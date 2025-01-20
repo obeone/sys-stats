@@ -1,0 +1,9 @@
+flask
+flask-cors
+psutil
+GPUtil
+coloredlogs
+requests
+prettytable
+termcolor
+setuptools

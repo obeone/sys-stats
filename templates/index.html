@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <link rel="shortcut icon" href="/favicon.png" type="image/png">
+  <title>Server Dashboard</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #121212;
+      color: #ffffff;
+      margin: 0;
+      padding: 0;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 60px auto 20px auto;
+      padding: 20px;
+    }
+
+    h1, h2 {
+      text-align: center;
+      cursor: pointer; /* so user sees it's clickable (fold/unfold) */
+    }
+
+    /* Pause/Resume button */
+    /* Contrôle général */
+    #controls {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      display: flex;
+      flex-direction: column; /* Empile les éléments verticalement */
+      align-items: center; /* Centre les éléments horizontalement */
+      gap: 10px; /* Espace entre le sélecteur et le bouton */
+    }
+    
+    /* Contrôle du sélecteur */
+    #refresh-control {
+      text-align: center;
+    }
+    
+    #refresh-control label {
+      color: #fff;
+      font-size: 0.9em;
+      margin-bottom: 5px;
+    }
+    
+    #refresh-interval {
+      background-color: #1e1e1e;
+      color: #fff;
+      border: 1px solid #4caf50;
+      border-radius: 4px;
+      padding: 5px;
+      font-size: 0.9em;
+      cursor: pointer;
+    }
+    
+    /* Bouton Pause */
+    #pause-button {
+      background-color: #4caf50;
+      border: none;
+      padding: 10px 20px;
+      color: #fff;
+      cursor: pointer;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    
+    #pause-button:hover {
+      background-color: #45a049;
+    }
+    
+
+    #dashboard {
+      display: flex;
+      justify-content: space-around;
+      flex-wrap: wrap;
+      margin-bottom: 30px;
+    }
+
+    .card {
+      background-color: #1e1e1e;
+      border-radius: 8px;
+      padding: 20px;
+      margin: 10px;
+      width: 250px;
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.5);
+      text-align: center;
+      transition: transform 0.2s ease-in-out;
+    }
+    .card:hover {
+      transform: scale(1.05);
+    }
+
+    .stat-section {
+      margin-bottom: 20px;
+    }
+
+    /* No separate button for fold/unfold. We do it on h2 click. */
+    .foldable-body {
+      margin-top: 10px;
+      display: block; /* shown by default */
+    }
+
+    /* Tables with fixed column widths */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    table, th, td {
+      border: 1px solid #333;
+    }
+    th, td {
+      padding: 8px;
+      text-align: left;
+    }
+    th {
+      background-color: #1e1e1e;
+      width: 150px; /* fixed width for headers */
+    }
+
+    /* For GPU Stats, we will have 6 columns now */
+    /* If you want different widths, adapt as needed */
+    tr:nth-child(even) {
+      background-color: #1e1e1e;
+    }
+
+    @media (max-width: 800px) {
+      th, td {
+        padding: 6px;
+        font-size: 12px;
+      }
+      .card {
+        width: 90%;
+      }
+      th, td {
+        width: auto; /* let them shrink on small screens */
+      }
+    }
+
+    .stat-value {
+      font-size: 2em;
+      margin: 10px 0;
+      font-weight: bold;
+      transition: color 0.3s, transform 0.3s;
+    }
+    .stat-value.updated {
+      color: #4caf50;
+      transform: scale(1.1);
+    }
+
+    .error {
+      color: red;
+      text-align: center;
+      margin: 20px;
+    }
+
+    /* Spinner in the bottom right corner */
+    #loading-spinner {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      display: none; /* hidden by default */
+      width: 40px;
+      height: 40px;
+      border: 5px solid #ccc;
+      border-top: 5px solid #4caf50;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      z-index: 1000; /* below the button */
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+
+    /* Truncated cmdline */
+    .cmdline-truncate {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 250px;
+      display: inline-block;
+      cursor: pointer;
+      border-bottom: 1px dashed #4caf50; /* visual indicator */
+    }
+    .cmdline-full {
+      white-space: normal;
+      word-wrap: break-word;
+    }
+
+    .current-time {
+      text-align: center;
+      font-size: 1.2em;
+      color: #4caf50; /* Vert agréable pour l'heure */
+      margin-top: -10px;
+      margin-bottom: 20px;
+      font-weight: bold;
+    }    
+  </style>
+</head>
+<body>
+  <!-- Pause/Resume button -->
+  <div id="controls">
+    <div id="refresh-control">
+      <label for="refresh-interval">Refresh Interval:</label>
+      <select id="refresh-interval">
+        <option value="1000">1 second</option>
+        <option value="2000">2 seconds</option>
+        <option value="3000">3 seconds</option>
+        <option value="4000">4 seconds</option>
+        <option value="5000">5 seconds</option>
+        <option value="10000">10 seconds</option>
+        <option value="30000">30 seconds</option>
+        <option value="60000">1 minute</option>
+      </select>
+    </div>
+    <button id="pause-button">Pause</button>
+  </div>
+  
+  
+
+  <!-- Loading spinner -->
+  <div id="loading-spinner"></div>
+
+  <div class="container">
+    <h1>Server Dashboard</h1>
+    <p id="current-time" class="current-time">Loading time...</p>
+    <div id="error-message" class="error" style="display:none;"></div>
+
+    <!-- Summary cards -->
+    <div id="dashboard">
+      <div class="card">
+        <h2>CPU</h2>
+        <div id="cpu-summary" class="stat-value">--%</div>
+        <p>Cores: <span id="cpu-cores">--</span></p>
+      </div>
+
+      <!-- GPU card hidden by default, shown only if has_gpu -->
+      <div class="card" id="gpu-card" style="display:none;">
+        <h2>GPU</h2>
+        <div id="gpu-summary" class="stat-value">--%</div>
+        <p>VRAM: <span id="gpu-vram">--%</span></p>
+      </div>
+
+      <div class="card">
+        <h2>RAM</h2>
+        <div id="ram-summary" class="stat-value">--%</div>
+        <p>Total: <span id="ram-total">-- GB</span></p>
+      </div>
+    </div>
+
+    <!-- CPU Section -->
+    <div class="stat-section" id="cpu-section">
+      <h2 onclick="toggleFold('cpu-section-body')">
+        Top Processes (CPU)
+      </h2>
+      <div class="foldable-body" id="cpu-section-body">
+        <table id="cpu-top">
+          <thead>
+            <tr>
+              <th>PID</th>
+              <th>Name</th>
+              <th>CPU %</th>
+              <th>Cmdline</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- RAM Section -->
+    <div class="stat-section" id="ram-section">
+      <h2 onclick="toggleFold('ram-section-body')">
+        Top Processes (RAM)
+      </h2>
+      <div class="foldable-body" id="ram-section-body">
+        <table id="ram-top">
+          <thead>
+            <tr>
+              <th>PID</th>
+              <th>Name</th>
+              <th>RAM</th>
+              <th>RAM %</th>
+              <th>Cmdline</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- GPU Stats Section -->
+    <div class="stat-section" id="gpu-stats-section" style="display:none;">
+      <h2 onclick="toggleFold('gpu-stats-body')">
+        GPU Stats
+      </h2>
+      <div class="foldable-body" id="gpu-stats-body">
+        <table id="gpu-stats">
+          <thead>
+            <!-- We add 6 columns: Name, Load, VRAM, Fan Speed, Power, Temperature -->
+            <tr>
+              <th>Name</th>
+              <th>Load (%)</th>
+              <th>VRAM</th>
+              <th>VRAM (%)</th>
+              <th>Fan (%)</th>
+              <th>Power (W)</th>
+              <th>Temp (°C)</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- GPU Processes Section -->
+    <div class="stat-section" id="gpu-procs-section" style="display:none;">
+      <h2 onclick="toggleFold('gpu-processes-body')">
+        GPU Processes
+      </h2>
+      <div class="foldable-body" id="gpu-processes-body">
+        <table id="gpu-processes">
+          <thead>
+            <tr>
+              <th>PID</th>
+              <th>Process Name</th>
+              <th>Memory Used</th>
+              <th>Command Line</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Ollama Stats Section -->
+    <div class="stat-section" id="ollama-stats-section" style="display:none;">
+      <h2 onclick="toggleFold('ollama-stats-body')">
+        Ollama Stats
+      </h2>
+      <div class="foldable-body" id="ollama-stats-body">
+        <table id="ollama-processes">
+          <thead>
+            <tr>
+              <th>Model Name</th>
+              <th>VRAM Usage</th>
+              <th>Expiration</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const errorMessageEl = document.getElementById('error-message');
+    const loadingSpinner = document.getElementById('loading-spinner');
+    const pauseButton = document.getElementById('pause-button');
+
+    let isPaused = false;
+    let refreshInterval = null;
+    let isRequestPending = false;
+    let refreshRate = 1000; // Default to 1 second
+
+    const refreshSelect = document.getElementById('refresh-interval');
+    refreshSelect.addEventListener('change', (event) => {
+      refreshRate = parseInt(event.target.value, 10); // Update the refresh rate
+      if (!isPaused) {
+        stopRefreshing();
+        startRefreshing();
+      }
+    });
+
+    // Listen for visibility changes
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        // Page is in the foreground
+        if (!isPaused && !refreshInterval) {
+          startRefreshing(); // Resume refreshing
+        }
+      } else {
+        // Page is in the background
+        stopRefreshing(); // Stop refreshing
+      }
+    });
+
+    // Start or resume refreshing
+    function startRefreshing() {
+      // We fetch stats every second
+      refreshInterval = setInterval(fetchStats, refreshRate);
+    }
+
+    // Stop refreshing immediately
+    function stopRefreshing() {
+      clearInterval(refreshInterval);
+      refreshInterval = null;
+    }
+
+    // Toggle Pause/Resume state
+    pauseButton.addEventListener('click', () => {
+      if (isPaused) {
+        // Resume
+        startRefreshing();
+        isPaused = false;
+        pauseButton.innerText = 'Pause';
+      } else {
+        // Pause immediately
+        stopRefreshing();
+        isPaused = true;
+        pauseButton.innerText = 'Resume';
+      }
+    });
+
+    // Toggle visibility of a section body by ID
+    function toggleFold(sectionBodyId) {
+      const bodyEl = document.getElementById(sectionBodyId);
+      if (!bodyEl) return;
+      bodyEl.style.display = (bodyEl.style.display === 'none') ? 'block' : 'none';
+    }
+
+    // On click, remove truncation and display full cmdline
+    function expandCmdline(span) {
+      const fullCmd = span.getAttribute('data-full-cmdline');
+      span.innerText = fullCmd;
+      span.classList.remove('cmdline-truncate', 'cmdline-full');
+      span.removeAttribute('onclick');
+    }
+
+    async function fetchStats() {
+      try {
+        if (isRequestPending) return; 
+        isRequestPending = true;
+        
+        loadingSpinner.style.display = 'block';
+        errorMessageEl.style.display = 'none';
+
+        const response = await fetch('/stats?limit=5');
+        if (!response.ok) {
+          throw new Error(`HTTP error! Status: ${response.status}`);
+        }
+
+        const data = await response.json();
+        loadingSpinner.style.display = 'none';
+
+        // If there's no GPU, hide GPU card and sections
+        if (!data.has_gpu) {
+          document.getElementById('gpu-card').style.display = 'none';
+          document.getElementById('gpu-stats-section').style.display = 'none';
+          document.getElementById('gpu-procs-section').style.display = 'none';
+        } else {
+          // Show GPU card and sections
+          document.getElementById('gpu-card').style.display = 'block';
+          document.getElementById('gpu-stats-section').style.display = 'block';
+          document.getElementById('gpu-procs-section').style.display = 'block';
+        }
+        if (data.ollama_processes.models.length === 0) {
+          document.getElementById('ollama-stats-section').style.display = 'none';
+        } else {
+          document.getElementById('ollama-stats-section').style.display = 'block';
+        }
+
+        // Update Current Time
+        document.getElementById('current-time').innerText = `Current Time: ${data.current_time}`;
+
+
+        // Update CPU Summary
+        updateStat('cpu-summary', `${data.summary.cpu.usage.toFixed(1)}%`);
+        document.getElementById('cpu-cores').innerText = data.summary.cpu.cores;
+
+        // Update RAM Summary
+        updateStat('ram-summary', `${data.summary.ram.percent.toFixed(1)}%`);
+        document.getElementById('ram-total').innerText = (data.summary.ram.total / 1e9).toFixed(2);
+
+        // Update GPU Summary (if present)
+        if (data.has_gpu && data.summary.gpu.length > 0) {
+          updateStat('gpu-summary', `${data.summary.gpu[0].load.toFixed(1)}%`);
+          document.getElementById('gpu-vram').innerText = `${data.summary.gpu[0].vram.toFixed(1)}%`;
+        } else {
+          updateStat('gpu-summary', 'N/A');
+          document.getElementById('gpu-vram').innerText = 'N/A';
+        }
+
+        // Update CPU Processes
+        const cpuTopBody = document.querySelector('#cpu-top tbody');
+        cpuTopBody.innerHTML = data.top_cpu.map(proc => `
+          <tr>
+            <td>${proc.pid}</td>
+            <td>${escapeHTML(proc.name)}</td>
+            <td>${proc.cpu_percent.toFixed(1)}</td>
+            <td>
+              <span class="cmdline-truncate"
+                    data-full-cmdline="${escapeAttribute(proc.cmdline)}"
+                    onclick="expandCmdline(this)">
+                ${escapeHTML(proc.cmdline)}
+              </span>
+            </td>
+          </tr>
+        `).join('');
+
+        // Update RAM Processes
+        const ramTopBody = document.querySelector('#ram-top tbody');
+        ramTopBody.innerHTML = data.top_memory.map(proc => `
+          <tr>
+            <td>${proc.pid}</td>
+            <td>${escapeHTML(proc.name)}</td>
+            <td>${formatBytes(proc.memory_usage)}</td>
+            <td>${proc.memory_percent.toFixed(1)}</td>
+            <td>
+              <span class="cmdline-truncate"
+                    data-full-cmdline="${escapeAttribute(proc.cmdline)}"
+                    onclick="expandCmdline(this)">
+                ${escapeHTML(proc.cmdline)}
+              </span>
+            </td>
+          </tr>
+        `).join('');
+
+        // Update GPU Stats
+        const gpuStatsBody = document.querySelector('#gpu-stats tbody');
+        gpuStatsBody.innerHTML = data.gpu.map(gpu => `
+          <tr>
+            <td>${escapeHTML(gpu.name)}</td>
+            <td>${gpu.load.toFixed(1)}</td>
+            <td>${formatBytes(gpu.memoryUsed)}</td>
+            <td>${gpu.memoryPercent.toFixed(1)}</td>
+            <td>${gpu.fanSpeed.toFixed(1)}</td>
+            <td>${gpu.powerDraw.toFixed(1)}</td>
+            <td>${gpu.temperature}</td>
+          </tr>
+        `).join('');
+
+        // Update GPU Processes
+        const gpuProcsBody = document.querySelector('#gpu-processes tbody');
+        gpuProcsBody.innerHTML = data.top_gpu_processes.map(proc => `
+          <tr>
+            <td>${proc.pid}</td>
+            <td>${escapeHTML(proc.name)}</td>
+            <td>${formatBytes(proc.memory_used)}</td>
+            <td>
+              <span class="cmdline-truncate"
+                    data-full-cmdline="${escapeAttribute(proc.cmdline)}"
+                    onclick="expandCmdline(this)">
+                ${escapeHTML(proc.cmdline)}
+              </span>
+            </td>
+          </tr>
+        `).join('');
+
+        // Update Ollama processes
+        const ollamaProcsBody = document.querySelector('#ollama-processes tbody');
+        ollamaProcsBody.innerHTML = data.ollama_processes.models.map(proc => `
+          <tr>
+            <td>${escapeHTML(proc.name)}</td>
+            <td>${formatBytes(proc.size_vram)}</td>
+            <td>${formatExpiration(proc.expires_at)}</td>
+          </tr>
+        `).join('');
+
+      } catch (error) {
+        loadingSpinner.style.display = 'none';
+        errorMessageEl.style.display = 'block';
+        errorMessageEl.innerText = `Error fetching stats: ${error.message}`;
+        console.error('Error fetching stats:', error);
+      } finally {
+        isRequestPending = false;
+      }
+    }
+
+    function updateStat(elementId, newValue) {
+      const element = document.getElementById(elementId);
+      if (element.innerText !== newValue) {
+        element.innerText = newValue;
+        element.classList.add('updated');
+        setTimeout(() => element.classList.remove('updated'), 300);
+      }
+    }
+
+    // Escape HTML to prevent injection
+    function escapeHTML(str) {
+      if (!str) return '';
+      return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    // Escape quotes for data-full-cmdline attribute
+    function escapeAttribute(str) {
+      if (!str) return '';
+      return str
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      const units = ['KB', 'MB', 'GB', 'TB'];
+      let i = -1;
+      do {
+        bytes /= 1024;
+        i++;
+      } while (bytes >= 1024 && i < units.length - 1);
+      return bytes.toFixed(2) + ' ' + units[i];
+    }
+  
+    function formatExpiration(expirationIso) {
+      const expirationDate = new Date(expirationIso);
+      const now = new Date();
+      const diffMs = expirationDate - now;
+  
+      if (diffMs <= 0) return "Expired";
+  
+      const seconds = Math.floor(diffMs / 1000) % 60;
+      const minutes = Math.floor(diffMs / (1000 * 60)) % 60;
+      const hours = Math.floor(diffMs / (1000 * 60 * 60));
+      return `${hours}h ${minutes}m ${seconds}s`;
+    }
+  
+
+    // Initial start
+    startRefreshing();
+    fetchStats(); // fetch once immediately
+  </script>
+</body>
+</html>

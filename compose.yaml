@@ -1,0 +1,17 @@
+services:
+  sys-stats:
+    image: obeoneorg/sys-stats
+    ports:
+      - "5000:5000"
+    environment:
+      OLLAMA_API_URL: "https://ollama.obeone.cloud"
+
+    pid: host
+    privileged: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [compute, utility]

@@ -1,0 +1,36 @@
+# Ignore hidden files and directories
+.*
+!.dockerignore
+
+# Ignore history folders
+.history/
+.history/**
+
+# Ignore container configuration files
+compose/
+sys-stats-deployment.yaml
+sys-stats-service.yaml
+
+# Ignore temporary or backup files
+*~
+*.swp
+*.bak
+*.tmp
+*.old
+
+# Ignore log files
+*.log
+
+# Ignore the following directories
+templates/templates/
+chart/
+.compose/
+compose/
+
+# Exclude compiled Python files and local dependency/config files
+__pycache__/
+*.py[cod]
+.env
+*.env
+.vscode/
+.idea/
