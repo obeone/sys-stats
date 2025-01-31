@@ -180,7 +180,7 @@ def display_top_processes(data, key, title, terminal_width):
     for field in table.field_names:
         table.align[field] = "l"
 
-    for proc in data[key]:
+    for proc in data.get(key, []):
         if key == 'top_cpu':
             table.add_row([
                 colored(proc['pid'], "cyan"),
@@ -233,6 +233,37 @@ def display_gpu_stats(data, terminal_width):
 
     print(table)
 
+def display_top_gpu_processes(data, terminal_width):
+    """
+    Display the top GPU processes (provided by 'top_gpu_processes') in a tabular format.
+
+    Args:
+        data (dict): The fetched statistics data.
+        terminal_width (int): The width of the terminal for formatting purposes.
+    """
+    if not data.get("top_gpu_processes"):
+        return
+
+    print(colored("\nTop GPU Processes:", "cyan", attrs=["bold", "underline"]))
+    table = PrettyTable()
+    table.field_names = ["PID", "Name", "Memory Used", "Cmdline"]
+
+    nb_columns = len(table.field_names)
+    width_per_col = max((terminal_width - 4) // nb_columns, 5)
+    table._max_width = {field: width_per_col for field in table.field_names}
+    for field in table.field_names:
+        table.align[field] = "l"
+
+    for proc in data["top_gpu_processes"]:
+        table.add_row([
+            colored(proc['pid'], "cyan"),
+            colored(proc['name'], "green"),
+            colored(human_readable_size(proc['memory_used']), "blue"),
+            colored(truncate_cmdline(proc['cmdline'], width_per_col), "white")
+        ])
+
+    print(table)
+
 def display_ollama_stats(data, terminal_width):
     """
     Display statistics related to Ollama processes in a tabular format.
@@ -246,7 +277,7 @@ def display_ollama_stats(data, terminal_width):
 
     print(colored("\nOllama Stats:", "cyan", attrs=["bold", "underline"]))
     table = PrettyTable()
-    table.field_names = ["Model Name", "VRAM Usage", "Expiration"]
+    table.field_names = ["Model Name", "Size", "VRAM Usage", "GPU Loaded", "Expiration"]
 
     nb_columns = len(table.field_names)
     width_per_col = max((terminal_width - 4) // nb_columns, 5)
@@ -255,9 +286,18 @@ def display_ollama_stats(data, terminal_width):
         table.align[field] = "l"
 
     for model in data['ollama_processes']['models']:
+        vram_str = human_readable_size(model['size_vram'])
+        total_str = human_readable_size(model['size'])
+        gpu_loaded_str = ""
+        if model['size'] > 0:
+            ratio = (model["size_vram"]/model['size'])*100
+            gpu_loaded_str = colored(f"{ratio:.0f}% GPU", "red", attrs=["bold"])
+
         table.add_row([
             colored(model['name'], "green", attrs=["bold"]),
-            colored(human_readable_size(model['size_vram']), "blue"),
+            colored(total_str, "blue"),
+            colored(vram_str, "blue"),
+            gpu_loaded_str,
             colored(time_until(model['expires_at']), "yellow")
         ])
 
@@ -285,6 +325,7 @@ def main():
                 display_top_processes(stats, 'top_cpu', 'Top CPU Processes', terminal_width)
                 display_top_processes(stats, 'top_memory', 'Top Memory Processes', terminal_width)
                 display_gpu_stats(stats, terminal_width)
+                display_top_gpu_processes(stats, terminal_width)
                 display_ollama_stats(stats, terminal_width)
 
         time.sleep(args.interval)
