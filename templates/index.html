@@ -349,7 +349,9 @@
           <thead>
             <tr>
               <th>Model Name</th>
+              <th>Model size</th>
               <th>VRAM Usage</th>
+              <th>GPU Loaded</th>
               <th>Expiration</th>
             </tr>
           </thead>
@@ -558,7 +560,9 @@
         ollamaProcsBody.innerHTML = data.ollama_processes.models.map(proc => `
           <tr>
             <td>${escapeHTML(proc.name)}</td>
+            <td>${formatBytes(proc.size)}</td>
             <td>${formatBytes(proc.size_vram)}</td>
+            <td>${(proc.size_vram/proc.size*100).toFixed(0)} %</td>
             <td>${formatExpiration(proc.expires_at)}</td>
           </tr>
         `).join('');
