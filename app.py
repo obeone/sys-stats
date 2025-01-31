@@ -87,6 +87,7 @@ def get_gpu_processes(limit: int = 5) -> List[Dict[str, Any]]:
             continue
         try:
             pid_str, process_name, used_memory_str = line.split(', ')
+            process_name = process_name.split('/')[-1]
             pid = int(pid_str)
             # Try to get command line using psutil
             try:
