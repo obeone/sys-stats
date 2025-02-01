@@ -52,7 +52,7 @@ jobs:
           tags: |
             ghcr.io/obeone/sys-stats:latest
             docker.io/obeoneorg/sys-stats:latest
-          platforms: linux/amd64,linux/arm64,linux/i386,linux/arm/v7,linux/ppc64le,linux/s390x
+          platforms: linux/amd64,linux/arm64,linux/i386,linux/arm/v7
 
       - name: Set up cosign
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
