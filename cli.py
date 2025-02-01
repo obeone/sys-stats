@@ -3,332 +3,444 @@
 import requests
 import time
 import argparse
-from prettytable import PrettyTable
 import shutil
-from termcolor import colored
 import os
+import threading
 from datetime import datetime, timedelta, timezone
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.text import Text
+import readchar  # Pour capturer les frappes de touches
 
+# URL de l'API par défaut
 SYS_STATS_API_URL = os.getenv('SYS_STATS_API_URL', 'http://localhost:5000/stats')
 
+console = Console()
+
+# États de la dashboard
+is_paused = False
+show_help_flag = False
+refresh_interval = 5  # Intervalle de rafraîchissement par défaut en secondes
+
+# Verrous pour les opérations thread-safe
+state_lock = threading.Lock()
+stats_lock = threading.Lock()
+
+# Événements pour la synchronisation
+exit_event = threading.Event()
+rebuild_layout_event = threading.Event()
+
+# Variable partagée pour stocker les dernières statistiques
+latest_stats = None
+
+
 def fetch_stats(api_url):
-    """
-    Fetch statistics from the specified API URL.
-
-    Args:
-        api_url (str): The URL of the API to fetch stats from.
-
-    Returns:
-        dict or None: The JSON response from the API if successful, None otherwise.
-    """
+    """Récupère les statistiques depuis l'URL de l'API spécifiée."""
     try:
         response = requests.get(api_url)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        print(colored(f"Error fetching stats: {e}", "red"))
+        console.print(f"[bold red]Erreur lors de la récupération des stats:[/bold red] {e}")
         return None
 
+
 def human_readable_size(size):
-    """
-    Convert bytes into a human-readable format.
-
-    Args:
-        size (int): The size in bytes.
-
-    Returns:
-        str: The size converted into a human-readable format (e.g., KB, MB).
-    """
+    """Convertit des octets en un format lisible."""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size < 1024:
             return f"{size:.1f} {unit}"
         size /= 1024
+    return f"{size:.1f} TB"
+
 
 def time_until(expiration):
-    """
-    Calculate the time remaining until a given expiration datetime.
+    """Calcule le temps restant jusqu'à une date d'expiration donnée."""
+    try:
+        exp_time = datetime.fromisoformat(expiration.replace('Z', '+00:00')).astimezone(timezone.utc)
+        now = datetime.now(timezone.utc)
+        delta = exp_time - now
+        if delta.total_seconds() <= 0:
+            return "[bold red]Expiré[/bold red]"
+        return str(timedelta(seconds=int(delta.total_seconds())))
+    except Exception:
+        return "N/A"
 
-    Args:
-        expiration (str): The expiration datetime in ISO format.
-
-    Returns:
-        str: A string representing the time until expiration or "Expired" if already expired.
-    """
-    exp_time = datetime.fromisoformat(expiration.replace('Z', '+00:00')).astimezone(timezone.utc)
-    now = datetime.now(timezone.utc)
-    delta = exp_time - now
-    if delta.total_seconds() <= 0:
-        return "Expired"
-    return str(timedelta(seconds=int(delta.total_seconds())))
 
 def truncate_cmdline(cmdline, width):
-    """
-    Truncate command line string if it exceeds a specified width.
+    """Tronque la chaîne de commande si elle dépasse une largeur spécifiée."""
+    return cmdline if len(cmdline) <= width else cmdline[:width - 1] + "…"
 
-    Args:
-        cmdline (str): The command line string to truncate.
-        width (int): The maximum width allowed.
 
-    Returns:
-        str: The truncated command line string.
-    """
-    return cmdline if len(cmdline) <= width else cmdline[:width - 3] + "..."
+def truncate_name(name, max_length=15):
+    """Tronque le nom si il dépasse une longueur maximale spécifiée."""
+    return name if len(name) <= max_length else name[:max_length - 1] + "…"
 
-def clear_terminal():
-    """
-    Clear the terminal screen.
-    """
-    print("\033[H\033[J", end="")  # ANSI escape sequence to clear screen and reset cursor
 
-def display_oneline_stats(data):
-    """
-    Display statistics on a single line with icons.
+def create_layout():
+    """Crée la mise en page initiale pour le dashboard."""
+    layout = Layout()
 
-    Args:
-        data (dict): The fetched statistics data.
-    """
-    # Icons to represent metrics
-    cpu_icon = "💻"
-    ram_icon = "🧠"
-    gpu_icon = "🎮"
-
-    cpu_usage_str = colored(f"{data['cpu']:.1f}%", "green", attrs=["bold"])
-    ram_usage_str = colored(f"{data['ram']['percent']:.1f}%", "yellow", attrs=["bold"])
-    ram_total_str = colored(human_readable_size(data['ram']['total']), "cyan")
-
-    usage_line = (
-        f"{cpu_icon} CPU: {cpu_usage_str}  "
-        f"{ram_icon} RAM: {ram_usage_str} / {ram_total_str}"
+    # Divise la mise en page principale en en-tête et corps
+    layout.split(
+        Layout(name="header", size=1),
+        Layout(name="body")
     )
 
+    # Divise le corps en sections supérieure et inférieure
+    layout["body"].split(
+        Layout(name="upper", ratio=1),
+        Layout(name="lower", ratio=1)
+    )
+
+    # Divise la section supérieure en résumé et processus
+    layout["upper"].split_row(
+        Layout(name="summary", ratio=1),
+        Layout(name="processes", ratio=2)
+    )
+
+    # Divise la section inférieure en processus GPU et statistiques Ollama
+    layout["lower"].split_row(
+        Layout(name="gpu_processes", ratio=1),
+        Layout(name="ollama", ratio=1)
+    )
+
+    return layout
+
+
+def build_header():
+    """Construit le panel d'en-tête."""
+    header_text = Text("🖥️ Sys Stats", style="bold white on blue")
+    return Panel(header_text, height=1, style="blue", padding=(0, 2))
+
+
+def build_summary(data, interval):
+    """Construit le panel de résumé avec l'utilisation du CPU, RAM et GPU."""
+    table = Table.grid(expand=True)
+    table.add_column(justify="left")
+    table.add_column(justify="right")
+
+    current_time = f"[bold]{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}[/bold]"
+
+    table.add_row("Heure actuelle", current_time)
+    table.add_row("", "")
+
+    # Informations CPU et RAM
+    cpu_usage = f"[bold green]CPU:[/bold green] {data.get('cpu', 0):.1f}%"
+    ram_percent = data.get('ram', {}).get('percent', 0)
+    ram_total = human_readable_size(data.get('ram', {}).get('total', 0))
+    ram_usage = f"[bold yellow]RAM:[/bold yellow] {ram_percent:.1f}% / {ram_total}"
+    table.add_row(cpu_usage, ram_usage)
+
+    # Informations GPU
     if data.get("has_gpu") and data.get("gpu"):
         gpu_data = data['gpu'][0]
-        gpu_usage_str = colored(f"{gpu_data['load']:.1f}%", "blue", attrs=["bold"])
-        vram_usage_str = colored(f"{gpu_data['memoryPercent']:.1f}%", "magenta", attrs=["bold"])
-        usage_line += f"  {gpu_icon} GPU: {gpu_usage_str} VRAM: {vram_usage_str}"
+        gpu_name = truncate_name(gpu_data.get('name', 'N/A'), 15)
+        gpu_load = gpu_data.get('load', 0)
 
-    if data.get("ollama_processes", {}).get("models"):
-        model = data['ollama_processes']['models'][0]  # First entry
-        model_name = model['name']
-        model_size = colored(human_readable_size(model['size_vram']), "blue")
-        usage_line += f"  (Ollama: {model_name}, {model_size})"
+        # Calcul du VRAM total
+        memory_used = gpu_data.get('memoryUsed', 0)
+        memory_percent = gpu_data.get('memoryPercent', 0)
+        if memory_percent > 0:
+            memory_total = memory_used / (memory_percent / 100)
+        else:
+            memory_total = 0
+        memory_used_str = human_readable_size(memory_used)
+        memory_total_str = human_readable_size(memory_total)
+        vram_percent = memory_percent
 
-    print(colored("\nOneline Stats:", "cyan", attrs=["bold"]))
-    print(usage_line)
+        gpu_title = f"[bold blue]GPU:[/bold blue] {gpu_name} ({memory_total_str})\n"
+        table.add_row(gpu_title)
 
-def display_summary(data, terminal_width):
-    """
-    Display a summary of the statistics in a table format.
+        gpu_info = f"[bold magenta]VRAM:[/bold magenta] {memory_used_str} ({vram_percent:.1f}%)"
+        gpu_load_str = f"[bold blue]Charge:[/bold blue] {gpu_load:.1f}%"
+        table.add_row(gpu_info, gpu_load_str)
 
-    Args:
-        data (dict): The fetched statistics data.
-        terminal_width (int): The width of the terminal for formatting purposes.
-    """
-    print(colored("\nSummary:", "cyan", attrs=["bold"]))
-    table = PrettyTable()
-    table.field_names = ["Metric", "Value"]
+    # Statut (Pause ou en cours)
+    with state_lock:
+        status = "[bold red]PAUSÉ[/bold red]" if is_paused else ""
 
-    # Calculate average space per column
-    nb_columns = len(table.field_names)
-    width_per_col = max((terminal_width - 4) // nb_columns, 5)  # 4 for margin, 5 min
+    table.add_row("", status)
 
-    # Adjust column alignment
-    for field in table.field_names:
-        table.align[field] = "l"
+    summary_panel = Panel(
+        table,
+        border_style="cyan",
+        padding=(0, 1),
+        subtitle=f"Taux de rafraîchissement : {interval}s"
+    )
+    return summary_panel
 
-    cpu_usage = colored(f"{data['cpu']:.1f}%", "green", attrs=["bold"])
-    ram_usage = colored(f"{data['ram']['percent']:.1f}%", "yellow", attrs=["bold"])
-    ram_total = colored(human_readable_size(data['ram']['total']), "cyan")
-    current_time = colored(data["current_time"], "white", attrs=["bold"])
 
-    table.add_row(["Date & Time", current_time])
-    table.add_row(["CPU Usage", cpu_usage])
-    table.add_row(["RAM Usage", ram_usage])
-    table.add_row(["RAM Total", ram_total])
+def build_process_table(processes, key, title):
+    """Construit un tableau pour les processus les plus gourmands."""
+    if not processes:
+        return Panel(
+            f"Aucune donnée pour {title}.",
+            title=f"[bold cyan]{title}[/bold cyan]",
+            border_style="cyan",
+            padding=(0, 1)
+        )
 
-    if data.get("has_gpu") and data.get("gpu"):
-        gpu_data = data['gpu'][0]
-        gpu_usage = colored(f"{gpu_data['load']:.1f}%", "blue", attrs=["bold"])
-        gpu_vram = colored(f"{gpu_data['memoryPercent']:.1f}%", "magenta", attrs=["bold"])
-        table.add_row(["GPU Usage", gpu_usage])
-        table.add_row(["GPU VRAM Usage", gpu_vram])
-
-    print(table)
-
-def display_top_processes(data, key, title, terminal_width):
-    """
-    Display the top processes based on either CPU or memory usage.
-
-    Args:
-        data (dict): The fetched statistics data.
-        key (str): The key to determine which processes to display ('top_cpu' or 'top_memory').
-        title (str): The title to display for the processes table.
-        terminal_width (int): The width of the terminal for formatting purposes.
-    """
-    print(colored(f"\n{title}:", "cyan", attrs=["bold", "underline"]))
-    table = PrettyTable()
+    table = Table(show_header=True, header_style="bold magenta", padding=(0, 1))
     if key == 'top_cpu':
-        table.field_names = ["PID", "Name", "CPU %", "Cmdline"]
+        table.add_column("PID", style="cyan", no_wrap=True, width=6)
+        table.add_column("Nom", style="green", width=15)
+        table.add_column("CPU%", style="yellow", justify="right", width=6)
+        table.add_column("Cmdline", style="white", max_width=20)
     elif key == 'top_memory':
-        table.field_names = ["PID", "Name", "Memory Usage", "Memory %", "Cmdline"]
+        table.add_column("PID", style="cyan", no_wrap=True, width=6)
+        table.add_column("Nom", style="green", width=15)
+        table.add_column("Mémoire%", style="blue", justify="right", width=6)
+        table.add_column("Cmdline", style="white", max_width=20)
 
-    # Calculate average space per column
-    nb_columns = len(table.field_names)
-    width_per_col = max((terminal_width - 4) // nb_columns, 5)
-
-    table._max_width = {field: width_per_col for field in table.field_names}
-    for field in table.field_names:
-        table.align[field] = "l"
-
-    for proc in data.get(key, []):
+    for proc in processes:
+        pid = str(proc.get('pid', 'N/A'))
+        name = truncate_name(proc.get('name', 'N/A'))
+        cmdline = truncate_cmdline(proc.get('cmdline', ''), 20)
         if key == 'top_cpu':
-            table.add_row([
-                colored(proc['pid'], "cyan"),
-                colored(proc['name'], "green"),
-                colored(f"{proc['cpu_percent']:.1f}%", "yellow", attrs=["bold"]),
-                colored(truncate_cmdline(proc['cmdline'], width_per_col), "white")
-            ])
+            cpu_percent = f"{proc.get('cpu_percent', 0):.1f}%"
+            table.add_row(pid, name, cpu_percent, cmdline)
         elif key == 'top_memory':
-            table.add_row([
-                colored(proc['pid'], "cyan"),
-                colored(proc['name'], "green"),
-                colored(human_readable_size(proc['memory_usage']), "blue"),
-                colored(f"{proc['memory_percent']:.1f}%", "yellow", attrs=["bold"]),
-                colored(truncate_cmdline(proc['cmdline'], width_per_col), "white")
-            ])
+            mem_percent = f"{proc.get('memory_percent', 0):.1f}%"
+            table.add_row(pid, name, mem_percent, cmdline)
 
-    print(table)
+    return table
 
-def display_gpu_stats(data, terminal_width):
-    """
-    Display GPU statistics in a tabular format.
 
-    Args:
-        data (dict): The fetched statistics data.
-        terminal_width (int): The width of the terminal for formatting purposes.
-    """
-    if not data.get("has_gpu") or not data.get("gpu"):
-        return
+def build_processes_panel(data):
+    """Construit le panel des processus avec Top CPU et Top Mémoire."""
+    top_cpu = data.get('top_cpu', [])
+    top_memory = data.get('top_memory', [])
 
-    print(colored("\nGPU Stats:", "cyan", attrs=["bold", "underline"]))
-    table = PrettyTable()
-    table.field_names = ["Name", "Load (%)", "VRAM", "VRAM (%)", "Fan (%)", "Power (W)", "Temp (°C)"]
+    table_cpu = build_process_table(top_cpu, 'top_cpu', 'CPU')
+    table_mem = build_process_table(top_memory, 'top_memory', 'Mémoire')
 
-    nb_columns = len(table.field_names)
-    width_per_col = max((terminal_width - 4) // nb_columns, 5)
-    table._max_width = {field: width_per_col for field in table.field_names}
-    for field in table.field_names:
-        table.align[field] = "l"
+    processes_table = Table.grid(expand=True)
+    processes_table.add_column()
+    processes_table.add_column()
 
-    for gpu in data['gpu']:
-        table.add_row([
-            colored(gpu['name'], "green", attrs=["bold"]),
-            colored(f"{gpu['load']:.1f}%", "blue"),
-            colored(f"{human_readable_size(gpu['memoryUsed'])}", "magenta"),
-            colored(f"{gpu['memoryPercent']:.1f}%", "magenta"),
-            colored(f"{gpu['fanSpeed']:.1f}%", "cyan"),
-            colored(f"{gpu['powerDraw']:.1f} W", "yellow"),
-            colored(f"{gpu['temperature']:.1f}°C", "red", attrs=["bold"])
-        ])
+    processes_table.add_row(
+        Panel(table_cpu, title="[bold cyan]Top CPU[/bold cyan]", border_style="cyan", padding=(0, 1)),
+        Panel(table_mem, title="[bold cyan]Top Mémoire[/bold cyan]", border_style="cyan", padding=(0, 1))
+    )
 
-    print(table)
+    return processes_table
 
-def display_top_gpu_processes(data, terminal_width):
-    """
-    Display the top GPU processes (provided by 'top_gpu_processes') in a tabular format.
 
-    Args:
-        data (dict): The fetched statistics data.
-        terminal_width (int): The width of the terminal for formatting purposes.
-    """
-    if not data.get("top_gpu_processes"):
-        return
+def build_gpu_processes_panel(data):
+    """Construit le panel des processus GPU."""
+    processes = data.get("top_gpu_processes", [])
+    if not processes:
+        return Panel(
+            "Aucun processus GPU.",
+            title="[bold cyan]Processus GPU[/bold cyan]",
+            border_style="cyan",
+            padding=(0, 1)
+        )
 
-    print(colored("\nTop GPU Processes:", "cyan", attrs=["bold", "underline"]))
-    table = PrettyTable()
-    table.field_names = ["PID", "Name", "Memory Used", "Cmdline"]
+    table = Table(show_header=True, header_style="bold magenta", padding=(0, 1))
+    table.add_column("PID", style="cyan", no_wrap=True, width=6)
+    table.add_column("Nom", style="green", width=15)
+    table.add_column("Mémoire Utilisée", style="blue", justify="right", width=10)
+    table.add_column("Cmdline", style="white", max_width=20)
 
-    nb_columns = len(table.field_names)
-    width_per_col = max((terminal_width - 4) // nb_columns, 5)
-    table._max_width = {field: width_per_col for field in table.field_names}
-    for field in table.field_names:
-        table.align[field] = "l"
+    for proc in processes:
+        pid = str(proc.get('pid', 'N/A'))
+        name = truncate_name(proc.get('name', 'N/A'))
+        memory_used = human_readable_size(proc.get('memory_used', 0))
+        cmdline = truncate_cmdline(proc.get('cmdline', ''), 20)
+        table.add_row(pid, name, memory_used, cmdline)
 
-    for proc in data["top_gpu_processes"]:
-        table.add_row([
-            colored(proc['pid'], "cyan"),
-            colored(proc['name'], "green"),
-            colored(human_readable_size(proc['memory_used']), "blue"),
-            colored(truncate_cmdline(proc['cmdline'], width_per_col), "white")
-        ])
+    return Panel(
+        table,
+        title="[bold cyan]Processus GPU[/bold cyan]",
+        border_style="cyan",
+        padding=(0, 1)
+    )
 
-    print(table)
 
-def display_ollama_stats(data, terminal_width):
-    """
-    Display statistics related to Ollama processes in a tabular format.
+def build_ollama_panel(data):
+    """Construit le panel des statistiques Ollama."""
+    models = data.get("ollama_processes", {}).get("models", [])
+    if not models:
+        return Panel(
+            "Aucun modèle Ollama.",
+            title="[bold cyan]Statistiques Ollama[/bold cyan]",
+            border_style="cyan",
+            padding=(0, 1)
+        )
 
-    Args:
-        data (dict): The fetched statistics data.
-        terminal_width (int): The width of the terminal for formatting purposes.
-    """
-    if not data.get("ollama_processes", {}).get("models"):
-        return
+    table = Table(show_header=True, header_style="bold magenta", padding=(0, 1))
+    table.add_column("Modèle", style="green", width=15)
+    table.add_column("Taille", style="blue", justify="right", width=10)
+    table.add_column("VRAM", style="blue", justify="right", width=10)
+    table.add_column("GPU%", style="red", justify="right", width=6)
+    table.add_column("Expire", style="yellow", justify="right", width=12)
 
-    print(colored("\nOllama Stats:", "cyan", attrs=["bold", "underline"]))
-    table = PrettyTable()
-    table.field_names = ["Model Name", "Size", "VRAM Usage", "GPU Loaded", "Expiration"]
-
-    nb_columns = len(table.field_names)
-    width_per_col = max((terminal_width - 4) // nb_columns, 5)
-    table._max_width = {field: width_per_col for field in table.field_names}
-    for field in table.field_names:
-        table.align[field] = "l"
-
-    for model in data['ollama_processes']['models']:
-        vram_str = human_readable_size(model['size_vram'])
-        total_str = human_readable_size(model['size'])
-        gpu_loaded_str = ""
-        if model['size'] > 0:
-            ratio = (model["size_vram"]/model['size'])*100
-            gpu_loaded_str = colored(f"{ratio:.0f}% GPU", "red", attrs=["bold"])
-
-        table.add_row([
-            colored(model['name'], "green", attrs=["bold"]),
-            colored(total_str, "blue"),
-            colored(vram_str, "blue"),
+    for model in models:
+        model_name = truncate_name(model.get('name', 'N/A'))
+        size_total = human_readable_size(model.get('size', 0))
+        size_vram = human_readable_size(model.get('size_vram', 0))
+        gpu_loaded_ratio = (model.get("size_vram", 0) / model.get('size', 1)) * 100 if model.get('size', 1) > 0 else 0
+        gpu_loaded_str = f"{gpu_loaded_ratio:.0f}%"
+        expiration = time_until(model.get('expires_at', ''))
+        table.add_row(
+            model_name,
+            size_total,
+            size_vram,
             gpu_loaded_str,
-            colored(time_until(model['expires_at']), "yellow")
-        ])
+            expiration
+        )
 
-    print(table)
+    return Panel(
+        table,
+        title="[bold cyan]Statistiques Ollama[/bold cyan]",
+        border_style="cyan",
+        padding=(0, 1)
+    )
+
+
+def build_layout_content(layout, data, interval, terminal_width):
+    """Remplit la mise en page avec les données récupérées."""
+    # Mise à jour de l'en-tête
+    layout["header"].update(build_header())
+
+    # Mise à jour du résumé
+    summary_panel = build_summary(data, interval)
+    layout["upper"]["summary"].update(summary_panel)
+
+    # Mise à jour des processus (Top CPU et Top Mémoire)
+    processes_table = build_processes_panel(data)
+    layout["upper"]["processes"].update(processes_table)
+
+    # Mise à jour des processus GPU
+    gpu_processes_panel = build_gpu_processes_panel(data)
+    layout["lower"]["gpu_processes"].update(gpu_processes_panel)
+
+    # Mise à jour des statistiques Ollama
+    ollama_panel = build_ollama_panel(data)
+    layout["lower"]["ollama"].update(ollama_panel)
+
+
+def build_full_screen_help():
+    """Construit le panel d'aide en plein écran."""
+    help_text = """
+[bold yellow]Raccourcis Clavier :[/bold yellow]
+
+[bold green]q[/bold green] - Quitter
+[bold green]r[/bold green] - Rafraîchir
+[bold green]h[/bold green] - Afficher/Masquer l'aide
+[bold green]p[/bold green] - Pause/Reprendre
+[bold green]-[/bold green] - Diminuer l'intervalle
+[bold green]+[/bold green] - Augmenter l'intervalle
+
+Appuyez de nouveau sur [bold green]h[/bold green] pour revenir.
+"""
+
+    help_panel = Panel.fit(
+        help_text,
+        title="[bold cyan]Aide[/bold cyan]",
+        border_style="green",
+        padding=(1, 2)
+    )
+    return help_panel
+
+
+def keyboard_listener():
+    """Écoute les entrées clavier et modifie l'état en conséquence."""
+    global is_paused, show_help_flag, refresh_interval, latest_stats
+    while not exit_event.is_set():
+        key = readchar.readkey()
+        with state_lock:
+            if key.lower() == 'q':
+                exit_event.set()
+            elif key.lower() == 'r':
+                # Signal pour rafraîchir les données
+                rebuild_layout_event.set()  # On veut reconstruire le layout avec les mêmes données
+            elif key.lower() == 'h':
+                show_help_flag = not show_help_flag
+                rebuild_layout_event.set()  # Reconstruire le layout pour afficher/masquer l'aide
+            elif key.lower() == 'p':
+                is_paused = not is_paused
+                rebuild_layout_event.set()  # Reconstruire le layout pour afficher l'état de pause
+            elif key == '-':
+                if refresh_interval > 1:
+                    refresh_interval -= 1
+                    rebuild_layout_event.set()  # Reconstruire le layout pour afficher le nouvel intervalle
+            elif key == '+':
+                if refresh_interval < 60:
+                    refresh_interval += 1
+                    rebuild_layout_event.set()  # Reconstruire le layout pour afficher le nouvel intervalle
+
 
 def main():
-    """
-    Main function to execute the server stats dashboard CLI.
-    """
-    parser = argparse.ArgumentParser(description="CLI for Server Stats Dashboard")
-    parser.add_argument("--url", type=str, default=SYS_STATS_API_URL, help="API URL for stats endpoint")
-    parser.add_argument("--interval", type=int, default=5, help="Refresh interval in seconds")
-    parser.add_argument("--oneline", action='store_true', help="Display stats on a single line with icons.")
+    """Fonction principale pour exécuter le dashboard CLI des statistiques serveur."""
+    global latest_stats
+    parser = argparse.ArgumentParser(description="CLI pour le dashboard des statistiques serveur")
+    parser.add_argument("--url", type=str, default=SYS_STATS_API_URL, help="URL de l'API pour les statistiques")
+    parser.add_argument("--interval", type=int, default=5, help="Intervalle de rafraîchissement en secondes (peut être ajusté avec '+' et '-')")
     args = parser.parse_args()
 
-    while True:
-        clear_terminal()
-        terminal_width, _ = shutil.get_terminal_size(fallback=(80, 20))  # Get terminal size
-        stats = fetch_stats(args.url)
-        if stats:
-            if args.oneline:
-                display_oneline_stats(stats)
-            else:
-                display_summary(stats, terminal_width)
-                display_top_processes(stats, 'top_cpu', 'Top CPU Processes', terminal_width)
-                display_top_processes(stats, 'top_memory', 'Top Memory Processes', terminal_width)
-                display_gpu_stats(stats, terminal_width)
-                display_top_gpu_processes(stats, terminal_width)
-                display_ollama_stats(stats, terminal_width)
+    global refresh_interval
+    with state_lock:
+        refresh_interval = args.interval
 
-        time.sleep(args.interval)
+    layout = create_layout()
+
+    # Démarrer le thread d'écoute des touches clavier
+    listener_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    listener_thread.start()
+
+    with Live(layout, refresh_per_second=4, screen=True):
+        while not exit_event.is_set():
+            with state_lock:
+                current_interval = refresh_interval
+                paused = is_paused
+                help_flag = show_help_flag
+
+            if help_flag:
+                # Afficher le panel d'aide en plein écran
+                help_panel = build_full_screen_help()
+                layout.update(help_panel)
+            else:
+                if not paused:
+                    # Récupérer les statistiques si non en pause
+                    stats = fetch_stats(args.url)
+                    if stats:
+                        with stats_lock:
+                            latest_stats = stats
+                        terminal_size = shutil.get_terminal_size(fallback=(80, 24))
+                        terminal_width = terminal_size.columns
+                        build_layout_content(layout, latest_stats, current_interval, terminal_width)
+                else:
+                    # Si en pause, reconstruire uniquement la mise en page avec les dernières données
+                    if latest_stats:
+                        build_layout_content(layout, latest_stats, current_interval, terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns)
+
+            # Vérifier si un rebuild du layout est requis
+            if rebuild_layout_event.is_set():
+                if help_flag:
+                    help_panel = build_full_screen_help()
+                    layout.update(help_panel)
+                elif not paused and latest_stats:
+                    build_layout_content(layout, latest_stats, current_interval, terminal_width=shutil.get_terminal_size(fallback=(80, 24)).columns)
+                elif paused and latest_stats:
+                    build_layout_content(layout, latest_stats, current_interval, terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns)
+                rebuild_layout_event.clear()
+
+            # Attendre l'intervalle de rafraîchissement ou un événement
+            sleep_time = current_interval
+            start_time = time.time()
+            while (time.time() - start_time) < sleep_time:
+                if exit_event.is_set() or rebuild_layout_event.is_set():
+                    break
+                time.sleep(0.1)  # Attendre par tranches de 100ms pour réagir rapidement aux événements
+
+    console.print("[bold red]Fermeture du dashboard...[/bold red]")
+
 
 if __name__ == "__main__":
     main()
