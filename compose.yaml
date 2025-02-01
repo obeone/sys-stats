@@ -4,14 +4,7 @@ services:
     ports:
       - "5000:5000"
     environment:
-      OLLAMA_API_URL: "https://ollama.obeone.cloud"
+      OLLAMA_API_URL: "http://localhost:11434"
 
     pid: host
     privileged: true
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['0']
-              capabilities: [compute, utility]
