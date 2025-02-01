@@ -120,7 +120,7 @@ Before setting up the project, make sure you have the following prerequisites in
 To use the CLI for live monitoring, execute:
 
 ```bash
-python cli-v2.py --url http://localhost:5000/stats --interval 5
+python cli.py [--url http://localhost:5000/stats] [--interval 5]
 ```
 
 This command launches the CLI with a 5-second refresh interval.
