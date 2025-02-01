@@ -1,83 +1,131 @@
-# Server Stats Dashboard
+# 📊 Sys-Stats Dashboard ✨
 
-## Overview
+Welcome to the **Sys-Stats Dashboard**! This project is designed to monitor and visualize system performance in real-time through a sleek and interactive dashboard. Whether you're interested in CPU, RAM, or GPU usage, this tool provides comprehensive insights at your fingertips. 
 
-This is a server stats dashboard application that provides real-time monitoring of system statistics. The application consists of three main components:
+## 🎢 Features
 
-1. **Server-side Flask Application (`app.py`)**: Handles the API endpoints for fetching system statistics.
-2. **Web Interface (`index.html`)**: A user-friendly web interface to visualize the system stats in a browser.
-3. **Command Line Interface (CLI) (`cli.py`)**: A command-line tool to fetch and display system statistics.
+- **Real-time Monitoring**: Get instant updates on system metrics such as CPU load, memory usage, GPU stats, and essential processes.
+  
+- **Interactive Dashboards**: Use the web-based or command-line interface for intuitive dashboards, allowing detailed insights into system behavior.
+  
+- **Cross-Platform Support**: Deployed using Docker, ensuring consistency and easy setup across different operating environments.
+  
+- **Customizable Refresh Rates**: Adapt the monitoring frequency to suit your needs, enabling faster updates or conserving resources when needed.
 
-## Project Structure
+- **Ollama API Integration**: Out-of-the-box compatibility with the Ollama API for additional system-specific metrics and insights.
 
+## 🚀 Getting Started
+
+Ready to get your Sys-Stats Dashboard up and running? Follow these steps:
+
+### 🐳 Running with Docker
+
+#### Requirements
+
+Ensure you have the following installed on your system:
+
+- Docker 🐳
+- NVIDIA drivers (if you want GPU monitoring) 🎮
+
+#### Installation
+
+1. **Clone the Repository:**
+
+   ```bash
+   git clone https://github.com/obeone/sys-stats.git
+   cd sys-stats
+   `````
+
+1. **Running the System:**
+
+    - **With nvidia GPU Support:**
+
+    ```bash
+    docker compose -f compose.yaml -f compose.gpu.yaml up -d
+    ```
+
+    - **Without nvidia GPU Support:**
+  
+    ```bash
+    docker compose up -d
+    ```
+
+   The service will be running at `http://localhost:5000`.
+
+### ⚙️ Running Without Docker
+
+If you prefer to run the Sys-Stats Dashboard directly on your machine without using Docker, follow these steps for a seamless setup:
+
+#### Prerequisites
+
+Before setting up the project, make sure you have the following prerequisites installed:
+
+- **Python 3.12+**: You'll need Python to run the application natively.
+- **pip**: Python's package manager to install required dependencies.
+- **NVIDIA drivers**: For GPU monitoring (if applicable).
+
+#### Setup Instructions
+
+1. **Clone the Repository:**
+
+   Begin by cloning the repository to your local machine:
+
+   ```bash
+   git clone https://github.com/obeone/sys-stats.git
+   cd sys-stats
+   ```
+
+2. **Create a Virtual Environment:**
+
+   It's a good practice to use a virtual environment to manage dependencies:
+
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+   ```
+
+3. **Install Dependencies:**
+
+   Install the required packages using `pip`:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Configure Environment Variables:**
+
+   If you're using the Ollama API, ensure you set the `OLLAMA_API_URL` environment variable:
+
+   ```bash
+   export OLLAMA_API_URL="http://localhost:11434"
+   ```
+
+5. **Start the Application:**
+
+   Run the Flask application:
+
+   ```bash
+   python app.py
+   ```
+
+   The application will start on `http://localhost:5000`.
+
+## Using the CLI
+
+To use the CLI for live monitoring, execute:
+
+```bash
+python cli-v2.py --url http://localhost:5000/stats --interval 5
 ```
-│── sys-stats/
-│   ├── app.py
-│   ├── index.html
-│   └── cli.py
-└── README.md
-```
 
-## Components
+This command launches the CLI with a 5-second refresh interval.
 
-### 1. `app.py` - Server-side Flask Application
+You're all set! Now you can enjoy using the Sys-Stats Dashboard on your local setup without Docker.
 
-- **Purpose**: This is the backend server that exposes an API endpoint to fetch system statistics.
-- **Dependencies**: Flask (a Python web framework).
+## 🧑‍💻 Contributing
 
-#### Usage
+We welcome contributions from the community! Feel free to open issues, suggest features, or submit pull requests. Let's build a better Sys-Stats Dashboard together!
 
-To start the server, navigate to the project directory and run:
+## 📝 Notes
 
-```sh
-python3 app.py
-```
-
-By default, the server runs on `http://localhost:5000`.
-
-### 2. `index.html` - Web Interface
-
-- **Purpose**: This is a web page that fetches system statistics from the API endpoint and displays them in real-time.
-- **Dependencies**: None (pure HTML/CSS/JavaScript).
-
-#### Usage
-
-Open `index.html` in a web browser to view the live stats dashboard. You can also access it through a server by placing `index.html` on a web server.
-
-### 3. `cli.py` - Command Line Interface (CLI)
-
-- **Purpose**: This is a command-line tool that fetches and displays system statistics.
-- **Dependencies**: Python libraries such as `requests`, `prettytable`, `shutil`, `termcolor`, and `datetime`.
-
-#### Usage
-
-To use the CLI, navigate to the project directory and run:
-
-```sh
-python3 cli.py --url http://localhost:5000/stats --interval 5
-```
-
-- `--url`: The URL of the API endpoint (default is `http://localhost:5000/stats`).
-- `--interval`: The refresh interval in seconds (default is 5 seconds).
-- `--oneline`: Display stats on a single line with icons.
-
-## Environment Variables
-
-You can set the `SYS_STATS_API_URL` environment variable to specify the API URL if it's different from the default:
-
-```sh
-export SYS_STATS_API_URL=http://your-custom-api-url/stats
-```
-
-## Contributing
-
-Feel free to contribute by submitting pull requests or issues. Any improvements or bug fixes are welcome!
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- The project uses various Python libraries to fetch and display system statistics.
-- Inspired by real-time monitoring tools, this dashboard aims to provide a simple yet effective way to monitor server performance.
+This repo is clearly messy, but it was supposed to be only for my own use!
