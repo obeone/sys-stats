@@ -14,6 +14,11 @@ Welcome to the **Sys-Stats Dashboard**! This project is designed to monitor and 
 
 - **Ollama API Integration**: Out-of-the-box compatibility with the Ollama API for additional system-specific metrics and insights.
 
+## 🎆 Screenshots
+
+![Web Dashboard](https://raw.githubusercontent.com/obeone/sys-stats/main/docs/web.png)
+![CLI Dashboard](https://raw.githubusercontent.com/obeone/sys-stats/main/docs/cli.png)
+
 ## 🚀 Getting Started
 
 Ready to get your Sys-Stats Dashboard up and running? Follow these steps:
