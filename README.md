@@ -115,7 +115,7 @@ Before setting up the project, make sure you have the following prerequisites in
 
    The application will start on `http://localhost:5000`.
 
-## Using the CLI
+## 📺 Using the CLI
 
 To use the CLI for live monitoring, execute:
 
