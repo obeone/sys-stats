@@ -137,9 +137,13 @@ def build_summary(data, interval):
 
     # Informations GPU
     if data.get("has_gpu") and data.get("gpu"):
+        table.add_row('','')
+        
         gpu_data = data['gpu'][0]
         gpu_name = truncate_name(gpu_data.get('name', 'N/A'), 15)
         gpu_load = gpu_data.get('load', 0)
+        gpu_fan_speed = gpu_data.get('fanSpeed', '')
+        gpu_power_draw = gpu_data.get('powerDraw', '')
 
         # Calcul du VRAM total
         memory_used = gpu_data.get('memoryUsed', 0)
@@ -152,12 +156,16 @@ def build_summary(data, interval):
         memory_total_str = human_readable_size(memory_total)
         vram_percent = memory_percent
 
-        gpu_title = f"[bold blue]GPU:[/bold blue] {gpu_name} ({memory_total_str})\n"
+        gpu_title = f"[bold blue]GPU:[/bold blue] {gpu_name} ({memory_total_str})"
         table.add_row(gpu_title)
+        
+        gpu_fan = f"[bold blue]Fan:[/bold blue] {gpu_fan_speed}%"
+        gpu_power = f"[bold blue]Power draw:[/bold blue] {gpu_power_draw}W"
+        table.add_row(gpu_fan, gpu_power)
 
-        gpu_info = f"[bold magenta]VRAM:[/bold magenta] {memory_used_str} ({vram_percent:.1f}%)"
-        gpu_load_str = f"[bold blue]Charge:[/bold blue] {gpu_load:.1f}%"
-        table.add_row(gpu_info, gpu_load_str)
+        gpu_vram = f"[bold blue]VRAM:[/bold blue] {memory_used_str} ({vram_percent:.1f}%)"
+        gpu_load_str = f"[bold blue]Load:[/bold blue] {gpu_load:.1f}%"
+        table.add_row(gpu_load_str, gpu_vram)
 
     # Statut (Pause ou en cours)
     with state_lock:
