@@ -13,43 +13,43 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.layout import Layout
 from rich.text import Text
-import readchar  # Pour capturer les frappes de touches
+import readchar  # To capture key presses
 
-# URL de l'API par défaut
+# Default API URL
 SYS_STATS_API_URL = os.getenv('SYS_STATS_API_URL', 'http://localhost:5000/stats')
 
 console = Console()
 
-# États de la dashboard
+# Dashboard states
 is_paused = False
 show_help_flag = False
-refresh_interval = 5  # Intervalle de rafraîchissement par défaut en secondes
+refresh_interval = 5  # Default refresh interval in seconds
 
-# Verrous pour les opérations thread-safe
+# Locks for thread-safe operations
 state_lock = threading.Lock()
 stats_lock = threading.Lock()
 
-# Événements pour la synchronisation
+# Events for synchronization
 exit_event = threading.Event()
 rebuild_layout_event = threading.Event()
 
-# Variable partagée pour stocker les dernières statistiques
+# Shared variable to store the latest statistics
 latest_stats = None
 
 
 def fetch_stats(api_url):
-    """Récupère les statistiques depuis l'URL de l'API spécifiée."""
+    """Fetch statistics from the specified API URL."""
     try:
         response = requests.get(api_url)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        console.print(f"[bold red]Erreur lors de la récupération des stats:[/bold red] {e}")
+        console.print(f"[bold red]Error fetching stats:[/bold red] {e}")
         return None
 
 
 def human_readable_size(size):
-    """Convertit des octets en un format lisible."""
+    """Converts bytes into a human-readable format."""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size < 1024:
             return f"{size:.1f} {unit}"
@@ -58,51 +58,51 @@ def human_readable_size(size):
 
 
 def time_until(expiration):
-    """Calcule le temps restant jusqu'à une date d'expiration donnée."""
+    """Calculates the remaining time until a given expiration date."""
     try:
         exp_time = datetime.fromisoformat(expiration.replace('Z', '+00:00')).astimezone(timezone.utc)
         now = datetime.now(timezone.utc)
         delta = exp_time - now
         if delta.total_seconds() <= 0:
-            return "[bold red]Expiré[/bold red]"
+            return "[bold red]Expired[/bold red]"
         return str(timedelta(seconds=int(delta.total_seconds())))
     except Exception:
         return "N/A"
 
 
 def truncate_cmdline(cmdline, width):
-    """Tronque la chaîne de commande si elle dépasse une largeur spécifiée."""
+    """Truncates the command line string if it exceeds a specified width."""
     return cmdline if len(cmdline) <= width else cmdline[:width - 1] + "…"
 
 
 def truncate_name(name, max_length=15):
-    """Tronque le nom si il dépasse une longueur maximale spécifiée."""
+    """Truncates the name if it exceeds a specified maximum length."""
     return name if len(name) <= max_length else name[:max_length - 1] + "…"
 
 
 def create_layout():
-    """Crée la mise en page initiale pour le dashboard."""
+    """Creates the initial layout for the dashboard."""
     layout = Layout()
 
-    # Divise la mise en page principale en en-tête et corps
+    # Split the main layout into header and body
     layout.split(
         Layout(name="header", size=1),
         Layout(name="body")
     )
 
-    # Divise le corps en sections supérieure et inférieure
+    # Split the body into upper and lower sections
     layout["body"].split(
         Layout(name="upper", ratio=1),
         Layout(name="lower", ratio=1)
     )
 
-    # Divise la section supérieure en résumé et processus
+    # Split the upper section into summary and processes
     layout["upper"].split_row(
         Layout(name="summary", ratio=1),
         Layout(name="processes", ratio=2)
     )
 
-    # Divise la section inférieure en processus GPU et statistiques Ollama
+    # Split the lower section into GPU processes and Ollama statistics
     layout["lower"].split_row(
         Layout(name="gpu_processes", ratio=1),
         Layout(name="ollama", ratio=1)
@@ -112,40 +112,40 @@ def create_layout():
 
 
 def build_header():
-    """Construit le panel d'en-tête."""
+    """Builds the header panel."""
     header_text = Text("🖥️ Sys Stats", style="bold white on blue")
     return Panel(header_text, height=1, style="blue", padding=(0, 2))
 
 
 def build_summary(data, interval):
-    """Construit le panel de résumé avec l'utilisation du CPU, RAM et GPU."""
+    """Builds the summary panel showing CPU, RAM, and GPU usage."""
     table = Table.grid(expand=True)
     table.add_column(justify="left")
     table.add_column(justify="right")
 
     current_time = f"[bold]{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}[/bold]"
 
-    table.add_row("Heure actuelle", current_time)
+    table.add_row("Current Time", current_time)
     table.add_row("", "")
 
-    # Informations CPU et RAM
+    # CPU and RAM information
     cpu_usage = f"[bold green]CPU:[/bold green] {data.get('cpu', 0):.1f}%"
     ram_percent = data.get('ram', {}).get('percent', 0)
     ram_total = human_readable_size(data.get('ram', {}).get('total', 0))
     ram_usage = f"[bold yellow]RAM:[/bold yellow] {ram_percent:.1f}% / {ram_total}"
     table.add_row(cpu_usage, ram_usage)
 
-    # Informations GPU
+    # GPU information
     if data.get("has_gpu") and data.get("gpu"):
         table.add_row('','')
-        
+
         gpu_data = data['gpu'][0]
         gpu_name = truncate_name(gpu_data.get('name', 'N/A'), 15)
         gpu_load = gpu_data.get('load', 0)
         gpu_fan_speed = gpu_data.get('fanSpeed', '')
         gpu_power_draw = gpu_data.get('powerDraw', '')
 
-        # Calcul du VRAM total
+        # Total VRAM calculation
         memory_used = gpu_data.get('memoryUsed', 0)
         memory_percent = gpu_data.get('memoryPercent', 0)
         if memory_percent > 0:
@@ -158,7 +158,7 @@ def build_summary(data, interval):
 
         gpu_title = f"[bold blue]GPU:[/bold blue] {gpu_name} ({memory_total_str})"
         table.add_row(gpu_title)
-        
+
         gpu_fan = f"[bold blue]Fan:[/bold blue] {gpu_fan_speed}%"
         gpu_power = f"[bold blue]Power draw:[/bold blue] {gpu_power_draw}W"
         table.add_row(gpu_fan, gpu_power)
@@ -167,9 +167,9 @@ def build_summary(data, interval):
         gpu_load_str = f"[bold blue]Load:[/bold blue] {gpu_load:.1f}%"
         table.add_row(gpu_load_str, gpu_vram)
 
-    # Statut (Pause ou en cours)
+    # Status (Paused or Running)
     with state_lock:
-        status = "[bold red]PAUSÉ[/bold red]" if is_paused else ""
+        status = "[bold red]PAUSED[/bold red]" if is_paused else ""
 
     table.add_row("", status)
 
@@ -177,16 +177,16 @@ def build_summary(data, interval):
         table,
         border_style="cyan",
         padding=(0, 1),
-        subtitle=f"Taux de rafraîchissement : {interval}s"
+        subtitle=f"Refresh rate: {interval}s"
     )
     return summary_panel
 
 
 def build_process_table(processes, key, title):
-    """Construit un tableau pour les processus les plus gourmands."""
+    """Builds a table for the most resource-intensive processes."""
     if not processes:
         return Panel(
-            f"Aucune donnée pour {title}.",
+            f"No data for {title}.",
             title=f"[bold cyan]{title}[/bold cyan]",
             border_style="cyan",
             padding=(0, 1)
@@ -195,13 +195,13 @@ def build_process_table(processes, key, title):
     table = Table(show_header=True, header_style="bold magenta", padding=(0, 1))
     if key == 'top_cpu':
         table.add_column("PID", style="cyan", no_wrap=True, width=6)
-        table.add_column("Nom", style="green", width=15)
+        table.add_column("Name", style="green", width=15)
         table.add_column("CPU%", style="yellow", justify="right", width=6)
         table.add_column("Cmdline", style="white", max_width=20)
     elif key == 'top_memory':
         table.add_column("PID", style="cyan", no_wrap=True, width=6)
-        table.add_column("Nom", style="green", width=15)
-        table.add_column("Mémoire%", style="blue", justify="right", width=6)
+        table.add_column("Name", style="green", width=15)
+        table.add_column("Memory%", style="blue", justify="right", width=6)
         table.add_column("Cmdline", style="white", max_width=20)
 
     for proc in processes:
@@ -219,12 +219,12 @@ def build_process_table(processes, key, title):
 
 
 def build_processes_panel(data):
-    """Construit le panel des processus avec Top CPU et Top Mémoire."""
+    """Builds the panel for Top CPU and Top Memory processes."""
     top_cpu = data.get('top_cpu', [])
     top_memory = data.get('top_memory', [])
 
     table_cpu = build_process_table(top_cpu, 'top_cpu', 'CPU')
-    table_mem = build_process_table(top_memory, 'top_memory', 'Mémoire')
+    table_mem = build_process_table(top_memory, 'top_memory', 'Memory')
 
     processes_table = Table.grid(expand=True)
     processes_table.add_column()
@@ -232,27 +232,27 @@ def build_processes_panel(data):
 
     processes_table.add_row(
         Panel(table_cpu, title="[bold cyan]Top CPU[/bold cyan]", border_style="cyan", padding=(0, 1)),
-        Panel(table_mem, title="[bold cyan]Top Mémoire[/bold cyan]", border_style="cyan", padding=(0, 1))
+        Panel(table_mem, title="[bold cyan]Top Memory[/bold cyan]", border_style="cyan", padding=(0, 1))
     )
 
     return processes_table
 
 
 def build_gpu_processes_panel(data):
-    """Construit le panel des processus GPU."""
+    """Builds the panel for GPU processes."""
     processes = data.get("top_gpu_processes", [])
     if not processes:
         return Panel(
-            "Aucun processus GPU.",
-            title="[bold cyan]Processus GPU[/bold cyan]",
+            "No GPU processes.",
+            title="[bold cyan]GPU Processes[/bold cyan]",
             border_style="cyan",
             padding=(0, 1)
         )
 
     table = Table(show_header=True, header_style="bold magenta", padding=(0, 1))
     table.add_column("PID", style="cyan", no_wrap=True, width=6)
-    table.add_column("Nom", style="green", width=15)
-    table.add_column("Mémoire Utilisée", style="blue", justify="right", width=10)
+    table.add_column("Name", style="green", width=15)
+    table.add_column("Memory Used", style="blue", justify="right", width=10)
     table.add_column("Cmdline", style="white", max_width=20)
 
     for proc in processes:
@@ -264,29 +264,29 @@ def build_gpu_processes_panel(data):
 
     return Panel(
         table,
-        title="[bold cyan]Processus GPU[/bold cyan]",
+        title="[bold cyan]GPU Processes[/bold cyan]",
         border_style="cyan",
         padding=(0, 1)
     )
 
 
 def build_ollama_panel(data):
-    """Construit le panel des statistiques Ollama."""
+    """Builds the panel for Ollama statistics."""
     models = data.get("ollama_processes", {}).get("models", [])
     if not models:
         return Panel(
-            "Aucun modèle Ollama.",
-            title="[bold cyan]Statistiques Ollama[/bold cyan]",
+            "No Ollama models.",
+            title="[bold cyan]Ollama Statistics[/bold cyan]",
             border_style="cyan",
             padding=(0, 1)
         )
 
     table = Table(show_header=True, header_style="bold magenta", padding=(0, 1))
-    table.add_column("Modèle", style="green", width=15)
-    table.add_column("Taille", style="blue", justify="right", width=10)
+    table.add_column("Model", style="green", width=15)
+    table.add_column("Size", style="blue", justify="right", width=10)
     table.add_column("VRAM", style="blue", justify="right", width=10)
     table.add_column("GPU%", style="red", justify="right", width=6)
-    table.add_column("Expire", style="yellow", justify="right", width=12)
+    table.add_column("Expires", style="yellow", justify="right", width=12)
 
     for model in models:
         model_name = truncate_name(model.get('name', 'N/A'))
@@ -305,52 +305,52 @@ def build_ollama_panel(data):
 
     return Panel(
         table,
-        title="[bold cyan]Statistiques Ollama[/bold cyan]",
+        title="[bold cyan]Ollama Statistics[/bold cyan]",
         border_style="cyan",
         padding=(0, 1)
     )
 
 
 def build_layout_content(layout, data, interval, terminal_width):
-    """Remplit la mise en page avec les données récupérées."""
-    # Mise à jour de l'en-tête
+    """Fills the layout with the fetched data."""
+    # Update header
     layout["header"].update(build_header())
 
-    # Mise à jour du résumé
+    # Update summary
     summary_panel = build_summary(data, interval)
     layout["upper"]["summary"].update(summary_panel)
 
-    # Mise à jour des processus (Top CPU et Top Mémoire)
+    # Update processes (Top CPU and Top Memory)
     processes_table = build_processes_panel(data)
     layout["upper"]["processes"].update(processes_table)
 
-    # Mise à jour des processus GPU
+    # Update GPU processes
     gpu_processes_panel = build_gpu_processes_panel(data)
     layout["lower"]["gpu_processes"].update(gpu_processes_panel)
 
-    # Mise à jour des statistiques Ollama
+    # Update Ollama statistics
     ollama_panel = build_ollama_panel(data)
     layout["lower"]["ollama"].update(ollama_panel)
 
 
 def build_full_screen_help():
-    """Construit le panel d'aide en plein écran."""
+    """Builds the full-screen help panel."""
     help_text = """
-[bold yellow]Raccourcis Clavier :[/bold yellow]
+[bold yellow]Keyboard Shortcuts:[/bold yellow]
 
-[bold green]q[/bold green] - Quitter
-[bold green]r[/bold green] - Rafraîchir
-[bold green]h[/bold green] - Afficher/Masquer l'aide
-[bold green]p[/bold green] - Pause/Reprendre
-[bold green]-[/bold green] - Diminuer l'intervalle
-[bold green]+[/bold green] - Augmenter l'intervalle
+[bold green]q[/bold green] - Quit
+[bold green]r[/bold green] - Refresh
+[bold green]h[/bold green] - Show/Hide help
+[bold green]p[/bold green] - Pause/Resume
+[bold green]-[/bold green] - Decrease interval
+[bold green]+[/bold green] - Increase interval
 
-Appuyez de nouveau sur [bold green]h[/bold green] pour revenir.
+Press [bold green]h[/bold green] again to return.
 """
 
     help_panel = Panel.fit(
         help_text,
-        title="[bold cyan]Aide[/bold cyan]",
+        title="[bold cyan]Help[/bold cyan]",
         border_style="green",
         padding=(1, 2)
     )
@@ -358,7 +358,7 @@ Appuyez de nouveau sur [bold green]h[/bold green] pour revenir.
 
 
 def keyboard_listener():
-    """Écoute les entrées clavier et modifie l'état en conséquence."""
+    """Listens for keyboard input and modifies state accordingly."""
     global is_paused, show_help_flag, refresh_interval, latest_stats
     while not exit_event.is_set():
         key = readchar.readkey()
@@ -366,30 +366,30 @@ def keyboard_listener():
             if key.lower() == 'q':
                 exit_event.set()
             elif key.lower() == 'r':
-                # Signal pour rafraîchir les données
-                rebuild_layout_event.set()  # On veut reconstruire le layout avec les mêmes données
+                # Signal to refresh data
+                rebuild_layout_event.set()  # We want to rebuild the layout with the same data
             elif key.lower() == 'h':
                 show_help_flag = not show_help_flag
-                rebuild_layout_event.set()  # Reconstruire le layout pour afficher/masquer l'aide
+                rebuild_layout_event.set()  # Rebuild layout to show/hide help
             elif key.lower() == 'p':
                 is_paused = not is_paused
-                rebuild_layout_event.set()  # Reconstruire le layout pour afficher l'état de pause
+                rebuild_layout_event.set()  # Rebuild layout to show pause state
             elif key == '-':
                 if refresh_interval > 1:
                     refresh_interval -= 1
-                    rebuild_layout_event.set()  # Reconstruire le layout pour afficher le nouvel intervalle
+                    rebuild_layout_event.set()  # Rebuild layout to show new interval
             elif key == '+':
                 if refresh_interval < 60:
                     refresh_interval += 1
-                    rebuild_layout_event.set()  # Reconstruire le layout pour afficher le nouvel intervalle
+                    rebuild_layout_event.set()  # Rebuild layout to show new interval
 
 
 def main():
-    """Fonction principale pour exécuter le dashboard CLI des statistiques serveur."""
+    """Main function to run the server statistics CLI dashboard."""
     global latest_stats
-    parser = argparse.ArgumentParser(description="CLI pour le dashboard des statistiques serveur")
-    parser.add_argument("--url", type=str, default=SYS_STATS_API_URL, help="URL de l'API pour les statistiques")
-    parser.add_argument("--interval", type=int, default=5, help="Intervalle de rafraîchissement en secondes (peut être ajusté avec '+' et '-')")
+    parser = argparse.ArgumentParser(description="CLI for server statistics dashboard")
+    parser.add_argument("--url", type=str, default=SYS_STATS_API_URL, help="API URL for the statistics")
+    parser.add_argument("--interval", type=int, default=5, help="Refresh interval in seconds (can be adjusted with '+' and '-')")
     args = parser.parse_args()
 
     global refresh_interval
@@ -398,7 +398,7 @@ def main():
 
     layout = create_layout()
 
-    # Démarrer le thread d'écoute des touches clavier
+    # Start keyboard listener thread
     listener_thread = threading.Thread(target=keyboard_listener, daemon=True)
     listener_thread.start()
 
@@ -410,12 +410,12 @@ def main():
                 help_flag = show_help_flag
 
             if help_flag:
-                # Afficher le panel d'aide en plein écran
+                # Show the help panel in full screen
                 help_panel = build_full_screen_help()
                 layout.update(help_panel)
             else:
                 if not paused:
-                    # Récupérer les statistiques si non en pause
+                    # Fetch statistics if not paused
                     stats = fetch_stats(args.url)
                     if stats:
                         with stats_lock:
@@ -424,11 +424,11 @@ def main():
                         terminal_width = terminal_size.columns
                         build_layout_content(layout, latest_stats, current_interval, terminal_width)
                 else:
-                    # Si en pause, reconstruire uniquement la mise en page avec les dernières données
+                    # If paused, only rebuild the layout with the latest data
                     if latest_stats:
                         build_layout_content(layout, latest_stats, current_interval, terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns)
 
-            # Vérifier si un rebuild du layout est requis
+            # Check if a layout rebuild is required
             if rebuild_layout_event.is_set():
                 if help_flag:
                     help_panel = build_full_screen_help()
@@ -439,15 +439,15 @@ def main():
                     build_layout_content(layout, latest_stats, current_interval, terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns)
                 rebuild_layout_event.clear()
 
-            # Attendre l'intervalle de rafraîchissement ou un événement
+            # Wait for the refresh interval or an event
             sleep_time = current_interval
             start_time = time.time()
             while (time.time() - start_time) < sleep_time:
                 if exit_event.is_set() or rebuild_layout_event.is_set():
                     break
-                time.sleep(0.1)  # Attendre par tranches de 100ms pour réagir rapidement aux événements
+                time.sleep(0.1)  # Wait in 100ms slices to react quickly to events
 
-    console.print("[bold red]Fermeture du dashboard...[/bold red]")
+    console.print("[bold red]Closing the dashboard...[/bold red]")
 
 
 if __name__ == "__main__":
