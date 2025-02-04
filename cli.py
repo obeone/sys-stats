@@ -156,8 +156,8 @@ def build_summary(data, interval):
         memory_total_str = human_readable_size(memory_total)
         vram_percent = memory_percent
 
-        gpu_title = f"[bold blue]GPU:[/bold blue] {gpu_name} ({memory_total_str})"
-        table.add_row(gpu_title)
+        gpu_title = f"[bold blue]GPU:[/bold blue] {gpu_name}"
+        table.add_row(gpu_title, memory_total_str)
 
         gpu_fan = f"[bold blue]Fan:[/bold blue] {gpu_fan_speed}%"
         gpu_power = f"[bold blue]Power draw:[/bold blue] {gpu_power_draw}W"
