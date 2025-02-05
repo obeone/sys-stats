@@ -86,7 +86,6 @@ def create_layout():
 
     # Split the main layout into header and body
     layout.split(
-        Layout(name="header", size=1),
         Layout(name="body")
     )
 
@@ -109,13 +108,6 @@ def create_layout():
     )
 
     return layout
-
-
-def build_header():
-    """Builds the header panel."""
-    header_text = Text("🖥️ Sys Stats", style="bold white on blue")
-    return Panel(header_text, height=1, style="blue", padding=(0, 2))
-
 
 def build_summary(data, interval):
     """Builds the summary panel showing CPU, RAM, and GPU usage."""
@@ -320,9 +312,6 @@ def build_ollama_panel(data):
 
 def build_layout_content(layout, data, interval, terminal_width):
     """Fills the layout with the fetched data."""
-    # Update header
-    layout["header"].update(build_header())
-
     # Update summary
     summary_panel = build_summary(data, interval)
     layout["upper"]["summary"].update(summary_panel)
