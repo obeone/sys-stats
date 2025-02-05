@@ -7,7 +7,7 @@ import shutil
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.table import Table
 from rich.panel import Panel
@@ -135,38 +135,6 @@ def build_summary(data, interval):
     ram_usage = f"[bold yellow]RAM:[/bold yellow] {ram_percent:.1f}% / {ram_total}"
     table.add_row(cpu_usage, ram_usage)
 
-    # GPU information
-    if data.get("has_gpu") and data.get("gpu"):
-        table.add_row('','')
-
-        gpu_data = data['gpu'][0]
-        gpu_name = truncate_name(gpu_data.get('name', 'N/A'), 15)
-        gpu_load = gpu_data.get('load', 0)
-        gpu_fan_speed = gpu_data.get('fanSpeed', '')
-        gpu_power_draw = gpu_data.get('powerDraw', '')
-
-        # Total VRAM calculation
-        memory_used = gpu_data.get('memoryUsed', 0)
-        memory_percent = gpu_data.get('memoryPercent', 0)
-        if memory_percent > 0:
-            memory_total = memory_used / (memory_percent / 100)
-        else:
-            memory_total = 0
-        memory_used_str = human_readable_size(memory_used)
-        memory_total_str = human_readable_size(memory_total)
-        vram_percent = memory_percent
-
-        gpu_title = f"[bold blue]GPU:[/bold blue] {gpu_name}"
-        table.add_row(gpu_title, memory_total_str)
-
-        gpu_fan = f"[bold blue]Fan:[/bold blue] {gpu_fan_speed}%"
-        gpu_power = f"[bold blue]Power draw:[/bold blue] {gpu_power_draw}W"
-        table.add_row(gpu_fan, gpu_power)
-
-        gpu_vram = f"[bold blue]VRAM:[/bold blue] {memory_used_str} ({vram_percent:.1f}%)"
-        gpu_load_str = f"[bold blue]Load:[/bold blue] {gpu_load:.1f}%"
-        table.add_row(gpu_load_str, gpu_vram)
-
     # Status (Paused or Running)
     with state_lock:
         status = "[bold red]PAUSED[/bold red]" if is_paused else ""
@@ -174,13 +142,52 @@ def build_summary(data, interval):
     table.add_row("", status)
 
     summary_panel = Panel(
-        table,
+        Group(table, build_gpu_summary(data)),
         border_style="cyan",
         padding=(0, 1),
         subtitle=f"Refresh rate: {interval}s"
     )
     return summary_panel
 
+def build_gpu_summary(data):
+    """Builds a summary panel for GPU information."""
+    tables = []
+    
+    if data.get("has_gpu") and data.get("gpu"):
+        for gpu_data in data['gpu']:
+
+            gpu_data = data['gpu'][0]
+            gpu_name = truncate_name(gpu_data.get('name', 'N/A'), 25)
+            gpu_load = gpu_data.get('load', 0)
+            gpu_fan_speed = gpu_data.get('fanSpeed', '')
+            gpu_power_draw = gpu_data.get('powerDraw', '')
+            gpu_temperature = gpu_data.get('temperature', '')
+
+            # Total VRAM calculation
+            memory_used = gpu_data.get('memoryUsed', 0)
+            memory_percent = gpu_data.get('memoryPercent', 0)
+            if memory_percent > 0:
+                memory_total = memory_used / (memory_percent / 100)
+            else:
+                memory_total = 0
+            memory_used_str = human_readable_size(memory_used)
+            memory_total_str = human_readable_size(memory_total)
+            vram_percent = memory_percent
+
+            table = Table(title=gpu_name, show_header=False, padding=(0, 1), expand=True)
+            
+            table.add_column(style='green')
+            table.add_column()
+            table.add_row('Total VRAM', memory_total_str)
+            table.add_row('Power draw', f"{gpu_power_draw:.0f} W")
+            table.add_row('Temperature', f"{gpu_temperature:.0f} °C")
+            table.add_row('Fan speed', f"{gpu_fan_speed:.0f} %")
+            table.add_row('VRAM used', f"{memory_used_str} ({vram_percent:.2f} %)")
+            table.add_row('Utilization', f"{gpu_load:.1f} %")
+            
+            tables.append(table)
+
+    return Group(*tables)
 
 def build_process_table(processes, key, title):
     """Builds a table for the most resource-intensive processes."""
