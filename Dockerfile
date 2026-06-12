@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
 
-# --- Build stage: resolve and install the package into an isolated venv ---
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
-
-ENV UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy
+# --- Build stage: install the package into an isolated venv ---
+# Use the full python image (ships a C toolchain) so native deps such as
+# psutil build from source on the exotic arches the workflow targets
+# (i386, arm/v7), which the slim/uv images do not all publish.
+FROM python:3.12 AS builder
 
 WORKDIR /app
 
@@ -12,9 +12,9 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv /opt/venv && \
-    VIRTUAL_ENV=/opt/venv uv pip install .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m venv /opt/venv && \
+    /opt/venv/bin/pip install .
 
 # --- Runtime stage: slim image with just the venv ---
 FROM python:3.12-slim
