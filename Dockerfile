@@ -1,32 +1,34 @@
 # syntax=docker/dockerfile:1
 
-FROM python:3.12 as builder
+# --- Build stage: resolve and install the package into an isolated venv ---
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
 
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip wheel -r requirements.txt -w /app/wheels
+# Copy only what the build needs first, for better layer caching.
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
 
-# Use a lightweight Python image as base
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv /opt/venv && \
+    VIRTUAL_ENV=/opt/venv uv pip install .
+
+# --- Runtime stage: slim image with just the venv ---
 FROM python:3.12-slim
 
 RUN useradd -d /app -m stats
 
-USER stats
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Set working directory
+USER stats
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN --mount=type=bind,from=builder,source=/app/wheels,target=/wheels \
-    pip install --no-index --find-links=/wheels -r requirements.txt
-
-# Copy necessary files into the container
-COPY . .
-
-# Expose port where Flask will run
+# Flask metrics server listens here (see sys_stats.server).
 EXPOSE 5000
 
-# Run Python application
-CMD ["python", "app.py"]
+# Console-script entry point installed by the package.
+CMD ["sys-stats-server"]
