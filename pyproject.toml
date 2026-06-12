@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sys-stats"
+version = "1.0.0"
+description = "Real-time system, GPU and Ollama monitoring dashboard (terminal + web)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "obeone", email = "obeone@obeone.org" }]
+keywords = ["monitoring", "dashboard", "gpu", "nvidia", "ollama", "psutil", "rich"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "coloredlogs>=15.0",
+    "Flask>=3.1",
+    "Flask-Cors>=6.0",
+    "GPUtil>=1.4",
+    "psutil>=6.1",
+    "requests>=2.32",
+    "rich>=13.9",
+    "readchar>=4.0",
+    "setuptools>=78.1; python_version >= '3.12'",
+]
+
+[project.urls]
+Homepage = "https://github.com/obeone/sys-stats"
+Repository = "https://github.com/obeone/sys-stats"
+Issues = "https://github.com/obeone/sys-stats/issues"
+
+[project.scripts]
+sys-stats = "sys_stats.cli:main"
+sys-stats-server = "sys_stats.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sys_stats"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/sys_stats", "README.md", "LICENSE"]
