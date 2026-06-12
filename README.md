@@ -57,10 +57,22 @@ Ensure you have the following installed on your system:
 
    The service will be running at `http://localhost:5000`.
 
-### 📦 Installing as a CLI (uv)
+### 📦 Installing as a CLI
 
-Sys-Stats is a proper Python package. The fastest way to get the commands on
-your `PATH` is [`uv`](https://docs.astral.sh/uv/):
+Sys-Stats is a proper Python package, so any standard Python installer puts the
+commands on your `PATH`. Pick the one you already use.
+
+Whichever method you choose, you get two console scripts:
+
+| Command            | Purpose                                            |
+| ------------------ | -------------------------------------------------- |
+| `sys-stats`        | The Rich terminal dashboard (client).              |
+| `sys-stats-server` | The Flask metrics API + web UI (serves `/stats`).  |
+
+#### With uv (recommended)
+
+[`uv`](https://docs.astral.sh/uv/) is the fastest option and isolates the tool
+in its own environment:
 
 ```bash
 # Install straight from the repository...
@@ -71,14 +83,42 @@ git clone https://github.com/obeone/sys-stats.git
 uv tool install ./sys-stats
 ```
 
-This installs two console scripts:
+Upgrade later with `uv tool upgrade sys-stats`, remove with
+`uv tool uninstall sys-stats`.
 
-| Command            | Purpose                                            |
-| ------------------ | -------------------------------------------------- |
-| `sys-stats`        | The Rich terminal dashboard (client).              |
-| `sys-stats-server` | The Flask metrics API + web UI (serves `/stats`).  |
+#### With pipx
 
-`pip install .` and `pipx install .` work the same way if you prefer them.
+[`pipx`](https://pipx.pypa.io/) also installs the CLI in a dedicated virtual
+environment, keeping it isolated from your system Python:
+
+```bash
+# From the repository...
+pipx install git+https://github.com/obeone/sys-stats.git
+
+# ...or from a local checkout
+pipx install ./sys-stats
+```
+
+Upgrade with `pipx upgrade sys-stats`, remove with `pipx uninstall sys-stats`.
+
+#### With pip
+
+Plain `pip` works too — ideally inside a virtual environment so it doesn't
+pollute your system packages:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # On Windows: .venv\Scripts\activate
+
+# From the repository...
+pip install git+https://github.com/obeone/sys-stats.git
+
+# ...or from a local checkout
+pip install ./sys-stats
+```
+
+With this method the `sys-stats` and `sys-stats-server` commands are available
+whenever the virtual environment is activated.
 
 ### ⚙️ Running Without Docker
 
@@ -89,7 +129,7 @@ This installs two console scripts:
 
 #### Setup Instructions
 
-1. **Install the package** (see [Installing as a CLI](#-installing-as-a-cli-uv))
+1. **Install the package** (see [Installing as a CLI](#-installing-as-a-cli))
    or, for development, in an editable virtual environment:
 
    ```bash
