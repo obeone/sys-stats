@@ -279,7 +279,16 @@ def get_stats():
         "ollama_processes": ollama_processes
     })
 
-if __name__ == '__main__':
+def main() -> None:
+    """Console-script entry point: run the Flask metrics server.
+
+    Honours the ``FLASK_DEBUG``, ``HOST`` and ``PORT`` environment variables.
+    """
     debug_mode = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
+    host = os.getenv('HOST', '0.0.0.0')
     port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=debug_mode)
+    app.run(host=host, port=port, debug=debug_mode)
+
+
+if __name__ == '__main__':
+    main()
