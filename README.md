@@ -57,75 +57,78 @@ Ensure you have the following installed on your system:
 
    The service will be running at `http://localhost:5000`.
 
-### ⚙️ Running Without Docker
+### 📦 Installing as a CLI (uv)
 
-If you prefer to run the Sys-Stats Dashboard directly on your machine without using Docker, follow these steps for a seamless setup:
+Sys-Stats is a proper Python package. The fastest way to get the commands on
+your `PATH` is [`uv`](https://docs.astral.sh/uv/):
+
+```bash
+# Install straight from the repository...
+uv tool install git+https://github.com/obeone/sys-stats.git
+
+# ...or from a local checkout
+git clone https://github.com/obeone/sys-stats.git
+uv tool install ./sys-stats
+```
+
+This installs two console scripts:
+
+| Command            | Purpose                                            |
+| ------------------ | -------------------------------------------------- |
+| `sys-stats`        | The Rich terminal dashboard (client).              |
+| `sys-stats-server` | The Flask metrics API + web UI (serves `/stats`).  |
+
+`pip install .` and `pipx install .` work the same way if you prefer them.
+
+### ⚙️ Running Without Docker
 
 #### Prerequisites
 
-Before setting up the project, make sure you have the following prerequisites installed:
-
-- **Python 3.12+**: You'll need Python to run the application natively.
-- **pip**: Python's package manager to install required dependencies.
-- **NVIDIA drivers**: For GPU monitoring (if applicable).
+- **Python 3.10+**
+- **NVIDIA drivers**: for GPU monitoring (optional).
 
 #### Setup Instructions
 
-1. **Clone the Repository:**
-
-   Begin by cloning the repository to your local machine:
+1. **Install the package** (see [Installing as a CLI](#-installing-as-a-cli-uv))
+   or, for development, in an editable virtual environment:
 
    ```bash
    git clone https://github.com/obeone/sys-stats.git
    cd sys-stats
+   uv venv && source .venv/bin/activate
+   uv pip install -e .
    ```
 
-2. **Create a Virtual Environment:**
+2. **Configure environment variables (optional):**
 
-   It's a good practice to use a virtual environment to manage dependencies:
-
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-   ```
-
-3. **Install Dependencies:**
-
-   Install the required packages using `pip`:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Configure Environment Variables:**
-
-   If you're using the Ollama API, ensure you set the `OLLAMA_API_URL` environment variable:
+   To enable Ollama metrics, point the server at your Ollama instance:
 
    ```bash
    export OLLAMA_API_URL="http://localhost:11434"
    ```
 
-5. **Start the Application:**
-
-   Run the Flask application:
+3. **Start the server:**
 
    ```bash
-   python app.py
+   sys-stats-server
    ```
 
-   The application will start on `http://localhost:5000`.
+   The application starts on `http://localhost:5000`. It honours the `HOST`,
+   `PORT` and `FLASK_DEBUG` environment variables.
 
 ## 📺 Using the CLI
 
-To use the CLI for live monitoring, execute:
+To use the terminal dashboard for live monitoring, run:
 
 ```bash
-python cli.py [--url http://localhost:5000/stats] [--interval 5]
+sys-stats [--url http://localhost:5000/stats] [--interval 5]
 ```
 
-This command launches the CLI with a 5-second refresh interval.
+This launches the dashboard with a 5-second refresh interval (adjustable at
+runtime with `+` / `-`; press `h` for the full keyboard help). The API URL can
+also be set via the `SYS_STATS_API_URL` environment variable.
 
-You're all set! Now you can enjoy using the Sys-Stats Dashboard on your local setup without Docker.
+You're all set! Enjoy the Sys-Stats Dashboard.
 
 ## 🧑‍💻 Contributing
 
