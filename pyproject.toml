@@ -32,6 +32,12 @@ dependencies = [
     "setuptools>=78.1; python_version >= '3.12'",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
 [project.urls]
 Homepage = "https://github.com/obeone/sys-stats"
 Repository = "https://github.com/obeone/sys-stats"
@@ -46,3 +52,15 @@ packages = ["src/sys_stats"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/sys_stats", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
