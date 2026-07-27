@@ -1,8 +1,11 @@
 /.DS_Store
 /.venv
-/__pycache__
+__pycache__/
 /sys-stats
 /build
 /dist
 *.egg-info/
 .qodo
+.pytest_cache/
+.ruff_cache/
+.agent.lock
