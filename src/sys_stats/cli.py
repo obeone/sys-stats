@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 
-import requests
-import time
 import argparse
-import shutil
 import os
+import shutil
 import threading
+import time
 from datetime import datetime, timedelta, timezone
-from rich.console import Console, Group
-from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
-from rich.layout import Layout
-from rich.text import Text
+
 import readchar  # To capture key presses
+import requests
+from rich.console import Console, Group
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 
 # Default API URL
 SYS_STATS_API_URL = os.getenv('SYS_STATS_API_URL', 'http://localhost:5000/stats')
@@ -49,8 +49,13 @@ def fetch_stats(api_url):
 
 
 def human_readable_size(size):
-    """Converts bytes into a human-readable format."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+    """Converts bytes into a human-readable format.
+
+    ``TB`` is handled by the fallback rather than by the loop: a unit listed in
+    the loop gets divided once more before the fallback is reached, which would
+    under-report anything past a terabyte.
+    """
+    for unit in ['B', 'KB', 'MB', 'GB']:
         if size < 1024:
             return f"{size:.1f} {unit}"
         size /= 1024
@@ -144,11 +149,9 @@ def build_summary(data, interval):
 def build_gpu_summary(data):
     """Builds a summary panel for GPU information."""
     tables = []
-    
+
     if data.get("has_gpu") and data.get("gpu"):
         for gpu_data in data['gpu']:
-
-            gpu_data = data['gpu'][0]
             gpu_name = truncate_name(gpu_data.get('name', 'N/A'), 25)
             gpu_load = gpu_data.get('load', 0)
             gpu_fan_speed = gpu_data.get('fanSpeed', '')
@@ -167,7 +170,7 @@ def build_gpu_summary(data):
             vram_percent = memory_percent
 
             table = Table(title=gpu_name, show_header=False, padding=(0, 1), expand=True)
-            
+
             table.add_column(style='green')
             table.add_column()
             table.add_row('Total VRAM', memory_total_str)
@@ -176,7 +179,7 @@ def build_gpu_summary(data):
             table.add_row('Fan speed', f"{gpu_fan_speed:.0f} %")
             table.add_row('VRAM used', f"{memory_used_str} ({vram_percent:.2f} %)")
             table.add_row('Utilization', f"{gpu_load:.1f} %")
-            
+
             tables.append(table)
 
     return Group(*tables)
@@ -385,7 +388,12 @@ def main():
     global latest_stats
     parser = argparse.ArgumentParser(description="CLI for server statistics dashboard")
     parser.add_argument("--url", type=str, default=SYS_STATS_API_URL, help="API URL for the statistics")
-    parser.add_argument("--interval", type=int, default=5, help="Refresh interval in seconds (can be adjusted with '+' and '-')")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=5,
+        help="Refresh interval in seconds (can be adjusted with '+' and '-')",
+    )
     args = parser.parse_args()
 
     global refresh_interval
@@ -422,7 +430,12 @@ def main():
                 else:
                     # If paused, only rebuild the layout with the latest data
                     if latest_stats:
-                        build_layout_content(layout, latest_stats, current_interval, terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns)
+                        build_layout_content(
+                            layout,
+                            latest_stats,
+                            current_interval,
+                            terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns,
+                        )
 
             # Check if a layout rebuild is required
             if rebuild_layout_event.is_set():
@@ -430,9 +443,19 @@ def main():
                     help_panel = build_full_screen_help()
                     layout.update(help_panel)
                 elif not paused and latest_stats:
-                    build_layout_content(layout, latest_stats, current_interval, terminal_width=shutil.get_terminal_size(fallback=(80, 24)).columns)
+                    build_layout_content(
+                        layout,
+                        latest_stats,
+                        current_interval,
+                        terminal_width=shutil.get_terminal_size(fallback=(80, 24)).columns,
+                    )
                 elif paused and latest_stats:
-                    build_layout_content(layout, latest_stats, current_interval, terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns)
+                    build_layout_content(
+                        layout,
+                        latest_stats,
+                        current_interval,
+                        terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns,
+                    )
                 rebuild_layout_event.clear()
 
             # Wait for the refresh interval or an event
