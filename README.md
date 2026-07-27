@@ -136,8 +136,18 @@ whenever the virtual environment is activated.
    git clone https://github.com/obeone/sys-stats.git
    cd sys-stats
    uv venv && source .venv/bin/activate
-   uv pip install -e .
+   uv pip install -e '.[dev]'
    ```
+
+   The `[dev]` extra adds `pytest` and `ruff`. Run the checks with:
+
+   ```bash
+   pytest
+   ruff check .
+   ```
+
+   Note for macOS: port 5000 is used by AirPlay Receiver, so start the server
+   with `PORT=5051 sys-stats-server` if you don't want to disable it.
 
 2. **Configure environment variables (optional):**
 
