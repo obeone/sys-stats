@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-import os
-import logging
-import psutil
-import subprocess
-from typing import List, Dict, Any
-from flask import Flask, jsonify, render_template, request, send_from_directory
-from flask_cors import CORS
-import GPUtil
-import coloredlogs
-import requests
 import datetime
+import logging
+import os
+import subprocess
+from typing import Any
 from urllib.parse import urljoin
 
+import coloredlogs
+import GPUtil
+import psutil
+import requests
+from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask_cors import CORS
 
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL")
 
@@ -23,17 +22,22 @@ coloredlogs.install(level='INFO', logger=logger, fmt='%(asctime)s - %(levelname)
 app = Flask(__name__)
 CORS(app)
 
-def get_top_processes_by_cpu(limit: int = 5) -> List[Dict[str, Any]]:
+def get_top_processes_by_cpu(limit: int = 5) -> list[dict[str, Any]]:
     """
     Retrieve the top processes by CPU usage.
     """
     processes = []
     for p in psutil.process_iter(["pid", "name", "cpu_percent", "cmdline"]):
         try:
+            # ``process_iter`` does not raise for attributes it cannot read: it
+            # fills them with None. That is the common case for root-owned
+            # processes when the server runs unprivileged (macOS, container
+            # without `pid: host` + `privileged`), and sorting None against a
+            # float would blow up the whole endpoint.
             processes.append({
                 "pid": p.info["pid"],
                 "name": p.info["name"],
-                "cpu_percent": p.info["cpu_percent"],
+                "cpu_percent": p.info["cpu_percent"] or 0.0,
                 "cmdline": " ".join(p.info["cmdline"]) if p.info["cmdline"] else "N/A"
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -43,18 +47,21 @@ def get_top_processes_by_cpu(limit: int = 5) -> List[Dict[str, Any]]:
     logger.debug(f"Top CPU processes: {processes[:limit]}")
     return processes[:limit]
 
-def get_top_processes_by_memory(limit: int = 5) -> List[Dict[str, Any]]:
+def get_top_processes_by_memory(limit: int = 5) -> list[dict[str, Any]]:
     """
     Retrieve the top processes by memory usage.
     """
     processes = []
     for p in psutil.process_iter(["pid", "name", "memory_percent", "memory_info", "cmdline"]):
         try:
+            # See get_top_processes_by_cpu: unreadable attributes come back as
+            # None, including the whole memory_info namedtuple.
+            memory_info = p.info["memory_info"]
             processes.append({
                 "pid": p.info["pid"],
                 "name": p.info["name"],
-                "memory_usage": p.info["memory_info"].rss,
-                "memory_percent": p.info["memory_percent"],
+                "memory_usage": memory_info.rss if memory_info else 0,
+                "memory_percent": p.info["memory_percent"] or 0.0,
                 "cmdline": " ".join(p.info["cmdline"]) if p.info["cmdline"] else "N/A"
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -64,15 +71,18 @@ def get_top_processes_by_memory(limit: int = 5) -> List[Dict[str, Any]]:
     logger.debug(f"Top Memory processes: {processes[:limit]}")
     return processes[:limit]
 
-def get_gpu_processes(limit: int = 5) -> List[Dict[str, Any]]:
+def get_gpu_processes(limit: int = 5) -> list[dict[str, Any]]:
     """
     Retrieve the top GPU processes using nvidia-smi for process usage.
     """
     try:
         result = subprocess.run(
-            ['nvidia-smi', '--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader,nounits'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            [
+                'nvidia-smi',
+                '--query-compute-apps=pid,process_name,used_memory',
+                '--format=csv,noheader,nounits',
+            ],
+            capture_output=True,
             text=True,
             check=True
         )
@@ -110,7 +120,7 @@ def get_gpu_processes(limit: int = 5) -> List[Dict[str, Any]]:
     logger.debug(f"Top GPU processes: {gpu_processes[:limit]}")
     return gpu_processes[:limit]
 
-def get_gpu_fan_and_power() -> Dict[int, Dict[str, float]]:
+def get_gpu_fan_and_power() -> dict[int, dict[str, float]]:
     """
     Retrieve fan speed (%) and power draw (W) for each GPU via nvidia-smi.
     Returns a dict keyed by GPU index: {"fan_speed": float, "power_draw": float}.
@@ -119,8 +129,7 @@ def get_gpu_fan_and_power() -> Dict[int, Dict[str, float]]:
     try:
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=index,fan.speed,power.draw', '--format=csv,noheader,nounits'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             check=True
         )
