@@ -1,9 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # --- Build stage: install the package into an isolated venv ---
-# Use the full python image (ships a C toolchain) so native deps such as
-# psutil build from source on the exotic arches the workflow targets
-# (i386, arm/v7), which the slim/uv images do not all publish.
+# Use the full python image (ships a C toolchain) so native deps such as psutil
+# still build when no prebuilt wheel matches the target platform.
 FROM python:3.12 AS builder
 
 WORKDIR /app
@@ -12,9 +11,8 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
-# uv comes from PyPI rather than from ghcr.io/astral-sh/uv: that image only
-# publishes linux/amd64 and linux/arm64, while this build also targets i386 and
-# arm/v7. The PyPI wheels cover all four (i686, armv7l, x86_64, aarch64).
+# uv comes from PyPI rather than from ghcr.io/astral-sh/uv, so the build stays
+# independent of that image's own platform coverage.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install uv
 

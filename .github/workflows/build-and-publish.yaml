@@ -102,7 +102,7 @@ jobs:
             ghcr.io/obeone/sys-stats:${{ steps.version.outputs.version }}
             docker.io/obeoneorg/sys-stats:latest
             docker.io/obeoneorg/sys-stats:${{ steps.version.outputs.version }}
-          platforms: linux/amd64,linux/arm64,linux/i386,linux/arm/v7
+          platforms: linux/amd64,linux/arm64
 
       - name: Set up cosign
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
