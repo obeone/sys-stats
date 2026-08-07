@@ -57,6 +57,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # pyproject.toml is the single source of truth for the version: it feeds
+      # both the image tags and the OCI version label baked by the Dockerfile.
+      - name: Read the package version
+        id: version
+        run: |
+          python3 -c 'import pathlib, tomllib; print("version=" + tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])' >> "$GITHUB_OUTPUT"
+
       - name: Log in to GitHub Container Registry
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v2
@@ -82,9 +89,13 @@ jobs:
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
           tags: |
             ghcr.io/obeone/sys-stats:latest
+            ghcr.io/obeone/sys-stats:${{ steps.version.outputs.version }}
             docker.io/obeoneorg/sys-stats:latest
+            docker.io/obeoneorg/sys-stats:${{ steps.version.outputs.version }}
           platforms: linux/amd64,linux/arm64,linux/i386,linux/arm/v7
 
       - name: Set up cosign
