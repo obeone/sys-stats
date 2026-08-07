@@ -87,7 +87,10 @@ class TestGetGpuProcesses:
         monkeypatch.setattr(
             server.subprocess,
             "run",
-            _fake_run("100, /usr/bin/python3, 512\n200, /opt/ollama/ollama, 2048\n"),
+            _fake_run(
+                "GPU-aaa, 100, /usr/bin/python3, 512\n"
+                "GPU-aaa, 200, /opt/ollama/ollama, 2048\n"
+            ),
         )
 
         processes = server.get_gpu_processes()
@@ -102,7 +105,7 @@ class TestGetGpuProcesses:
         monkeypatch.setattr(
             server.subprocess,
             "run",
-            _fake_run("1, a, 10\n2, b, 20\n3, c, 30\n"),
+            _fake_run("GPU-aaa, 1, a, 10\nGPU-aaa, 2, b, 20\nGPU-aaa, 3, c, 30\n"),
         )
 
         assert len(server.get_gpu_processes(limit=2)) == 2
@@ -114,15 +117,139 @@ class TestGetGpuProcesses:
             raise psutil.NoSuchProcess(pid)
 
         monkeypatch.setattr(server.psutil, "Process", _raise)
-        monkeypatch.setattr(server.subprocess, "run", _fake_run("100, python3, 512\n"))
+        monkeypatch.setattr(
+            server.subprocess, "run", _fake_run("GPU-aaa, 100, python3, 512\n")
+        )
 
         assert server.get_gpu_processes()[0]["cmdline"] == "N/A"
 
     def test_returns_empty_list_when_nvidia_smi_fails(self, monkeypatch):
-        """No GPU compute apps and a broken nvidia-smi look the same to callers."""
+        """No GPU compute apps and a broken nvidia-smi look the same to callers.
+
+        Both the UUID-aware query and the legacy one fail here, which is the
+        only case where the whole list is given up.
+        """
         monkeypatch.setattr(server.subprocess, "run", _failing_run())
 
         assert server.get_gpu_processes() == []
+
+    def test_skips_malformed_lines_without_dropping_the_batch(self, monkeypatch):
+        """A truncated row costs its own line, not the other processes."""
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            _fake_run("GPU-aaa, 100\nGPU-aaa, 200, /usr/bin/python3, 512\n"),
+        )
+
+        processes = server.get_gpu_processes()
+
+        assert [p["pid"] for p in processes] == [200]
+
+    def test_resolves_the_gpu_index_through_the_uuid_mapping(self, monkeypatch):
+        """The card of a compute app is only knowable through its UUID."""
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            _fake_run(
+                "GPU-bbb, 200, /opt/ollama/ollama, 2048\n"
+                "GPU-aaa, 100, /usr/bin/python3, 512\n"
+            ),
+        )
+
+        processes = server.get_gpu_processes(
+            uuid_to_index={"GPU-aaa": 0, "GPU-bbb": 1}
+        )
+
+        assert [(p["gpu_index"], p["gpu_uuid"]) for p in processes] == [
+            (0, "GPU-aaa"),
+            (1, "GPU-bbb"),
+        ]
+
+    def test_leaves_the_gpu_index_unresolved_without_a_mapping(self, monkeypatch):
+        """Called on its own, the collector still reports the raw UUID."""
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            _fake_run("GPU-aaa, 100, /usr/bin/python3, 512\n"),
+        )
+
+        process = server.get_gpu_processes()[0]
+
+        assert process["gpu_uuid"] == "GPU-aaa"
+        assert process["gpu_index"] is None
+
+    def test_leaves_the_gpu_index_unresolved_for_an_unknown_uuid(self, monkeypatch):
+        """A UUID absent from the mapping is not an error, just an unknown card."""
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            _fake_run("GPU-zzz, 100, /usr/bin/python3, 512\n"),
+        )
+
+        assert server.get_gpu_processes(uuid_to_index={"GPU-aaa": 0})[0]["gpu_index"] is None
+
+    def test_sorts_by_gpu_index_then_by_descending_memory(self, monkeypatch):
+        """Processes of one card stay contiguous, heaviest first within the card."""
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            _fake_run(
+                "GPU-bbb, 1, a, 4096\n"
+                "GPU-aaa, 2, b, 512\n"
+                "GPU-bbb, 3, c, 8192\n"
+                "GPU-aaa, 4, d, 1024\n"
+            ),
+        )
+
+        processes = server.get_gpu_processes(uuid_to_index={"GPU-aaa": 0, "GPU-bbb": 1})
+
+        assert [p["pid"] for p in processes] == [4, 2, 3, 1]
+
+    def test_pushes_unresolved_cards_last(self, monkeypatch):
+        """``gpu_index`` is None for unknown cards, and None does not compare with int.
+
+        Regression guard: a naive ``(gpu_index, -memory_used)`` key raises
+        TypeError as soon as one row is unattributed.
+        """
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            _fake_run(
+                "GPU-zzz, 1, a, 8192\n"
+                "GPU-aaa, 2, b, 512\n"
+                "GPU-zzz, 3, c, 16384\n"
+            ),
+        )
+
+        processes = server.get_gpu_processes(uuid_to_index={"GPU-aaa": 0})
+
+        assert [p["pid"] for p in processes] == [2, 3, 1]
+
+    def test_falls_back_to_the_legacy_query_when_gpu_uuid_is_rejected(self, monkeypatch):
+        """An old driver rejects ``gpu_uuid``; losing the card beats losing the list."""
+        queries = []
+
+        def _run(args, **kwargs):
+            queries.append(args[1])
+            if "gpu_uuid" in args[1]:
+                raise subprocess.CalledProcessError(
+                    1, "nvidia-smi", stderr="Field gpu_uuid is not supported"
+                )
+            return _FakeCompletedProcess("100, /usr/bin/python3, 512\n")
+
+        monkeypatch.setattr(server.subprocess, "run", _run)
+
+        processes = server.get_gpu_processes(uuid_to_index={"GPU-aaa": 0})
+
+        assert queries == [
+            "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+            "--query-compute-apps=pid,process_name,used_memory",
+        ]
+        assert len(processes) == 1
+        assert processes[0]["pid"] == 100
+        assert processes[0]["gpu_uuid"] is None
+        assert processes[0]["gpu_index"] is None
+        assert processes[0]["memory_used"] == 512 * 1024 * 1024
 
 
 class TestGetOllamaProcess:

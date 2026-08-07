@@ -21,13 +21,42 @@ class _FakeVirtualMemory:
 class _FakeGPU:
     """Stand-in for a :class:`GPUtil.GPU`, which reports VRAM in MiB."""
 
-    def __init__(self, gpu_id: int = 0) -> None:
+    def __init__(self, gpu_id: int = 0, uuid: str | None = None) -> None:
         self.id = gpu_id
         self.name = "NVIDIA GeForce RTX 3090"
         self.load = 0.42
         self.memoryTotal = 24576
         self.memoryUsed = 12288
         self.temperature = 61.0
+        # The attribute is deliberately absent unless a UUID is asked for: that
+        # is what an older GPUtil looks like, and ``get_stats`` must survive it.
+        if uuid is not None:
+            self.uuid = uuid
+
+
+class _FakeCompletedProcess:
+    """Minimal stand-in for :class:`subprocess.CompletedProcess`."""
+
+    def __init__(self, stdout: str) -> None:
+        self.stdout = stdout
+        self.stderr = ""
+
+
+class _FakeProcess:
+    """Stand-in for :class:`psutil.Process`, resolving any PID to a command line."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+    def cmdline(self) -> list[str]:
+        """Return a fixed command line.
+
+        Returns
+        -------
+        list of str
+            The argv of the fake process.
+        """
+        return ["python", "train.py"]
 
 
 @pytest.fixture
@@ -75,7 +104,7 @@ def test_stats_converts_gpu_memory_to_bytes(client, monkeypatch):
     monkeypatch.setattr(
         server, "get_gpu_fan_and_power", lambda: {0: {"fan_speed": 30.0, "power_draw": 220.0}}
     )
-    monkeypatch.setattr(server, "get_gpu_processes", lambda limit=5: [])
+    monkeypatch.setattr(server, "get_gpu_processes", lambda limit=5, uuid_to_index=None: [])
 
     gpu = client.get("/stats").get_json()["gpu"][0]
 
@@ -91,7 +120,7 @@ def test_stats_summary_mirrors_the_first_gpu(client, monkeypatch):
     """The summary block is a condensed view of GPU 0 for the compact panels."""
     monkeypatch.setattr(server.GPUtil, "getGPUs", lambda: [_FakeGPU()])
     monkeypatch.setattr(server, "get_gpu_fan_and_power", lambda: {})
-    monkeypatch.setattr(server, "get_gpu_processes", lambda limit=5: [])
+    monkeypatch.setattr(server, "get_gpu_processes", lambda limit=5, uuid_to_index=None: [])
 
     summary = client.get("/stats").get_json()["summary"]
 
@@ -104,12 +133,59 @@ def test_stats_defaults_to_zero_fan_and_power_when_nvidia_smi_is_silent(client, 
     """Missing fan/power data must not drop the GPU from the payload."""
     monkeypatch.setattr(server.GPUtil, "getGPUs", lambda: [_FakeGPU()])
     monkeypatch.setattr(server, "get_gpu_fan_and_power", lambda: {})
-    monkeypatch.setattr(server, "get_gpu_processes", lambda limit=5: [])
+    monkeypatch.setattr(server, "get_gpu_processes", lambda limit=5, uuid_to_index=None: [])
 
     gpu = client.get("/stats").get_json()["gpu"][0]
 
     assert gpu["fanSpeed"] == 0.0
     assert gpu["powerDraw"] == 0.0
+
+
+def test_stats_attributes_gpu_processes_to_their_card(client, monkeypatch):
+    """``top_gpu_processes`` entries name their GPU by UUID and by index.
+
+    Exercises the real collector rather than a stub: the UUID mapping is built
+    from the GPUtil devices inside ``get_stats``, so stubbing the collector
+    would test nothing about that wiring.
+    """
+    monkeypatch.setattr(
+        server.GPUtil,
+        "getGPUs",
+        lambda: [_FakeGPU(gpu_id=0, uuid="GPU-aaa"), _FakeGPU(gpu_id=1, uuid="GPU-bbb")],
+    )
+    monkeypatch.setattr(server, "get_gpu_fan_and_power", lambda: {})
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *a, **kw: _FakeCompletedProcess(
+            "GPU-bbb, 200, /opt/ollama/ollama, 2048\nGPU-aaa, 100, /usr/bin/python3, 512\n"
+        ),
+    )
+    monkeypatch.setattr(server.psutil, "Process", lambda pid: _FakeProcess(pid))
+
+    processes = client.get("/stats").get_json()["top_gpu_processes"]
+
+    assert [(p["gpu_index"], p["gpu_uuid"], p["pid"]) for p in processes] == [
+        (0, "GPU-aaa", 100),
+        (1, "GPU-bbb", 200),
+    ]
+
+
+def test_stats_leaves_the_gpu_index_unresolved_for_an_unknown_uuid(client, monkeypatch):
+    """A compute app on a card GPUtil did not enumerate still shows up."""
+    monkeypatch.setattr(server.GPUtil, "getGPUs", lambda: [_FakeGPU(uuid="GPU-aaa")])
+    monkeypatch.setattr(server, "get_gpu_fan_and_power", lambda: {})
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *a, **kw: _FakeCompletedProcess("GPU-zzz, 100, /usr/bin/python3, 512\n"),
+    )
+    monkeypatch.setattr(server.psutil, "Process", lambda pid: _FakeProcess(pid))
+
+    process = client.get("/stats").get_json()["top_gpu_processes"][0]
+
+    assert process["gpu_uuid"] == "GPU-zzz"
+    assert process["gpu_index"] is None
 
 
 def test_stats_forwards_the_limit_query_parameter(client, monkeypatch):
