@@ -947,9 +947,14 @@ def format_context_length(value):
     context windows are usually quoted; anything else is shown raw rather than
     rounded, because a truncated context length is misleading.
 
+    Anything that is not a positive whole number renders ``"N/A"``: a zero or
+    negative context window is meaningless, and so is a value the server did
+    not send. This mirrors ``formatContextLength`` in the web UI, which reads
+    the same field of the same payload.
+
     Parameters
     ----------
-    value : int or None
+    value : int or str or None
         The ``context_length`` reported by ``/api/ps``, or ``None`` when the
         Ollama server is too old to expose it.
 
@@ -958,19 +963,18 @@ def format_context_length(value):
     str
         ``"1M"``, ``"32K"``, the raw integer, or ``"N/A"``.
     """
-    if value is None:
-        return "N/A"
-
     try:
         context_length = int(value)
     except (TypeError, ValueError):
         return "N/A"
 
-    if context_length > 0:
-        if context_length % (1024 * 1024) == 0:
-            return f"{context_length // (1024 * 1024)}M"
-        if context_length % 1024 == 0:
-            return f"{context_length // 1024}K"
+    if context_length <= 0:
+        return "N/A"
+
+    if context_length % (1024 * 1024) == 0:
+        return f"{context_length // (1024 * 1024)}M"
+    if context_length % 1024 == 0:
+        return f"{context_length // 1024}K"
 
     return str(context_length)
 

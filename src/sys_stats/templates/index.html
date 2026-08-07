@@ -638,20 +638,22 @@
      * thing: powers of 1024 get a K/M suffix, anything else stays raw because
      * rounding an odd context window would be misleading.
      *
-     * @param {number|null|undefined} value Context length in tokens, as
-     *   reported by Ollama's /api/ps. Missing on Ollama versions older
-     *   than 0.32.
+     * @param {number|string|null|undefined} value Context length in tokens,
+     *   as reported by Ollama's /api/ps. Missing on Ollama versions older
+     *   than 0.32. A numeric string is accepted so this stays in step with
+     *   the CLI's format_context_length, which reads the same field.
      * @returns {string} "1M", "32K", the raw number, or "N/A" when unknown.
      */
     function formatContextLength(value) {
       // Older Ollama releases simply omit the field, and a zero-length
       // context is meaningless, so both collapse to "N/A".
-      if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) {
+      const length = typeof value === 'string' ? Number(value.trim() || NaN) : value;
+      if (length === null || length === undefined || !Number.isFinite(length) || length <= 0) {
         return 'N/A';
       }
-      if (value % (1024 * 1024) === 0) return (value / (1024 * 1024)) + 'M';
-      if (value % 1024 === 0) return (value / 1024) + 'K';
-      return String(value);
+      if (length % (1024 * 1024) === 0) return (length / (1024 * 1024)) + 'M';
+      if (length % 1024 === 0) return (length / 1024) + 'K';
+      return String(length);
     }
 
 
