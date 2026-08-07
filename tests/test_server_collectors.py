@@ -41,6 +41,20 @@ def _failing_run(stderr: str = "no devices"):
     return _run
 
 
+def _missing_binary_run():
+    """Build a ``subprocess.run`` replacement raising ``FileNotFoundError``.
+
+    Simulates a host where the ``nvidia-smi`` binary is simply not installed
+    (no NVIDIA driver at all), as opposed to ``_failing_run`` which simulates
+    the binary existing but the command failing.
+    """
+
+    def _run(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "nvidia-smi")
+
+    return _run
+
+
 class TestGetGpuFanAndPower:
     def test_parses_one_entry_per_gpu_index(self, monkeypatch):
         """The CSV output of nvidia-smi is keyed by GPU index."""
@@ -64,6 +78,18 @@ class TestGetGpuFanAndPower:
     def test_returns_empty_mapping_when_nvidia_smi_fails(self, monkeypatch):
         """A failing nvidia-smi degrades to no fan/power data at all."""
         monkeypatch.setattr(server.subprocess, "run", _failing_run())
+
+        assert server.get_gpu_fan_and_power() == {}
+
+    def test_returns_empty_mapping_when_nvidia_smi_is_absent(self, monkeypatch):
+        """A missing ``nvidia-smi`` binary must degrade like a failing one.
+
+        Regression guard: ``subprocess.run`` raises ``FileNotFoundError`` when
+        the binary is not on ``PATH`` at all, which is a different exception
+        than ``CalledProcessError``. The collector's contract (CLAUDE.md) is
+        to degrade to ``{}``, not to propagate the exception.
+        """
+        monkeypatch.setattr(server.subprocess, "run", _missing_binary_run())
 
         assert server.get_gpu_fan_and_power() == {}
 
@@ -130,6 +156,18 @@ class TestGetGpuProcesses:
         only case where the whole list is given up.
         """
         monkeypatch.setattr(server.subprocess, "run", _failing_run())
+
+        assert server.get_gpu_processes() == []
+
+    def test_returns_empty_list_when_nvidia_smi_is_absent(self, monkeypatch):
+        """A missing ``nvidia-smi`` binary must degrade like a failing one.
+
+        Regression guard: ``subprocess.run`` raises ``FileNotFoundError`` on a
+        host without the NVIDIA driver installed at all (e.g. macOS), a
+        different exception than ``CalledProcessError``. The collector's
+        contract (CLAUDE.md) is to degrade to ``[]``, not to propagate it.
+        """
+        monkeypatch.setattr(server.subprocess, "run", _missing_binary_run())
 
         assert server.get_gpu_processes() == []
 

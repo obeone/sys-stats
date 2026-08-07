@@ -100,14 +100,16 @@ def _query_compute_apps() -> str | None:
                 text=True,
                 check=True
             )
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
             last_error = e
             continue
         return result.stdout
 
-    # ``stderr`` is None when the caller did not capture it, so guard the strip.
-    stderr = (last_error.stderr or "").strip() if last_error is not None else ""
-    logger.error(f"Error fetching GPU processes: {stderr}")
+    # ``stderr`` is only set on ``CalledProcessError``; ``FileNotFoundError``
+    # (binary missing entirely) has none, so guard both the attribute and the
+    # None case before stripping.
+    stderr = (getattr(last_error, "stderr", None) or "").strip() if last_error is not None else ""
+    logger.error(f"Error fetching GPU processes: {stderr or last_error}")
     return None
 
 
@@ -243,6 +245,11 @@ def get_gpu_fan_and_power() -> dict[int, dict[str, float]]:
         )
     except subprocess.CalledProcessError as e:
         logger.error(f"Error fetching GPU fan/power: {e.stderr.strip()}")
+        return {}
+    except FileNotFoundError as e:
+        # The ``nvidia-smi`` binary is not installed at all (no NVIDIA driver
+        # on this host), as opposed to the binary existing but failing.
+        logger.error(f"Error fetching GPU fan/power: {e}")
         return {}
 
     lines = result.stdout.strip().split('\n')
