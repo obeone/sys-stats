@@ -1015,48 +1015,82 @@ class _FakeLive:
         self.updates.append(renderable)
 
 
-class TestMainHelpToggleUsesLiveUpdate:
-    """Regression: ``layout.update(help_panel)`` is a no-op once ``layout``
-    has children (Rich renders a layout's children in preference to its own
-    set renderable), which used to freeze the whole dashboard as soon as help
-    was toggled on, since the loop also stopped calling
-    :func:`build_layout_content` while ``show_help_flag`` was set."""
+class _MainHarness:
+    """Run :func:`sys_stats.cli.main` against a fake ``Live`` and clock.
 
-    def test_toggling_help_swaps_the_lives_renderable(self, monkeypatch):
-        """Two ``h`` presses: show help, then return to the live layout."""
-        live_instances = []
+    The inner sleep loop checks ``exit_event``/``rebuild_layout_event`` before
+    every ``time.sleep`` call, so driving those two events from a faked
+    ``time.sleep`` steps the outer loop deterministically without any real
+    waiting.
+    """
 
-        def fake_live_factory(renderable, **kwargs):
+    STATS = {
+        "cpu": 1.0,
+        "ram": {"percent": 1.0, "total": 1},
+        "has_gpu": False,
+        "gpu": [],
+        "top_cpu": [],
+        "top_memory": [],
+        "top_gpu_processes": [],
+        "ollama_processes": {"models": []},
+    }
+
+    def __init__(self, monkeypatch, on_sleep, on_fetch=None):
+        self.live_instances = []
+        self.monkeypatch = monkeypatch
+        self.on_sleep = on_sleep
+        self.on_fetch = on_fetch
+
+    def _fetch(self, _url):
+        if self.on_fetch is not None:
+            self.on_fetch()
+        return self.STATS
+
+    def run(self):
+        """Reset the module globals, run ``main``, and return the fake ``Live``."""
+        def live_factory(renderable, **kwargs):
             instance = _FakeLive(renderable, **kwargs)
-            live_instances.append(instance)
+            self.live_instances.append(instance)
             return instance
 
-        stats_payload = {
-            "cpu": 1.0,
-            "ram": {"percent": 1.0, "total": 1},
-            "has_gpu": False,
-            "gpu": [],
-            "top_cpu": [],
-            "top_memory": [],
-            "top_gpu_processes": [],
-            "ollama_processes": {"models": []},
-        }
-
-        monkeypatch.setattr(cli, "Live", fake_live_factory)
-        monkeypatch.setattr(cli, "keyboard_listener", lambda: None)
-        monkeypatch.setattr(cli, "fetch_stats", lambda url: stats_payload)
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(cli, "Live", live_factory)
+        self.monkeypatch.setattr(cli, "keyboard_listener", lambda: None)
+        self.monkeypatch.setattr(cli, "fetch_stats", self._fetch)
+        self.monkeypatch.setattr(cli.time, "sleep", self.on_sleep)
+        self.monkeypatch.setattr(
             sys, "argv", ["sys-stats", "--url", "http://example.invalid/stats", "--interval", "1"]
         )
 
-        # The inner sleep loop checks ``exit_event``/``rebuild_layout_event``
-        # before every ``time.sleep`` call, so driving those two events from
-        # a faked ``time.sleep`` steps the outer loop deterministically
-        # without any real waiting: call 1 mirrors the first ``h`` press
-        # (help on), call 2 the second (help off), call 3 quits.
+        cli.exit_event.clear()
+        cli.rebuild_layout_event.clear()
+        cli.show_help_flag = False
+        cli.is_paused = False
+        cli.latest_stats = None
+        try:
+            cli.main()
+        finally:
+            cli.exit_event.clear()
+            cli.rebuild_layout_event.clear()
+            cli.show_help_flag = False
+            cli.is_paused = False
+            cli.latest_stats = None
+
+        assert len(self.live_instances) == 1
+        return self.live_instances[0]
+
+
+class TestMainLoop:
+    def test_toggling_help_swaps_the_lives_renderable(self, monkeypatch):
+        """Regression: ``layout.update(help_panel)`` is a no-op once ``layout``
+        has children (Rich renders a layout's children in preference to its
+        own set renderable), which used to freeze the whole dashboard as soon
+        as help was toggled on.
+
+        Two ``h`` presses: show help, then return to the live layout.
+        """
         calls = {"count": 0}
 
-        def fake_sleep(_seconds):
+        def on_sleep(_seconds):
             calls["count"] += 1
             if calls["count"] == 1:
                 with cli.state_lock:
@@ -1069,25 +1103,56 @@ class TestMainHelpToggleUsesLiveUpdate:
             else:
                 cli.exit_event.set()
 
-        monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+        live = _MainHarness(monkeypatch, on_sleep).run()
 
-        cli.exit_event.clear()
-        cli.rebuild_layout_event.clear()
-        cli.show_help_flag = False
-        cli.is_paused = False
-        cli.latest_stats = None
-
-        try:
-            cli.main()
-        finally:
-            cli.exit_event.clear()
-            cli.rebuild_layout_event.clear()
-            cli.show_help_flag = False
-
-        assert len(live_instances) == 1
-        live = live_instances[0]
         assert live.updates, "expected at least one live.update() call"
         # First press: the help panel is swapped in, not the layout.
         assert live.updates[0] is not live.initial_renderable
         # Second press: the live layout is restored so refreshes resume.
         assert live.updates[-1] is live.initial_renderable
+
+    def test_a_key_press_during_the_fetch_is_honoured_at_once(self, monkeypatch):
+        """Regression: a key pressed while the HTTP request was in flight was
+        swallowed for a whole refresh interval.
+
+        The loop sampled the state, blocked in ``fetch_stats``, then acted on
+        that now stale sample and cleared the wake-up event, destroying it.
+        Pressing ``h`` mid-request has to show the help screen on this very
+        iteration.
+        """
+        pressed = {"done": False}
+
+        def on_fetch():
+            if pressed["done"]:
+                return
+            pressed["done"] = True
+            # The keyboard thread reacting while the request is in flight.
+            with cli.state_lock:
+                cli.show_help_flag = True
+            cli.rebuild_layout_event.set()
+
+        def on_sleep(_seconds):
+            cli.exit_event.set()
+
+        live = _MainHarness(monkeypatch, on_sleep, on_fetch=on_fetch).run()
+
+        assert live.updates, "the help screen was not shown on the iteration that fetched"
+        assert live.updates[0] is not live.initial_renderable
+
+    def test_pausing_during_the_fetch_stops_the_next_request(self, monkeypatch):
+        """The same staleness used to keep a paused dashboard fetching once more."""
+        fetches = {"count": 0}
+
+        def on_fetch():
+            fetches["count"] += 1
+            if fetches["count"] == 1:
+                with cli.state_lock:
+                    cli.is_paused = True
+                cli.rebuild_layout_event.set()
+
+        def on_sleep(_seconds):
+            cli.exit_event.set()
+
+        _MainHarness(monkeypatch, on_sleep, on_fetch=on_fetch).run()
+
+        assert fetches["count"] == 1
