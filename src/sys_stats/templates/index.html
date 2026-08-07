@@ -352,6 +352,7 @@
               <th>Model size</th>
               <th>VRAM Usage</th>
               <th>GPU Loaded</th>
+              <th>Context</th>
               <th>Expiration</th>
             </tr>
           </thead>
@@ -563,6 +564,7 @@
             <td>${formatBytes(proc.size)}</td>
             <td>${formatBytes(proc.size_vram)}</td>
             <td>${(proc.size_vram/proc.size*100).toFixed(0)} %</td>
+            <td>${formatContextLength(proc.context_length)}</td>
             <td>${formatExpiration(proc.expires_at)}</td>
           </tr>
         `).join('');
@@ -628,7 +630,30 @@
       const hours = Math.floor(diffMs / (1000 * 60 * 60));
       return `${hours}h ${minutes}m ${seconds}s`;
     }
-  
+
+    /**
+     * Format an Ollama context window size for display.
+     *
+     * Mirrors the CLI formatting so both consumers of /stats show the same
+     * thing: powers of 1024 get a K/M suffix, anything else stays raw because
+     * rounding an odd context window would be misleading.
+     *
+     * @param {number|null|undefined} value Context length in tokens, as
+     *   reported by Ollama's /api/ps. Missing on Ollama versions older
+     *   than 0.32.
+     * @returns {string} "1M", "32K", the raw number, or "N/A" when unknown.
+     */
+    function formatContextLength(value) {
+      // Older Ollama releases simply omit the field, and a zero-length
+      // context is meaningless, so both collapse to "N/A".
+      if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) {
+        return 'N/A';
+      }
+      if (value % (1024 * 1024) === 0) return (value / (1024 * 1024)) + 'M';
+      if (value % 1024 === 0) return (value / 1024) + 'K';
+      return String(value);
+    }
+
 
     // Initial start
     startRefreshing();
