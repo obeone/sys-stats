@@ -1161,7 +1161,11 @@ def main():
     listener_thread = threading.Thread(target=keyboard_listener, daemon=True)
     listener_thread.start()
 
-    with Live(layout, refresh_per_second=4, screen=True):
+    with Live(layout, refresh_per_second=4, screen=True) as live:
+        # Tracks whether the previous iteration was showing the help screen,
+        # so ``live.update`` is only called on an actual transition rather
+        # than every loop iteration.
+        previous_help_flag = False
         while not exit_event.is_set():
             with state_lock:
                 current_interval = refresh_interval
@@ -1169,10 +1173,19 @@ def main():
                 help_flag = show_help_flag
 
             if help_flag:
-                # Show the help panel in full screen
-                help_panel = build_full_screen_help()
-                layout.update(help_panel)
+                # Show the help panel in full screen. ``layout.update`` would
+                # be a no-op here: once a ``Layout`` has children, Rich
+                # renders those in preference to its own set renderable, so
+                # the help screen has to be swapped in on the ``Live``
+                # instance instead, which is what actually controls what
+                # gets drawn.
+                if not previous_help_flag:
+                    live.update(build_full_screen_help())
             else:
+                if previous_help_flag:
+                    # Coming back from the help screen: restore the live
+                    # layout so refreshes resume underneath it.
+                    live.update(layout)
                 if not paused:
                     # Fetch statistics if not paused
                     stats = fetch_stats(args.url)
@@ -1192,11 +1205,12 @@ def main():
                             terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns,
                         )
 
+            previous_help_flag = help_flag
+
             # Check if a layout rebuild is required
             if rebuild_layout_event.is_set():
                 if help_flag:
-                    help_panel = build_full_screen_help()
-                    layout.update(help_panel)
+                    live.update(build_full_screen_help())
                 elif not paused and latest_stats:
                     build_layout_content(
                         layout,
