@@ -58,7 +58,8 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # pyproject.toml is the single source of truth for the version: it feeds
-      # both the image tags and the OCI version label baked by the Dockerfile.
+      # both the image tags and the OCI version label, so neither the Dockerfile
+      # nor this file ever spells a version out.
       - name: Read the package version
         id: version
         run: |
@@ -89,8 +90,9 @@ jobs:
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
           tags: |
             ghcr.io/obeone/sys-stats:latest
             ghcr.io/obeone/sys-stats:${{ steps.version.outputs.version }}
