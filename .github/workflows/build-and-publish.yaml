@@ -57,13 +57,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v9
+
       # pyproject.toml is the single source of truth for the version: it feeds
       # both the image tags and the OCI version label, so neither the Dockerfile
-      # nor this file ever spells a version out.
+      # nor this file ever spells a version out. `uv version` reports the project
+      # version because it runs at the repo root; uv's own is `uv self version`.
       - name: Read the package version
         id: version
-        run: |
-          python3 -c 'import pathlib, tomllib; print("version=" + tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])' >> "$GITHUB_OUTPUT"
+        run: echo "version=$(uv version --short)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
