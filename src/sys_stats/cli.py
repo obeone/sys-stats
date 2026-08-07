@@ -524,18 +524,22 @@ def build_single_gpu_table(gpu_data):
     rich.table.Table
         A two-column table (label, value) titled with the GPU name.
     """
-    gpu_name = truncate_name(gpu_data.get('name', 'N/A'), 25)
-    gpu_load = gpu_data.get('load', 0)
-    gpu_fan_speed = gpu_data.get('fanSpeed', '')
-    gpu_power_draw = gpu_data.get('powerDraw', '')
-    gpu_temperature = gpu_data.get('temperature', '')
+    # Every figure goes through ``or 0``: a driver that cannot report one of
+    # them sends ``null``, and formatting ``None`` as a number raises. The
+    # row-per-GPU rendering has always guarded this; this one used to crash
+    # on the very same payload, purely because the terminal was wider.
+    gpu_name = truncate_name(gpu_data.get('name') or 'N/A', 25)
+    gpu_load = gpu_data.get('load') or 0
+    gpu_fan_speed = gpu_data.get('fanSpeed') or 0
+    gpu_power_draw = gpu_data.get('powerDraw') or 0
+    gpu_temperature = gpu_data.get('temperature') or 0
 
-    memory_used = gpu_data.get('memoryUsed', 0)
+    memory_used = gpu_data.get('memoryUsed') or 0
     memory_used_str = human_readable_size(memory_used)
     memory_total_str = human_readable_size(gpu_memory_total_bytes(gpu_data))
     # The reported percentage is kept as-is rather than recomputed: it is what
     # the driver claims, and it stays consistent with the web UI.
-    vram_percent = gpu_data.get('memoryPercent', 0)
+    vram_percent = gpu_data.get('memoryPercent') or 0
 
     table = Table(title=gpu_name, show_header=False, padding=(0, 1), expand=True)
 
