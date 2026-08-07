@@ -1002,6 +1002,64 @@ class TestBuildLayoutContent:
         assert layout["top_left"].ratio == 1
 
 
+class TestGpuColumnReachesTheScreen:
+    """The headline feature of the multi-GPU layout, checked end to end.
+
+    Every other test of the ``GPU`` column stops at the renderable the panel
+    builder returns, so nothing proved that ``build_layout_content`` actually
+    asks for it: passing ``multi_gpu=False`` at that call site left the whole
+    suite green while the column silently vanished from a multi-GPU
+    dashboard. These read the column back out of the drawn characters.
+    """
+
+    def _processes(self):
+        """Compute apps spread over three cards, none of them Ollama's.
+
+        Keeping Ollama out is deliberate. An Ollama process would give the
+        Ollama table a ``GPU`` column of its own, and these tests have to pin
+        down the one that belongs to the GPU Processes panel, not any ``GPU``
+        header that happens to be on screen.
+        """
+        return [
+            {"pid": 8888, "name": "python3", "memory_used": 3_145_728_000,
+             "cmdline": "python3 train.py --epochs 40", "gpu_uuid": "GPU-0", "gpu_index": 0},
+            {"pid": 9001, "name": "vllm", "memory_used": 2_147_483_648,
+             "cmdline": "vllm serve mistral", "gpu_uuid": "GPU-2", "gpu_index": 2},
+            {"pid": 9002, "name": "comfyui", "memory_used": 1_073_741_824,
+             "cmdline": "python main.py --listen", "gpu_uuid": "GPU-1", "gpu_index": 1},
+            # A driver too old to report gpu_uuid leaves the index unresolved.
+            {"pid": 9999, "name": "blender", "memory_used": 1_258_291_200,
+             "cmdline": "blender -b scene.blend", "gpu_uuid": None, "gpu_index": None},
+        ]
+
+    def _data(self, gpu_count):
+        """A payload whose GPU processes are the ones above."""
+        data = _stats(gpu_count)
+        data["top_gpu_processes"] = self._processes()
+        return data
+
+    def test_a_multi_gpu_dashboard_draws_the_index_of_every_process(self):
+        """Regression: the column has to survive the trip through the layout.
+
+        Three cards at 200 columns keep the GPU Detail panel on its
+        headerless side-by-side rendering, and no Ollama process means no
+        ``GPU`` column in the Ollama table, so the only one left on screen is
+        the one under test.
+        """
+        text = _render_layout(self._data(3), 200)
+
+        assert "GPU" in _header_cells(text)
+        assert _rendered_column(text, "GPU") == ["0", "2", "1", "?"]
+
+    def test_a_mono_gpu_dashboard_draws_no_index_at_all(self):
+        """One card means the column would only repeat ``0`` on every row."""
+        text = _render_layout(self._data(1), 200)
+
+        assert "GPU" not in _header_cells(text)
+        # The placeholder for an unresolved index exists nowhere else.
+        assert "?" not in text
+
+
 class _FakeLive:
     """Stand-in for :class:`rich.live.Live` that records ``update`` calls.
 
