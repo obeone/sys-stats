@@ -769,16 +769,25 @@ class TestFormatContextLength:
         [
             (32768, "32K"),
             (4096, "4K"),
+            (131072, "128K"),
             (1024 * 1024, "1M"),
             (2 * 1024 * 1024, "2M"),
             (40000, "40000"),
-            (0, "0"),
+            ("32768", "32K"),
+            (0, "N/A"),
+            (-1, "N/A"),
             (None, "N/A"),
             ("nope", "N/A"),
         ],
     )
     def test_formats_known_shapes(self, value, expected):
-        """Exact multiples of 1024 are abbreviated, the rest is shown raw."""
+        """Exact multiples of 1024 are abbreviated, the rest is shown raw.
+
+        Anything that is not a positive whole number is ``N/A``, which is what
+        ``formatContextLength`` in the web UI answers for the same payload:
+        the two are documented as paired consumers of ``/stats`` and used to
+        disagree on ``0``, on negatives and on numeric strings.
+        """
         assert format_context_length(value) == expected
 
 
