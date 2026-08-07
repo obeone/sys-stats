@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 
 import argparse
+import io
 import os
-import shutil
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 
 import readchar  # To capture key presses
 import requests
+from rich.cells import cell_len
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
+from rich.measure import Measurement
 from rich.panel import Panel
 from rich.table import Table
 
@@ -43,51 +45,72 @@ MAX_SIDE_BY_SIDE_GPUS = 3
 # Minimum number of columns a vertical GPU table needs to stay legible.
 MIN_GPU_COLUMN_WIDTH = 26
 
-# Rendering thresholds for the panels stacked in the left column of the
-# multi-GPU layout (Ollama and GPU Processes): below these available widths
-# the least valuable column is dropped rather than squeezed into
-# illegibility. Rich shares out space among flexible columns by their
-# measured content width, not their ``min_width``, so once a table is asked
-# to fit into less than the sum of its columns' minimums it can starve some
-# of them down to zero rather than shrinking every column proportionally.
-# Dropping a column outright is more reliable than fighting that algorithm.
-OLLAMA_VRAM_COLUMN_MIN_WIDTH = 30
-OLLAMA_SIZE_COLUMN_MIN_WIDTH = 36
-OLLAMA_GPU_PERCENT_COLUMN_MIN_WIDTH = 42
-OLLAMA_EXPIRES_COLUMN_MIN_WIDTH = 50
-GPU_PROCESSES_CMDLINE_COLUMN_MIN_WIDTH = 36
-# Below GPU_PROCESSES_CMDLINE_COLUMN_MIN_WIDTH (Cmdline already dropped), the
-# GPU Processes table still overflows its panel because ``Name`` and
-# ``Memory Used`` naturally want more room than is left: their headers are
-# wider than a single value. These caps force Rich to actually shrink them
-# instead of reverting to their natural content width (see
-# :func:`build_gpu_processes_panel`).
-GPU_PROCESSES_NAME_COLUMN_MAX_WIDTH = 4
-GPU_PROCESSES_MEMORY_COLUMN_MAX_WIDTH = 8
+# Floors for the columns that hold free text rather than a formatted figure.
+# Every other column is sized to its own widest value and is dropped outright
+# rather than shown truncated (see :class:`AdaptiveColumn`); these ones carry
+# names and command lines, which stay useful once ellipsised, so they are
+# allowed to shrink down to these widths and to soak up whatever room is left
+# over afterwards.
+MODEL_COLUMN_MIN_WIDTH = 8
+PROCESS_NAME_COLUMN_MIN_WIDTH = 8
+GPU_NAME_COLUMN_MIN_WIDTH = 8
+CMDLINE_COLUMN_MIN_WIDTH = 7
 
-# Rendering thresholds for the GPU Detail panel's row-per-GPU fallback
-# (:func:`build_gpu_rows_table`). Columns are dropped in ascending order of
-# importance as the estimated available width shrinks: ``%`` first (not
-# ranked among the named columns below), then ``Name``, ``Fan``, ``Power``,
-# ``Temp`` and finally ``Util``. ``GPU`` and ``VRAM`` are never dropped.
-GPU_DETAIL_PERCENT_COLUMN_MIN_WIDTH = 76
-GPU_DETAIL_NAME_COLUMN_MIN_WIDTH = 70
-GPU_DETAIL_FAN_COLUMN_MIN_WIDTH = 50
-GPU_DETAIL_POWER_COLUMN_MIN_WIDTH = 43
-GPU_DETAIL_TEMP_COLUMN_MIN_WIDTH = 36
-GPU_DETAIL_UTIL_COLUMN_MIN_WIDTH = 28
-
-# Rendering thresholds for the Top CPU / Top Memory process tables
-# (:func:`build_process_table`). Columns are dropped in ascending order of
-# importance: ``Cmdline`` first, then the metric (``CPU%``/``Memory%``), then
-# ``PID``. ``Name`` is never dropped, it is the whole point of the panel.
-PROCESS_TABLE_CMDLINE_COLUMN_MIN_WIDTH = 55
-PROCESS_TABLE_METRIC_COLUMN_MIN_WIDTH = 30
-PROCESS_TABLE_PID_COLUMN_MIN_WIDTH = 24
+# Which column each table sacrifices first when it does not fit the room it
+# was given: the lowest priority goes first, and the last one standing is
+# kept whatever happens. The numbers themselves are meaningless, only their
+# order matters.
+OLLAMA_COLUMN_PRIORITIES = {
+    "Model": 100,
+    "Ctx": 90,
+    "GPU": 80,
+    "VRAM": 40,
+    "Size": 30,
+    "GPU%": 20,
+    "Expires": 10,
+}
+GPU_PROCESSES_COLUMN_PRIORITIES = {
+    "Name": 100,
+    "GPU": 90,
+    "Memory Used": 80,
+    "PID": 20,
+    "Cmdline": 10,
+}
+GPU_DETAIL_COLUMN_PRIORITIES = {
+    "GPU": 100,
+    "VRAM": 90,
+    "Util": 60,
+    "Temp": 50,
+    "Power": 40,
+    "Fan": 30,
+    "Name": 20,
+    "%": 10,
+}
+# The metric outranks the PID here: a ranking stripped of the figure it
+# ranks by is a list of names in an order nobody can see, while a name and a
+# percentage still say everything the panel is for.
+PROCESS_TABLE_COLUMN_PRIORITIES = {
+    "Name": 100,
+    "CPU%": 40,
+    "Memory%": 40,
+    "PID": 30,
+    "Cmdline": 10,
+}
 
 # Style applied to the GPU process rows owned by Ollama, so its share of the
 # VRAM stands out among the other compute apps.
 OLLAMA_ROW_STYLE = "bold magenta"
+
+# Width handed to the measurement console below. It only has to be larger
+# than any table this dashboard can produce: Rich clamps a measurement to the
+# width it is measured against, and a clamped measurement would report every
+# table as fitting.
+MEASUREMENT_WIDTH = 10_000
+
+# Console used solely to measure candidate tables before rendering them. It
+# writes into a buffer nobody reads: what is wanted is Rich's own column
+# arithmetic, which needs a console to resolve styles and character widths.
+_measurement_console = Console(file=io.StringIO(), width=MEASUREMENT_WIDTH, legacy_windows=False)
 
 
 def fetch_stats(api_url):
@@ -138,91 +161,232 @@ def truncate_name(name, max_length=15):
     return name if len(name) <= max_length else name[:max_length - 1] + "…"
 
 
-def left_column_available_width(terminal_width):
-    """Estimate the width available to the Ollama and GPU Processes panels.
+class AdaptiveRenderable:
+    """A renderable that is only built once Rich reveals its real width.
 
-    Both panels live in the layout's left column: on its own in mono-GPU
-    mode (roughly a third of the terminal, ``top_left`` ratio 1 against
-    ``top_right`` ratio 2) or stacked with each other in multi-GPU mode
-    (roughly two fifths, ratio 2 against 3). A third of the terminal width is
-    used as a single, slightly conservative estimate for both modes: it
-    matches the mono-GPU case closely and under-estimates the multi-GPU one,
-    which only means columns are dropped a little earlier than strictly
-    necessary there, never later.
-
-    Parameters
-    ----------
-    terminal_width : int or None
-        Width of the terminal in columns, or ``None`` when unconstrained.
-
-    Returns
-    -------
-    int or None
-        The estimated available width, or ``None`` when ``terminal_width``
-        is ``None``, in which case callers should treat every column as
-        fitting.
-    """
-    if terminal_width is None:
-        return None
-    return terminal_width // 3
-
-
-def bottom_right_column_available_width(terminal_width):
-    """Estimate the width available to the GPU Detail panel's row fallback.
-
-    Unlike the Ollama and GPU Processes panels, the GPU Detail panel lives in
-    ``bottom_right``, whose ratio against ``bottom_left`` is 2:1 in multi-GPU
-    mode (the only mode that reaches the row-per-GPU fallback, see
-    :data:`MAX_SIDE_BY_SIDE_GPUS`), so it gets roughly two thirds of the
-    terminal rather than a third. Reusing
-    :func:`left_column_available_width` here would under-estimate the room
-    available by about half, dropping columns that would actually fit.
+    Every panel of this dashboard has to decide which columns it can afford,
+    and the only reliable source for the room it actually gets is Rich
+    itself: ``options.max_width`` in :meth:`__rich_console__` is the exact
+    number of columns the renderable may occupy, already net of the enclosing
+    panel's borders and padding. Guessing that number from the terminal width
+    and the layout ratios cannot account for the panel chrome or for Rich's
+    own rounding, which is how tables ended up overflowing their panel and
+    losing their right border.
 
     Parameters
     ----------
-    terminal_width : int or None
-        Width of the terminal in columns, or ``None`` when unconstrained.
-
-    Returns
-    -------
-    int or None
-        The estimated available width, or ``None`` when ``terminal_width``
-        is ``None``, in which case callers should treat every column as
-        fitting.
+    builder : callable
+        Takes the available width in columns and returns the renderable to
+        display. It is called once per render pass, and again whenever Rich
+        measures the object, so it must be free of side effects.
     """
-    if terminal_width is None:
-        return None
-    return terminal_width * 2 // 3
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def build(self, available_width):
+        """Build the wrapped renderable for a given width.
+
+        Parameters
+        ----------
+        available_width : int
+            Width in columns the renderable may occupy.
+
+        Returns
+        -------
+        rich.console.RenderableType
+            Whatever the builder produced.
+        """
+        return self._builder(available_width)
+
+    def __rich_console__(self, console, options):
+        """Render the wrapped renderable at its real width."""
+        yield self.build(options.max_width)
+
+    def __rich_measure__(self, console, options):
+        """Report the wrapped renderable's own measurement.
+
+        Without this, Rich falls back to "anything up to the full width",
+        which would make the two side-by-side process panels claim the whole
+        region instead of sharing it.
+        """
+        return Measurement.get(console, options, self.build(options.max_width))
 
 
-def process_table_available_width(terminal_width):
-    """Estimate the width available to each Top CPU / Top Memory table.
+class AdaptiveColumn:
+    """One candidate column of a table sized by :func:`build_adaptive_table`.
 
-    ``top_right`` gets a ratio of 2 against ``top_left``'s 1 in mono-GPU mode
-    and 3 against 2 in multi-GPU mode (roughly two thirds and three fifths of
-    the terminal, respectively), and :func:`build_processes_panel` then
-    splits that region into two side-by-side tables, so each one only gets
-    about half of it. The smaller of the two ratios, three fifths, is used as
-    a single, slightly conservative estimate that covers both modes: it
-    matches the multi-GPU case closely and under-estimates the mono-GPU one,
-    which only means columns are dropped a little earlier than strictly
-    necessary there, never later.
+    A column knows the widest string it will ever have to show, and refuses
+    to be rendered narrower than that unless it explicitly opts into
+    shrinking through ``minimum``. That is what keeps a value such as
+    ``128K`` from being ellipsised into ``12…``: a column that cannot show
+    its own content is dropped, never mangled.
 
     Parameters
     ----------
-    terminal_width : int or None
-        Width of the terminal in columns, or ``None`` when unconstrained.
+    header : str
+        Column header.
+    cells : list of str
+        One value per row, in row order.
+    style : str, optional
+        Rich style applied to the column's values.
+    justify : str, optional
+        Rich justification, ``"left"`` by default.
+    minimum : int, optional
+        Width the column may be squeezed down to. Defaults to the natural
+        width, meaning "never squeezed". Only ever set on columns holding
+        free text, which stays readable once ellipsised. The header always
+        fits: a column whose own header is truncated tells the reader
+        nothing.
+    grow : bool, optional
+        Whether the column may take a share of the width left over once
+        every kept column has its minimum. Only makes sense together with
+        ``minimum``.
+    """
+
+    def __init__(self, header, cells, *, style=None, justify="left", minimum=None, grow=False):
+        self.header = header
+        self.cells = [str(cell) for cell in cells]
+        self.style = style
+        self.justify = justify
+        self.grow = grow
+        self.natural_width = max(cell_len(text) for text in [header, *self.cells])
+        if minimum is None:
+            self.minimum = self.natural_width
+        else:
+            # Never below the header, never above what the content needs.
+            self.minimum = min(self.natural_width, max(minimum, cell_len(header)))
+
+
+def measure_table_width(table):
+    """Return the exact number of columns a table renders into.
+
+    Only meaningful for tables whose every column has a fixed ``width``, as
+    :func:`assemble_table` builds them: their measurement has no slack, so
+    Rich's minimum and maximum coincide with the rendered width, borders and
+    padding included.
+
+    Parameters
+    ----------
+    table : rich.table.Table
+        A table built by :func:`assemble_table`, without an overall width.
 
     Returns
     -------
-    int or None
-        The estimated available width, or ``None`` when ``terminal_width``
-        is ``None``, in which case callers should treat every column as
-        fitting.
+    int
+        The rendered width in columns.
     """
-    if terminal_width is None:
-        return None
-    return (terminal_width * 3 // 5) // 2
+    options = _measurement_console.options.update_width(MEASUREMENT_WIDTH)
+    return Measurement.get(_measurement_console, options, table).maximum
+
+
+def assemble_table(columns, widths, row_styles=None, total_width=None):
+    """Build a table whose columns all have a fixed width.
+
+    Fixed widths are not a stylistic choice, they are the only shape Rich
+    keeps its promises on. When a table overflows, ``Table._calculate_column_widths``
+    shrinks the columns and then re-measures them, and that second
+    measurement re-applies each column's ``min_width``, undoing the shrink
+    and letting the table run past its panel. A column pinned with ``width``
+    is clamped by the re-measure instead of growing back.
+
+    Parameters
+    ----------
+    columns : list of AdaptiveColumn
+        Columns to render, in display order.
+    widths : list of int
+        Content width of each column, excluding padding.
+    row_styles : list, optional
+        One Rich style (or ``None``) per row.
+    total_width : int, optional
+        Overall width of the table. Acts as a hard cap: with fixed columns
+        Rich can honour it, so it is the last line of defence against an
+        overflow.
+
+    Returns
+    -------
+    rich.table.Table
+        The assembled table.
+    """
+    # Padding is collapsed and the edges dropped: these tables live in a
+    # fraction of the screen and every spare column buys another value.
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        padding=(0, 1),
+        collapse_padding=True,
+        pad_edge=False,
+        width=total_width,
+    )
+    for column, width in zip(columns, widths, strict=True):
+        # ``no_wrap`` keeps a starved cell on a single line: without it the
+        # text wraps onto extra lines, stretching the row and leaving the
+        # other cells looking like blank rows underneath it.
+        table.add_column(
+            column.header,
+            style=column.style,
+            justify=column.justify,
+            width=width,
+            no_wrap=True,
+            overflow="ellipsis",
+        )
+
+    row_count = len(columns[0].cells) if columns else 0
+    styles = row_styles if row_styles is not None else [None] * row_count
+    for index in range(row_count):
+        table.add_row(*[column.cells[index] for column in columns], style=styles[index])
+
+    return table
+
+
+def build_adaptive_table(columns, available_width, priorities, row_styles=None):
+    """Fit a set of candidate columns into an exactly known width.
+
+    The least important column is dropped, and the result measured again,
+    until the table fits. Whatever room is left over then goes to the columns
+    that can use it, so the table fills its panel rather than leaving a
+    ragged gap. Because the width is measured rather than estimated, the
+    column set only ever grows as the terminal widens.
+
+    Parameters
+    ----------
+    columns : list of AdaptiveColumn
+        Candidate columns, in display order.
+    available_width : int
+        Room the table has, in columns, as reported by Rich.
+    priorities : dict
+        Maps a column header to its importance; the lowest is dropped first.
+    row_styles : list, optional
+        One Rich style (or ``None``) per row.
+
+    Returns
+    -------
+    rich.table.Table
+        A table guaranteed to fit ``available_width``, unless a single column
+        is already too wide for it.
+    """
+    kept = list(columns)
+    widths = [column.minimum for column in kept]
+    width = measure_table_width(assemble_table(kept, widths, row_styles))
+
+    while width > available_width and len(kept) > 1:
+        index = min(range(len(kept)), key=lambda position: priorities[kept[position].header])
+        del kept[index]
+        del widths[index]
+        width = measure_table_width(assemble_table(kept, widths, row_styles))
+
+    # Hand the slack to the free-text columns, left to right.
+    slack = available_width - width
+    for index, column in enumerate(kept):
+        if slack <= 0:
+            break
+        if not column.grow:
+            continue
+        extra = min(slack, column.natural_width - widths[index])
+        widths[index] += extra
+        slack -= extra
+
+    return assemble_table(kept, widths, row_styles, total_width=available_width)
 
 
 def create_layout():
@@ -462,7 +626,7 @@ def build_gpu_totals(data):
     return table
 
 
-def build_gpu_rows_table(gpus, terminal_width=None):
+def build_gpu_rows_table(gpus, available_width):
     """Build one wide table holding a single row per GPU.
 
     The horizontal fallback of :func:`build_gpu_detail_panel`, used when there
@@ -472,19 +636,10 @@ def build_gpu_rows_table(gpus, terminal_width=None):
     ----------
     gpus : list of dict
         The ``gpu`` list returned by ``/stats``.
-    terminal_width : int, optional
-        Width of the terminal in columns. ``None`` means unconstrained, in
-        which case every column is shown. Otherwise the ``%``, ``Name``,
-        ``Fan``, ``Power``, ``Temp`` and ``Util`` columns are dropped one by
-        one, in that order (least important first), as the width estimated
-        through :func:`bottom_right_column_available_width` drops below
-        :data:`GPU_DETAIL_PERCENT_COLUMN_MIN_WIDTH`,
-        :data:`GPU_DETAIL_NAME_COLUMN_MIN_WIDTH`,
-        :data:`GPU_DETAIL_FAN_COLUMN_MIN_WIDTH`,
-        :data:`GPU_DETAIL_POWER_COLUMN_MIN_WIDTH`,
-        :data:`GPU_DETAIL_TEMP_COLUMN_MIN_WIDTH` and
-        :data:`GPU_DETAIL_UTIL_COLUMN_MIN_WIDTH`. ``GPU`` and ``VRAM`` are
-        never dropped: they carry the values this panel exists to show.
+    available_width : int
+        Room the table has, in columns, as measured by Rich. Columns are
+        dropped in the order given by :data:`GPU_DETAIL_COLUMN_PRIORITIES`
+        until the rest fits.
 
     Returns
     -------
@@ -492,114 +647,80 @@ def build_gpu_rows_table(gpus, terminal_width=None):
         A table with as many of the GPU / Name / Util / VRAM / % / Temp /
         Fan / Power columns as fit.
     """
-    available_width = bottom_right_column_available_width(terminal_width)
-    show_percent = available_width is None or available_width >= GPU_DETAIL_PERCENT_COLUMN_MIN_WIDTH
-    show_name = available_width is None or available_width >= GPU_DETAIL_NAME_COLUMN_MIN_WIDTH
-    show_fan = available_width is None or available_width >= GPU_DETAIL_FAN_COLUMN_MIN_WIDTH
-    show_power = available_width is None or available_width >= GPU_DETAIL_POWER_COLUMN_MIN_WIDTH
-    show_temp = available_width is None or available_width >= GPU_DETAIL_TEMP_COLUMN_MIN_WIDTH
-    show_util = available_width is None or available_width >= GPU_DETAIL_UTIL_COLUMN_MIN_WIDTH
+    # ``id`` is the driver index; fall back to the position in the list when a
+    # payload omits it, so the column is never blank.
+    indices = [str(gpu.get('id', position)) for position, gpu in enumerate(gpus)]
+    names = [truncate_name(gpu.get('name') or 'N/A', 20) for gpu in gpus]
+    loads = [f"{gpu.get('load') or 0:.0f} %" for gpu in gpus]
+    memories = [human_readable_size(gpu.get('memoryUsed') or 0) for gpu in gpus]
+    percents = [f"{gpu.get('memoryPercent') or 0:.0f} %" for gpu in gpus]
+    temperatures = [f"{gpu.get('temperature') or 0:.0f} °C" for gpu in gpus]
+    fan_speeds = [f"{gpu.get('fanSpeed') or 0:.0f} %" for gpu in gpus]
+    power_draws = [f"{gpu.get('powerDraw') or 0:.0f} W" for gpu in gpus]
 
-    # Padding is collapsed and the edges dropped, and every column is
-    # ``no_wrap``, for the same reasons as the GPU Processes table: without
-    # them a starved column wraps its text onto extra lines rather than
-    # truncating it, stretching the row and leaving the other cells looking
-    # like blank rows underneath it.
-    table = Table(
-        show_header=True,
-        header_style="bold magenta",
-        padding=(0, 1),
-        collapse_padding=True,
-        pad_edge=False,
+    columns = [
+        AdaptiveColumn("GPU", indices, style="cyan", justify="right"),
+        AdaptiveColumn(
+            "Name", names, style="green", minimum=GPU_NAME_COLUMN_MIN_WIDTH, grow=True
+        ),
+        AdaptiveColumn("Util", loads, style="yellow", justify="right"),
+        AdaptiveColumn("VRAM", memories, style="blue", justify="right"),
+        AdaptiveColumn("%", percents, style="blue", justify="right"),
+        AdaptiveColumn("Temp", temperatures, style="red", justify="right"),
+        AdaptiveColumn("Fan", fan_speeds, style="white", justify="right"),
+        AdaptiveColumn("Power", power_draws, style="white", justify="right"),
+    ]
+
+    return build_adaptive_table(columns, available_width, GPU_DETAIL_COLUMN_PRIORITIES)
+
+
+def build_gpu_detail_content(gpus, available_width):
+    """Pick and build the rendering of the GPU detail panel.
+
+    Up to :data:`MAX_SIDE_BY_SIDE_GPUS` vertical tables are laid out side by
+    side as long as each of them gets at least
+    :data:`MIN_GPU_COLUMN_WIDTH` columns; anything beyond that falls back to
+    one row per GPU.
+
+    Parameters
+    ----------
+    gpus : list of dict
+        The ``gpu`` list returned by ``/stats``.
+    available_width : int
+        Room the panel's content has, in columns, as measured by Rich.
+
+    Returns
+    -------
+    rich.table.Table
+        Either a grid of vertical tables, or the row-per-GPU table.
+    """
+    side_by_side = (
+        len(gpus) <= MAX_SIDE_BY_SIDE_GPUS
+        and available_width >= len(gpus) * MIN_GPU_COLUMN_WIDTH
     )
-    # Every numeric/name column also gets an explicit ``max_width``. Without
-    # one, Rich measures a column's *natural* content width (e.g. the full
-    # GPU name before ellipsis truncation) to decide its initial width, and
-    # that natural width is what competes for space; if the columns'
-    # combined natural widths overflow the panel, Rich's last-resort shrink
-    # kicks in and can crush a whole trailing column to zero width or clip a
-    # value's unit off, regardless of ``min_width``/``no_wrap``. Capping
-    # every column keeps the combined natural width predictable so that
-    # reaching this fallback path is avoided in the first place.
-    table.add_column("GPU", style="cyan", justify="right", no_wrap=True, min_width=3, max_width=3)
-    if show_name:
-        table.add_column(
-            "Name", style="green", min_width=8, max_width=18, overflow="ellipsis", no_wrap=True
-        )
-    if show_util:
-        table.add_column(
-            "Util", style="yellow", justify="right", no_wrap=True, min_width=5, max_width=5,
-            overflow="ellipsis",
-        )
-    table.add_column(
-        "VRAM", style="blue", justify="right", no_wrap=True, min_width=8, max_width=8,
-        overflow="ellipsis",
-    )
-    if show_percent:
-        table.add_column(
-            "%", style="blue", justify="right", no_wrap=True, min_width=4, max_width=4,
-            overflow="ellipsis",
-        )
-    if show_temp:
-        table.add_column(
-            "Temp", style="red", justify="right", no_wrap=True, min_width=6, max_width=6,
-            overflow="ellipsis",
-        )
-    if show_fan:
-        table.add_column(
-            "Fan", style="white", justify="right", no_wrap=True, min_width=5, max_width=5,
-            overflow="ellipsis",
-        )
-    if show_power:
-        table.add_column(
-            "Power", style="white", justify="right", no_wrap=True, min_width=5, max_width=5,
-            overflow="ellipsis",
-        )
+    if not side_by_side:
+        return build_gpu_rows_table(gpus, available_width)
 
-    for position, gpu_data in enumerate(gpus):
-        # ``id`` is the driver index; fall back to the position in the list when
-        # a payload omits it, so the column is never blank.
-        gpu_index = gpu_data.get('id', position)
-        memory_used = gpu_data.get('memoryUsed') or 0
-        cells = [str(gpu_index)]
-        if show_name:
-            cells.append(truncate_name(gpu_data.get('name', 'N/A'), 20))
-        if show_util:
-            cells.append(f"{gpu_data.get('load') or 0:.0f} %")
-        cells.append(human_readable_size(memory_used))
-        if show_percent:
-            cells.append(f"{gpu_data.get('memoryPercent') or 0:.0f} %")
-        if show_temp:
-            cells.append(f"{gpu_data.get('temperature') or 0:.0f} °C")
-        if show_fan:
-            cells.append(f"{gpu_data.get('fanSpeed') or 0:.0f} %")
-        if show_power:
-            cells.append(f"{gpu_data.get('powerDraw') or 0:.0f} W")
-        table.add_row(*cells)
-
-    return table
+    grid = Table.grid(expand=True)
+    for _ in gpus:
+        grid.add_column(ratio=1)
+    grid.add_row(*[build_single_gpu_table(gpu_data) for gpu_data in gpus])
+    return grid
 
 
-def build_gpu_detail_panel(data, terminal_width=None):
+def build_gpu_detail_panel(data):
     """Build the per-GPU detail panel used in multi-GPU mode.
-
-    Two renderings, picked from the number of cards and the room available: up
-    to :data:`MAX_SIDE_BY_SIDE_GPUS` vertical tables are laid out side by side,
-    anything beyond that (or too narrow a terminal) falls back to one row per
-    GPU.
 
     Parameters
     ----------
     data : dict
         The ``/stats`` payload.
-    terminal_width : int, optional
-        Width of the terminal in columns. ``None`` means unconstrained, in
-        which case only the GPU count decides.
 
     Returns
     -------
     rich.panel.Panel
-        The GPU detail panel.
+        The GPU detail panel, whose content is chosen from the width Rich
+        hands it (see :func:`build_gpu_detail_content`).
     """
     gpus = data.get('gpu') or []
     if not data.get('has_gpu') or not gpus:
@@ -610,31 +731,15 @@ def build_gpu_detail_panel(data, terminal_width=None):
             padding=(0, 1)
         )
 
-    # In multi-GPU mode this panel occupies roughly half of the screen width,
-    # so that is the budget the vertical tables have to fit in.
-    available_width = terminal_width // 2 if terminal_width else None
-    side_by_side = len(gpus) <= MAX_SIDE_BY_SIDE_GPUS and (
-        available_width is None or available_width >= len(gpus) * MIN_GPU_COLUMN_WIDTH
-    )
-
-    if side_by_side:
-        grid = Table.grid(expand=True)
-        for _ in gpus:
-            grid.add_column(ratio=1)
-        grid.add_row(*[build_single_gpu_table(gpu_data) for gpu_data in gpus])
-        content = grid
-    else:
-        content = build_gpu_rows_table(gpus, terminal_width)
-
     return Panel(
-        content,
+        AdaptiveRenderable(lambda width: build_gpu_detail_content(gpus, width)),
         title="[bold cyan]GPU Detail[/bold cyan]",
         border_style="cyan",
         padding=(0, 1)
     )
 
 
-def build_process_table(processes, key, title, terminal_width=None):
+def build_process_table(processes, key, available_width):
     """Build a table for the most resource-intensive processes.
 
     Parameters
@@ -643,119 +748,164 @@ def build_process_table(processes, key, title, terminal_width=None):
         Entries of ``top_cpu`` or ``top_memory``.
     key : str
         Either ``"top_cpu"`` or ``"top_memory"``; selects the metric column.
-    title : str
-        Human readable name of the ranking, used by the empty-state panel.
-    terminal_width : int, optional
-        Width of the terminal in columns. ``None`` means unconstrained, in
-        which case every column is shown. Otherwise the ``Cmdline``, metric
-        (``CPU%``/``Memory%``) and ``PID`` columns are dropped one by one, in
-        that order (least important first), as the width estimated through
-        :func:`process_table_available_width` drops below
-        :data:`PROCESS_TABLE_CMDLINE_COLUMN_MIN_WIDTH`,
-        :data:`PROCESS_TABLE_METRIC_COLUMN_MIN_WIDTH` and
-        :data:`PROCESS_TABLE_PID_COLUMN_MIN_WIDTH`. ``Name`` is never
-        dropped: identifying the process is the whole point of the panel.
+    available_width : int
+        Room the table has, in columns, as measured by Rich. Columns are
+        dropped in the order given by :data:`PROCESS_TABLE_COLUMN_PRIORITIES`
+        until the rest fits.
 
     Returns
     -------
-    rich.table.Table or rich.panel.Panel
-        The ranking table, or an explanatory panel when there is no data.
+    rich.table.Table
+        The ranking table.
     """
-    if not processes:
-        return Panel(
-            f"No data for {title}.",
-            title=f"[bold cyan]{title}[/bold cyan]",
-            border_style="cyan",
-            padding=(0, 1)
-        )
+    pids = [str(proc.get('pid', 'N/A')) for proc in processes]
+    names = [truncate_name(proc.get('name') or 'N/A') for proc in processes]
+    cmdlines = [truncate_cmdline(proc.get('cmdline') or '', 20) for proc in processes]
+    if key == 'top_cpu':
+        metric_header = "CPU%"
+        metric_style = "yellow"
+        metrics = [f"{proc.get('cpu_percent') or 0:.1f}%" for proc in processes]
+    else:
+        metric_header = "Memory%"
+        metric_style = "blue"
+        metrics = [f"{proc.get('memory_percent') or 0:.1f}%" for proc in processes]
 
-    available_width = process_table_available_width(terminal_width)
-    show_cmdline = (
-        available_width is None or available_width >= PROCESS_TABLE_CMDLINE_COLUMN_MIN_WIDTH
-    )
-    show_metric = (
-        available_width is None or available_width >= PROCESS_TABLE_METRIC_COLUMN_MIN_WIDTH
-    )
-    show_pid = available_width is None or available_width >= PROCESS_TABLE_PID_COLUMN_MIN_WIDTH
+    columns = [
+        AdaptiveColumn("PID", pids, style="cyan"),
+        AdaptiveColumn(
+            "Name", names, style="green", minimum=PROCESS_NAME_COLUMN_MIN_WIDTH, grow=True
+        ),
+        AdaptiveColumn(metric_header, metrics, style=metric_style, justify="right"),
+        AdaptiveColumn(
+            "Cmdline", cmdlines, style="white", minimum=CMDLINE_COLUMN_MIN_WIDTH, grow=True
+        ),
+    ]
 
-    # Padding is collapsed and the edges dropped, and every column is
-    # ``no_wrap``, for the same reasons as the GPU Processes table: without
-    # them a starved column wraps its text onto extra lines rather than
-    # truncating it, stretching the row and leaving the other cells looking
-    # like blank rows underneath it.
-    table = Table(
-        show_header=True,
-        header_style="bold magenta",
+    return build_adaptive_table(columns, available_width, PROCESS_TABLE_COLUMN_PRIORITIES)
+
+
+def build_process_panel(processes, key, title):
+    """Wrap a process ranking in its titled panel.
+
+    Parameters
+    ----------
+    processes : list of dict
+        Entries of ``top_cpu`` or ``top_memory``.
+    key : str
+        Either ``"top_cpu"`` or ``"top_memory"``.
+    title : str
+        Human readable name of the ranking, used as the panel title and by
+        the empty state.
+
+    Returns
+    -------
+    rich.panel.Panel
+        The ranking panel, showing an explanatory line when there is no data.
+    """
+    content = (
+        AdaptiveRenderable(lambda width: build_process_table(processes, key, width))
+        if processes
+        else f"No data for {title}."
+    )
+    return Panel(
+        content,
+        title=f"[bold cyan]{title}[/bold cyan]",
+        border_style="cyan",
         padding=(0, 1),
-        collapse_padding=True,
-        pad_edge=False,
     )
-    metric_header = "CPU%" if key == 'top_cpu' else "Memory%"
-    if show_pid:
-        table.add_column("PID", style="cyan", no_wrap=True, min_width=4)
-    table.add_column("Name", style="green", min_width=6, overflow="ellipsis", no_wrap=True)
-    if show_metric:
-        table.add_column(metric_header, style="yellow" if key == 'top_cpu' else "blue",
-                          justify="right", no_wrap=True, min_width=5)
-    if show_cmdline:
-        table.add_column("Cmdline", style="white", max_width=20, overflow="ellipsis", no_wrap=True)
-
-    for proc in processes:
-        pid = str(proc.get('pid', 'N/A'))
-        name = truncate_name(proc.get('name', 'N/A'))
-        cmdline = truncate_cmdline(proc.get('cmdline', ''), 20)
-        metric = f"{proc.get('cpu_percent', 0):.1f}%" if key == 'top_cpu' \
-            else f"{proc.get('memory_percent', 0):.1f}%"
-
-        cells = []
-        if show_pid:
-            cells.append(pid)
-        cells.append(name)
-        if show_metric:
-            cells.append(metric)
-        if show_cmdline:
-            cells.append(cmdline)
-        table.add_row(*cells)
-
-    return table
 
 
-def build_processes_panel(data, terminal_width=None):
+def build_processes_panel(data):
     """Build the panel holding the Top CPU and Top Memory rankings.
 
     Parameters
     ----------
     data : dict
         The ``/stats`` payload.
-    terminal_width : int, optional
-        Width of the terminal in columns, forwarded to
-        :func:`build_process_table` so it can size the two side-by-side
-        rankings correctly (see :func:`process_table_available_width`).
 
     Returns
     -------
     rich.table.Table
-        A two-column grid with one panel per ranking.
+        A two-column grid with one panel per ranking. Each panel sizes its
+        own table from the half of the region Rich gives it, so neither has
+        to guess how the grid was split.
     """
-    top_cpu = data.get('top_cpu', [])
-    top_memory = data.get('top_memory', [])
-
-    table_cpu = build_process_table(top_cpu, 'top_cpu', 'CPU', terminal_width)
-    table_mem = build_process_table(top_memory, 'top_memory', 'Memory', terminal_width)
-
     processes_table = Table.grid(expand=True)
     processes_table.add_column()
     processes_table.add_column()
 
     processes_table.add_row(
-        Panel(table_cpu, title="[bold cyan]Top CPU[/bold cyan]", border_style="cyan", padding=(0, 1)),
-        Panel(table_mem, title="[bold cyan]Top Memory[/bold cyan]", border_style="cyan", padding=(0, 1))
+        build_process_panel(data.get('top_cpu', []), 'top_cpu', 'Top CPU'),
+        build_process_panel(data.get('top_memory', []), 'top_memory', 'Top Memory'),
     )
 
     return processes_table
 
 
-def build_gpu_processes_panel(data, multi_gpu=False, terminal_width=None):
+def build_gpu_processes_table(processes, multi_gpu, available_width):
+    """Build the table listing the processes holding VRAM.
+
+    Parameters
+    ----------
+    processes : list of dict
+        Entries of ``top_gpu_processes``.
+    multi_gpu : bool
+        When ``True`` a ``GPU`` column is prepended with the index of the card
+        each process runs on. On a single-GPU host that column would only
+        repeat ``0`` on every row, so it is left out.
+    available_width : int
+        Room the table has, in columns, as measured by Rich. Columns are
+        dropped in the order given by
+        :data:`GPU_PROCESSES_COLUMN_PRIORITIES` until the rest fits.
+
+    Returns
+    -------
+    rich.table.Table
+        The GPU processes table.
+    """
+    names = [proc.get('name') or 'N/A' for proc in processes]
+    columns = []
+    if multi_gpu:
+        # A driver too old to report gpu_uuid leaves the index unresolved.
+        indices = [
+            "?" if proc.get('gpu_index') is None else str(proc['gpu_index'])
+            for proc in processes
+        ]
+        columns.append(AdaptiveColumn("GPU", indices, style="cyan", justify="right"))
+
+    columns.append(
+        AdaptiveColumn("PID", [str(proc.get('pid', 'N/A')) for proc in processes], style="cyan")
+    )
+    columns.append(
+        AdaptiveColumn(
+            "Name", [truncate_name(name) for name in names], style="green",
+            minimum=PROCESS_NAME_COLUMN_MIN_WIDTH, grow=True,
+        )
+    )
+    columns.append(
+        AdaptiveColumn(
+            "Memory Used",
+            [human_readable_size(proc.get('memory_used') or 0) for proc in processes],
+            style="blue", justify="right",
+        )
+    )
+    columns.append(
+        AdaptiveColumn(
+            "Cmdline",
+            [truncate_cmdline(proc.get('cmdline') or '', 20) for proc in processes],
+            style="white", minimum=CMDLINE_COLUMN_MIN_WIDTH, grow=True,
+        )
+    )
+
+    # Ollama's own workers are highlighted so its share stands out.
+    row_styles = [OLLAMA_ROW_STYLE if name == "ollama" else None for name in names]
+
+    return build_adaptive_table(
+        columns, available_width, GPU_PROCESSES_COLUMN_PRIORITIES, row_styles=row_styles
+    )
+
+
+def build_gpu_processes_panel(data, multi_gpu=False):
     """Build the panel listing the processes holding VRAM.
 
     Parameters
@@ -763,22 +913,7 @@ def build_gpu_processes_panel(data, multi_gpu=False, terminal_width=None):
     data : dict
         The ``/stats`` payload.
     multi_gpu : bool, optional
-        When ``True`` a ``GPU`` column is prepended with the index of the card
-        each process runs on. On a single-GPU host that column would only
-        repeat ``0`` on every row, so it is left out.
-    terminal_width : int, optional
-        Width of the terminal in columns. ``None`` means unconstrained, in
-        which case every column is shown at its natural width. Below
-        :data:`GPU_PROCESSES_CMDLINE_COLUMN_MIN_WIDTH` (estimated through
-        :func:`left_column_available_width`) the ``Cmdline`` column, the
-        widest and least essential one, is dropped, and the ``Name`` and
-        ``Memory Used`` columns are additionally capped at
-        :data:`GPU_PROCESSES_NAME_COLUMN_MAX_WIDTH` and
-        :data:`GPU_PROCESSES_MEMORY_COLUMN_MAX_WIDTH` respectively: their
-        headers are wider than a single value, so left uncapped Rich keeps
-        them at their natural width and the table overflows its panel even
-        with ``Cmdline`` gone. Capping them keeps the GPU, PID and the memory
-        figure with its unit legible instead of being clipped mid-word.
+        Forwarded to :func:`build_gpu_processes_table`.
 
     Returns
     -------
@@ -786,64 +921,15 @@ def build_gpu_processes_panel(data, multi_gpu=False, terminal_width=None):
         The GPU processes panel, or an empty-state panel.
     """
     processes = data.get("top_gpu_processes", [])
-    if not processes:
-        return Panel(
-            "No GPU processes.",
-            title="[bold cyan]GPU Processes[/bold cyan]",
-            border_style="cyan",
-            padding=(0, 1)
+    content = (
+        AdaptiveRenderable(
+            lambda width: build_gpu_processes_table(processes, multi_gpu, width)
         )
-
-    available_width = left_column_available_width(terminal_width)
-    show_cmdline = (
-        available_width is None or available_width >= GPU_PROCESSES_CMDLINE_COLUMN_MIN_WIDTH
+        if processes
+        else "No GPU processes."
     )
-    name_max_width = None if show_cmdline else GPU_PROCESSES_NAME_COLUMN_MAX_WIDTH
-    memory_max_width = None if show_cmdline else GPU_PROCESSES_MEMORY_COLUMN_MAX_WIDTH
-
-    # Padding is collapsed and the edges dropped: this table lives in a third of
-    # the screen and the extra column has to come from somewhere. Every column
-    # is ``no_wrap``: without it, a column starved for width wraps its text
-    # onto extra lines instead of truncating it, which stretches the row and
-    # leaves the other cells looking like blank rows underneath it.
-    table = Table(
-        show_header=True,
-        header_style="bold magenta",
-        padding=(0, 1),
-        collapse_padding=True,
-        pad_edge=False,
-    )
-    if multi_gpu:
-        table.add_column("GPU", style="cyan", justify="right", no_wrap=True, min_width=3)
-    table.add_column("PID", style="cyan", no_wrap=True, min_width=4)
-    table.add_column(
-        "Name", style="green", min_width=6, max_width=name_max_width,
-        overflow="ellipsis", no_wrap=True,
-    )
-    table.add_column(
-        "Memory Used", style="blue", justify="right", no_wrap=True, min_width=5,
-        max_width=memory_max_width, overflow="ellipsis",
-    )
-    if show_cmdline:
-        table.add_column("Cmdline", style="white", max_width=20, overflow="ellipsis", no_wrap=True)
-
-    for proc in processes:
-        pid = str(proc.get('pid', 'N/A'))
-        name = proc.get('name', 'N/A')
-        memory_used = human_readable_size(proc.get('memory_used', 0))
-        cells = [pid, truncate_name(name), memory_used]
-        if show_cmdline:
-            cells.append(truncate_cmdline(proc.get('cmdline', ''), 20))
-        if multi_gpu:
-            # A driver too old to report gpu_uuid leaves the index unresolved.
-            gpu_index = proc.get('gpu_index')
-            cells.insert(0, "?" if gpu_index is None else str(gpu_index))
-        # Ollama's own workers are highlighted so its share stands out.
-        row_style = OLLAMA_ROW_STYLE if name == "ollama" else None
-        table.add_row(*cells, style=row_style)
-
     return Panel(
-        table,
+        content,
         title="[bold cyan]GPU Processes[/bold cyan]",
         border_style="cyan",
         padding=(0, 1)
@@ -911,32 +997,27 @@ def ollama_gpu_indices(gpu_processes):
     return True, (",".join(str(index) for index in indices) if indices else "-")
 
 
-def build_ollama_panel(data, gpu_processes=None, terminal_width=None):
-    """Build the panel listing the models Ollama keeps loaded.
+def build_ollama_table(models, has_ollama_process, gpu_label, available_width):
+    """Build the table listing the models Ollama keeps loaded.
 
     Parameters
     ----------
-    data : dict
-        The ``/stats`` payload.
-    gpu_processes : list of dict, optional
-        Entries of ``top_gpu_processes``, used to fill the ``GPU`` column.
-    terminal_width : int, optional
-        Width of the terminal in columns. ``None`` means unconstrained, in
-        which case every column is shown. Otherwise the ``Size``, ``VRAM``,
-        ``GPU%`` and ``Expires`` columns are dropped one by one, in that
-        order (least important first), as the width estimated through
-        :func:`left_column_available_width` drops below
-        :data:`OLLAMA_VRAM_COLUMN_MIN_WIDTH`,
-        :data:`OLLAMA_SIZE_COLUMN_MIN_WIDTH`,
-        :data:`OLLAMA_GPU_PERCENT_COLUMN_MIN_WIDTH` and
-        :data:`OLLAMA_EXPIRES_COLUMN_MIN_WIDTH`. ``Model``, ``GPU`` and
-        ``Ctx`` are never dropped: they carry the values this panel exists to
-        show.
+    models : list of dict
+        The ``models`` list of the ``/api/ps`` response.
+    has_ollama_process : bool
+        Whether an Ollama process was found among the GPU compute apps; the
+        ``GPU`` column only exists when there is something to attribute.
+    gpu_label : str
+        Comma-joined indices Ollama holds VRAM on.
+    available_width : int
+        Room the table has, in columns, as measured by Rich. Columns are
+        dropped in the order given by :data:`OLLAMA_COLUMN_PRIORITIES` until
+        the rest fits.
 
     Returns
     -------
-    rich.panel.Panel
-        The Ollama panel, or an empty-state panel.
+    rich.table.Table
+        The Ollama table.
 
     Notes
     -----
@@ -950,6 +1031,60 @@ def build_ollama_panel(data, gpu_processes=None, terminal_width=None):
     misleading; its cell falls back to the same placeholder used when no
     index could be resolved.
     """
+    names, gpu_cells, contexts = [], [], []
+    sizes, vrams, ratios, expirations = [], [], [], []
+
+    for model in models:
+        size_value = model.get('size') or 0
+        # ``or 0`` also absorbs an explicit ``None``, which a payload predating
+        # this field would otherwise turn into a ``TypeError`` below.
+        size_vram_value = model.get('size_vram') or 0
+
+        names.append(truncate_name(model.get('name') or 'N/A'))
+        # A model absent from VRAM was never actually placed on any of the
+        # cards Ollama holds; showing the process-level indices there would
+        # misattribute it, so it gets the "unresolved" placeholder.
+        gpu_cells.append(gpu_label if size_vram_value > 0 else "-")
+        contexts.append(format_context_length(model.get('context_length')))
+        sizes.append(human_readable_size(size_value))
+        vrams.append(human_readable_size(size_vram_value))
+        ratio = (size_vram_value / size_value) * 100 if size_value > 0 else 0
+        ratios.append(f"{ratio:.0f}%")
+        expirations.append(time_until(model.get('expires_at', '')))
+
+    columns = [
+        AdaptiveColumn(
+            "Model", names, style="green", minimum=MODEL_COLUMN_MIN_WIDTH, grow=True
+        ),
+    ]
+    if has_ollama_process:
+        columns.append(AdaptiveColumn("GPU", gpu_cells, style="cyan", justify="right"))
+    columns.extend([
+        AdaptiveColumn("Ctx", contexts, style="magenta", justify="right"),
+        AdaptiveColumn("Size", sizes, style="blue", justify="right"),
+        AdaptiveColumn("VRAM", vrams, style="blue", justify="right"),
+        AdaptiveColumn("GPU%", ratios, style="red", justify="right"),
+        AdaptiveColumn("Expires", expirations, style="yellow", justify="right"),
+    ])
+
+    return build_adaptive_table(columns, available_width, OLLAMA_COLUMN_PRIORITIES)
+
+
+def build_ollama_panel(data, gpu_processes=None):
+    """Build the panel listing the models Ollama keeps loaded.
+
+    Parameters
+    ----------
+    data : dict
+        The ``/stats`` payload.
+    gpu_processes : list of dict, optional
+        Entries of ``top_gpu_processes``, used to fill the ``GPU`` column.
+
+    Returns
+    -------
+    rich.panel.Panel
+        The Ollama panel, or an empty-state panel.
+    """
     models = data.get("ollama_processes", {}).get("models", [])
     if not models:
         return Panel(
@@ -961,77 +1096,17 @@ def build_ollama_panel(data, gpu_processes=None, terminal_width=None):
 
     has_ollama_process, gpu_label = ollama_gpu_indices(gpu_processes)
 
-    available_width = left_column_available_width(terminal_width)
-    show_vram = available_width is None or available_width >= OLLAMA_VRAM_COLUMN_MIN_WIDTH
-    show_size = available_width is None or available_width >= OLLAMA_SIZE_COLUMN_MIN_WIDTH
-    show_gpu_percent = (
-        available_width is None or available_width >= OLLAMA_GPU_PERCENT_COLUMN_MIN_WIDTH
-    )
-    show_expires = available_width is None or available_width >= OLLAMA_EXPIRES_COLUMN_MIN_WIDTH
-
-    # Up to seven columns in a third of the screen leave no room for cell
-    # padding: with it the table overflows its region and Rich clips the
-    # rightmost columns off. The box lines still separate the values, every
-    # floor is kept low, and every column is ``no_wrap`` so a starved one
-    # truncates its text instead of wrapping it onto extra lines.
-    table = Table(
-        show_header=True,
-        header_style="bold magenta",
-        padding=(0, 0),
-        pad_edge=False,
-    )
-    table.add_column("Model", style="green", min_width=8, overflow="ellipsis", no_wrap=True)
-    if has_ollama_process:
-        table.add_column("GPU", style="cyan", justify="right", no_wrap=True, min_width=3)
-    table.add_column("Ctx", style="magenta", justify="right", no_wrap=True, min_width=3)
-    if show_size:
-        table.add_column("Size", style="blue", justify="right", no_wrap=True, min_width=5)
-    if show_vram:
-        table.add_column("VRAM", style="blue", justify="right", no_wrap=True, min_width=5)
-    if show_gpu_percent:
-        table.add_column("GPU%", style="red", justify="right", no_wrap=True, min_width=4)
-    if show_expires:
-        table.add_column("Expires", style="yellow", justify="right", no_wrap=True, min_width=5)
-
-    for model in models:
-        model_name = truncate_name(model.get('name', 'N/A'))
-        context_length = format_context_length(model.get('context_length'))
-        size_value = model.get('size', 0)
-        # ``or 0`` also absorbs an explicit ``None``, which a payload predating
-        # this field would otherwise turn into a ``TypeError`` below.
-        size_vram_value = model.get('size_vram') or 0
-        size_total = human_readable_size(size_value)
-        size_vram = human_readable_size(size_vram_value)
-        gpu_loaded_ratio = (size_vram_value / size_value) * 100 if size_value > 0 else 0
-        gpu_loaded_str = f"{gpu_loaded_ratio:.0f}%"
-        expiration = time_until(model.get('expires_at', ''))
-
-        cells = [model_name]
-        if has_ollama_process:
-            # A model absent from VRAM was never actually placed on any of the
-            # cards Ollama holds; showing the process-level indices there
-            # would misattribute it, so it gets the "unresolved" placeholder.
-            cells.append(gpu_label if size_vram_value > 0 else "-")
-        cells.append(context_length)
-        if show_size:
-            cells.append(size_total)
-        if show_vram:
-            cells.append(size_vram)
-        if show_gpu_percent:
-            cells.append(gpu_loaded_str)
-        if show_expires:
-            cells.append(expiration)
-        table.add_row(*cells)
-
     return Panel(
-        table,
+        AdaptiveRenderable(
+            lambda width: build_ollama_table(models, has_ollama_process, gpu_label, width)
+        ),
         title="[bold cyan]Ollama Statistics[/bold cyan]",
         border_style="cyan",
         padding=(0, 1)
     )
 
 
-def build_layout_content(layout, data, interval, terminal_width=None):
+def build_layout_content(layout, data, interval):
     """Fill the four layout regions with the fetched data.
 
     The routing depends on the number of GPUs. With zero or one card the
@@ -1039,6 +1114,10 @@ def build_layout_content(layout, data, interval, terminal_width=None):
     always was. From two cards on, the detail moves to its own region, the GPU
     processes join Ollama on the left (they describe the same VRAM), and the
     summary keeps only cumulated figures.
+
+    No width is threaded through: every panel sizes itself from the room Rich
+    hands it at render time (see :class:`AdaptiveRenderable`), which is the
+    only figure that accounts for the layout ratios *and* the panel chrome.
 
     Parameters
     ----------
@@ -1048,9 +1127,6 @@ def build_layout_content(layout, data, interval, terminal_width=None):
         The ``/stats`` payload.
     interval : int
         Current refresh interval in seconds.
-    terminal_width : int, optional
-        Width of the terminal in columns, forwarded to
-        :func:`build_gpu_detail_panel` to pick its rendering.
 
     Returns
     -------
@@ -1060,13 +1136,11 @@ def build_layout_content(layout, data, interval, terminal_width=None):
     multi_gpu = bool(data.get("has_gpu")) and len(gpus) > 1
 
     gpu_processes = data.get("top_gpu_processes") or []
-    ollama_panel = build_ollama_panel(data, gpu_processes=gpu_processes, terminal_width=terminal_width)
-    gpu_processes_panel = build_gpu_processes_panel(
-        data, multi_gpu=multi_gpu, terminal_width=terminal_width
-    )
+    ollama_panel = build_ollama_panel(data, gpu_processes=gpu_processes)
+    gpu_processes_panel = build_gpu_processes_panel(data, multi_gpu=multi_gpu)
 
     # Both modes keep the process rankings top right, they need the width.
-    layout["top_right"].update(build_processes_panel(data, terminal_width))
+    layout["top_right"].update(build_processes_panel(data))
 
     if multi_gpu:
         # The left column carries two stacked panels, hence a bit more room.
@@ -1076,7 +1150,7 @@ def build_layout_content(layout, data, interval, terminal_width=None):
         layout["bottom_right"].ratio = 2
         layout["top_left"].update(Group(ollama_panel, gpu_processes_panel))
         layout["bottom_left"].update(build_summary(data, interval, multi_gpu=True))
-        layout["bottom_right"].update(build_gpu_detail_panel(data, terminal_width))
+        layout["bottom_right"].update(build_gpu_detail_panel(data))
     else:
         layout["top_left"].ratio = 1
         layout["top_right"].ratio = 2
@@ -1192,18 +1266,11 @@ def main():
                     if stats:
                         with stats_lock:
                             latest_stats = stats
-                        terminal_size = shutil.get_terminal_size(fallback=(80, 24))
-                        terminal_width = terminal_size.columns
-                        build_layout_content(layout, latest_stats, current_interval, terminal_width)
+                        build_layout_content(layout, latest_stats, current_interval)
                 else:
                     # If paused, only rebuild the layout with the latest data
                     if latest_stats:
-                        build_layout_content(
-                            layout,
-                            latest_stats,
-                            current_interval,
-                            terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns,
-                        )
+                        build_layout_content(layout, latest_stats, current_interval)
 
             previous_help_flag = help_flag
 
@@ -1212,19 +1279,9 @@ def main():
                 if help_flag:
                     live.update(build_full_screen_help())
                 elif not paused and latest_stats:
-                    build_layout_content(
-                        layout,
-                        latest_stats,
-                        current_interval,
-                        terminal_width=shutil.get_terminal_size(fallback=(80, 24)).columns,
-                    )
+                    build_layout_content(layout, latest_stats, current_interval)
                 elif paused and latest_stats:
-                    build_layout_content(
-                        layout,
-                        latest_stats,
-                        current_interval,
-                        terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns,
-                    )
+                    build_layout_content(layout, latest_stats, current_interval)
                 rebuild_layout_event.clear()
 
             # Wait for the refresh interval or an event

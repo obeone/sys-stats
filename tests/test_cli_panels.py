@@ -1,8 +1,13 @@
 """Tests for the Rich panel builders of the terminal dashboard.
 
 The builders are pure: they take a ``/stats`` payload and return renderables, so
-they can be asserted on without a terminal. Only structure is checked here (how
-many tables, which rows), never the ANSI output.
+they can be asserted on without a terminal. Structure is checked wherever it is
+enough (how many tables, which columns); the assembled layout is rendered to
+plain text when the question is whether it physically fits the screen.
+
+Panels do not choose their columns when they are built, they choose them when
+Rich tells them how wide they are, so a panel's table is obtained through
+``panel.renderable.build(width)`` (see :class:`sys_stats.cli.AdaptiveRenderable`).
 """
 
 import io
@@ -17,15 +22,37 @@ from sys_stats.cli import (
     OLLAMA_ROW_STYLE,
     build_gpu_detail_panel,
     build_gpu_processes_panel,
+    build_gpu_processes_table,
+    build_gpu_rows_table,
     build_gpu_summary,
     build_gpu_totals,
     build_layout_content,
     build_ollama_panel,
+    build_process_panel,
     build_process_table,
     build_processes_panel,
+    build_summary,
     create_layout,
     format_context_length,
     gpu_memory_total_bytes,
+)
+
+# Every terminal width the assembled layout is swept over. 60 is narrower than
+# anything usable and 260 is wider than an ultrawide terminal, so the range
+# brackets reality on both sides.
+SWEEP_WIDTHS = range(60, 261)
+
+# Openers and their closers, for the box-integrity check below. A table that
+# overflows the panel it lives in keeps the character that starts its border
+# and loses the one that ends it.
+BOX_PAIRS = (
+    ("┏", "┓"),
+    ("┡", "┩"),
+    ("┗", "┛"),
+    ("└", "┘"),
+    ("┌", "┐"),
+    ("╭", "╮"),
+    ("╰", "╯"),
 )
 
 
@@ -43,14 +70,119 @@ def _gpu(gpu_id: int, name: str) -> dict:
     }
 
 
-def _render(renderable, width: int = 200) -> str:
-    """Render a renderable to plain text, for the assertions on values.
+def _null_gpu() -> dict:
+    """A card whose driver reports nothing but its name.
 
-    Structure assertions are preferred everywhere else; this is only used when
-    the computed figure itself is what matters. The console writes to a
-    :class:`io.StringIO`, so Rich emits no ANSI escapes.
+    ``nvidia-smi`` leaves every figure at ``null`` on a GPU it cannot query
+    (a card in an exotic power state, a container without the right
+    capabilities), and the payload carries those nulls through untouched.
     """
-    console = Console(file=io.StringIO(), width=width, legacy_windows=False)
+    return {
+        "id": 0,
+        "name": "NVIDIA GeForce RTX 3090",
+        "load": None,
+        "memoryUsed": None,
+        "memoryTotal": None,
+        "memoryPercent": None,
+        "temperature": None,
+        "fanSpeed": None,
+        "powerDraw": None,
+    }
+
+
+def _ollama_models() -> list:
+    """Four loaded models, covering every shape of the Ollama payload."""
+    return [
+        {
+            "name": "qwen3-coder:30b",
+            "size": 19_000_000_000,
+            "size_vram": 19_000_000_000,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "context_length": 32768,
+        },
+        {
+            "name": "llama3.3:70b-instruct-q4_K_M",
+            "size": 43_000_000_000,
+            "size_vram": 21_000_000_000,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "context_length": 131072,
+        },
+        # No context_length at all: an Ollama older than 0.32.
+        {
+            "name": "nomic-embed-text",
+            "size": 274_000_000,
+            "size_vram": 274_000_000,
+            "expires_at": "2099-01-01T00:00:00Z",
+        },
+        # Evicted from VRAM, and a context window that is not a power of two.
+        {
+            "name": "mistral-small:24b",
+            "size": 14_000_000_000,
+            "size_vram": 0,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "context_length": 5000,
+        },
+    ]
+
+
+def _gpu_processes() -> list:
+    """Compute apps holding VRAM, two of them owned by Ollama."""
+    return [
+        {
+            "pid": 4242, "name": "ollama", "memory_used": 17_825_792_000,
+            "cmdline": "/usr/local/bin/ollama runner --model qwen3-coder",
+            "gpu_uuid": "GPU-0", "gpu_index": 0,
+        },
+        {
+            "pid": 4242, "name": "ollama", "memory_used": 9_437_184_000,
+            "cmdline": "/usr/local/bin/ollama runner --model llama3.3",
+            "gpu_uuid": "GPU-2", "gpu_index": 2,
+        },
+        {
+            "pid": 8888, "name": "python3", "memory_used": 3_145_728_000,
+            "cmdline": "python3 train.py --epochs 40 --batch 8",
+            "gpu_uuid": "GPU-1", "gpu_index": 1,
+        },
+        {
+            "pid": 9999, "name": "blender", "memory_used": 1_258_291_200,
+            "cmdline": "blender -b scene.blend -f 120",
+            "gpu_uuid": None, "gpu_index": None,
+        },
+    ]
+
+
+def _stats(gpu_count: int) -> dict:
+    """Build a realistic ``/stats`` payload with the requested number of GPUs."""
+    return {
+        "cpu": 37.4,
+        "ram": {"percent": 61.2, "total": 128 * 1024**3},
+        "has_gpu": gpu_count > 0,
+        "gpu": [_gpu(index, f"NVIDIA GeForce RTX {3090 + index}") for index in range(gpu_count)],
+        "top_cpu": [
+            {"pid": 4242, "name": "ollama", "cpu_percent": 412.0,
+             "cmdline": "/usr/local/bin/ollama serve"},
+            {"pid": 8888, "name": "python3", "cpu_percent": 98.6,
+             "cmdline": "python3 train.py --epochs 40 --batch 8"},
+            {"pid": 771, "name": "kworker/u64:3", "cpu_percent": 12.1, "cmdline": "N/A"},
+        ],
+        "top_memory": [
+            {"pid": 4242, "name": "ollama", "memory_percent": 29.8,
+             "cmdline": "/usr/local/bin/ollama serve"},
+            {"pid": 3120, "name": "postgres", "memory_percent": 6.0,
+             "cmdline": "postgres: writer process"},
+        ],
+        "top_gpu_processes": _gpu_processes() if gpu_count else [],
+        "ollama_processes": {"models": _ollama_models()},
+    }
+
+
+def _render(renderable, width: int = 200, height: int = 50) -> str:
+    """Render a renderable to plain text.
+
+    The console writes to a :class:`io.StringIO`, so Rich emits no ANSI
+    escapes and the result can be asserted on character by character.
+    """
+    console = Console(file=io.StringIO(), width=width, height=height, legacy_windows=False)
     console.print(renderable)
     return console.file.getvalue()
 
@@ -60,6 +192,22 @@ def _headers(table: Table) -> list:
     return [column.header for column in table.columns]
 
 
+def _table(panel, width: int = 200) -> Table:
+    """Build the table a panel renders into, for a given panel width.
+
+    Parameters
+    ----------
+    panel : rich.panel.Panel
+        A panel whose renderable is an
+        :class:`~sys_stats.cli.AdaptiveRenderable`.
+    width : int, optional
+        Width in columns handed to the builder. Note this is the width of the
+        table itself, not of the panel: Rich deducts the panel's borders and
+        padding before the renderable ever sees it.
+    """
+    return panel.renderable.build(width)
+
+
 def _has_blank_row(text: str) -> bool:
     """Detect a table row made only of box-drawing bars and whitespace.
 
@@ -67,16 +215,6 @@ def _has_blank_row(text: str) -> bool:
     (already truncated) text onto extra physical lines: the row grows taller
     than one line, but every other cell only has content on the first line,
     leaving the rest looking like a fully blank row.
-
-    Parameters
-    ----------
-    text : str
-        Plain text rendering of a panel or table.
-
-    Returns
-    -------
-    bool
-        ``True`` if any non-empty line consists solely of ``│`` and spaces.
     """
     for line in text.splitlines():
         stripped = line.strip()
@@ -85,30 +223,244 @@ def _has_blank_row(text: str) -> bool:
     return False
 
 
-def _first_column_collapsed(text: str) -> bool:
-    """Detect a table's first column having been starved down to zero width.
+def _clipped_lines(text: str) -> list:
+    """Return the rendered lines holding a box that never closes.
 
-    Rich's last-resort column shrinking (triggered when even the sum of every
-    column's minimum width does not fit) can crush a column to nothing
-    regardless of its ``min_width``: the signature is the header row's
-    top-left corner being immediately followed by a column separator instead
-    of at least one border dash.
+    When a table is wider than the panel it sits in, Rich draws it anyway and
+    the enclosing panel cuts off whatever ran past its right edge. The table
+    keeps the character that opens each of its border lines and loses the one
+    that closes it, so an unbalanced line is the fingerprint of an overflow.
+    Both counts and order are checked: a line may legitimately hold several
+    boxes side by side, but never an opener with no closer after it.
+    """
+    clipped = []
+    for line in text.splitlines():
+        for opener, closer in BOX_PAIRS:
+            unbalanced = line.count(opener) != line.count(closer)
+            unclosed = opener in line and line.rfind(opener) > line.rfind(closer)
+            if unbalanced or unclosed:
+                clipped.append(line)
+                break
+    return clipped
+
+
+def _header_cells(text: str) -> set:
+    """Collect every table header cell of a rendered layout.
+
+    A table's header row is the line right below the one carrying its top
+    border, and header cells are separated by the heavy bar Rich uses inside
+    a table (the enclosing panels use a light one).
+    """
+    lines = text.splitlines()
+    cells = set()
+    for index, line in enumerate(lines[:-1]):
+        if "┏" not in line:
+            continue
+        for cell in lines[index + 1].split("┃"):
+            cell = cell.strip()
+            if cell and "│" not in cell:
+                cells.add(cell)
+    return cells
+
+
+def _rendered_column(text: str, header: str) -> list:
+    """Return the rendered cells sitting under a given table header.
+
+    Finds the one table whose header row carries ``header``, works out that
+    table's horizontal span from its own top border (several tables share a
+    line once they are laid out side by side), and reads every row inside
+    that span. Everything is recovered from the characters that were drawn,
+    so this proves what reached the screen rather than what a renderable
+    intended to put there.
 
     Parameters
     ----------
     text : str
-        Plain text rendering of a panel or table.
+        Plain text rendering of the assembled layout.
+    header : str
+        Exact header of the column to read.
 
     Returns
     -------
-    bool
-        ``True`` if the first column has zero width.
+    list of str
+        One stripped value per row, in row order.
+
+    Raises
+    ------
+    AssertionError
+        When no rendered table carries that header.
     """
-    for line in text.splitlines():
-        if "┏" in line:
-            index = line.index("┏")
-            return line[index + 1] in ("┳", "┓")
-    return False
+    lines = text.splitlines()
+    for index, line in enumerate(lines[:-1]):
+        start = line.find("┏")
+        while start != -1:
+            end = line.find("┓", start)
+            if end == -1:
+                break
+            # Header cells are separated by the heavy bar, values by the light
+            # one, but both sit at the same positions, so one index fits both.
+            cells = [cell.strip() for cell in lines[index + 1][start:end + 1].split("┃")]
+            if header in cells:
+                position = cells.index(header)
+                column = []
+                for row in lines[index + 2:]:
+                    span = row[start:end + 1]
+                    if span.startswith("┡"):
+                        continue  # The rule under the header.
+                    if not span.startswith("│"):
+                        break     # The bottom border, or whatever follows it.
+                    column.append(span.split("│")[position].strip())
+                return column
+            start = line.find("┏", end)
+    raise AssertionError(f"no rendered table carries a {header!r} column")
+
+
+def _render_layout(data: dict, width: int) -> str:
+    """Assemble the whole dashboard and render it at a given terminal width."""
+    layout = create_layout()
+    build_layout_content(layout, data, 5)
+    return _render(layout, width=width)
+
+
+# Every adaptive table of the dashboard, keyed by the panel it belongs to and
+# built from a realistic payload. Each entry takes the width the table is
+# allowed to occupy and returns the table itself.
+TABLE_FACTORIES = {
+    "ollama": lambda width: _table(
+        build_ollama_panel(
+            {"ollama_processes": {"models": _ollama_models()}},
+            gpu_processes=_gpu_processes(),
+        ),
+        width,
+    ),
+    "gpu_processes": lambda width: _table(
+        build_gpu_processes_panel({"top_gpu_processes": _gpu_processes()}, multi_gpu=True),
+        width,
+    ),
+    "top_cpu": lambda width: build_process_table(_stats(1)["top_cpu"], "top_cpu", width),
+    "top_memory": lambda width: build_process_table(
+        _stats(1)["top_memory"], "top_memory", width
+    ),
+    "gpu_rows": lambda width: build_gpu_rows_table(_stats(5)["gpu"], width),
+}
+
+
+class TestAssembledLayoutFitsTheTerminal:
+    """The panels are only ever correct together.
+
+    Every earlier regression test here rendered a panel on its own, against a
+    width someone had estimated by hand, which is precisely how a dashboard
+    whose tables overflowed at most terminal widths kept a green suite. These
+    sweep the real thing: the layout as ``main`` assembles it, rendered
+    through a console of the width under test.
+    """
+
+    @pytest.mark.parametrize("gpu_count", [0, 1, 3, 5])
+    def test_no_table_is_ever_clipped_by_its_panel(self, gpu_count):
+        """Regression: tables overflowed their panel at most terminal widths.
+
+        Before the panels started measuring the room they get instead of
+        estimating it from the terminal width, the mono-GPU dashboard clipped
+        a table at every width from 60 to 83 and from 90 to 206, and the
+        multi-GPU one at 60-74, 90-94, 100, 108-142 and 150-172.
+        """
+        data = _stats(gpu_count)
+
+        offenders = {
+            width: _clipped_lines(_render_layout(data, width))
+            for width in SWEEP_WIDTHS
+        }
+        clipped_widths = sorted(width for width, lines in offenders.items() if lines)
+
+        assert not clipped_widths, (
+            f"{gpu_count} GPU: clipped at {clipped_widths}\n"
+            + "\n".join(offenders[clipped_widths[0]])
+        )
+
+    @pytest.mark.parametrize("gpu_count", [0, 1, 5])
+    def test_columns_only_ever_appear_as_the_terminal_widens(self, gpu_count):
+        """A wider terminal must never show fewer columns than a narrower one.
+
+        Three GPUs are left out: that is the one payload where the GPU Detail
+        panel swaps its row-per-GPU table for side-by-side vertical ones as
+        the terminal widens, and those have no headers at all, so the column
+        set legitimately changes shape rather than growing. Zero, one and five
+        cards cover every table without that mode switch.
+        """
+        data = _stats(gpu_count)
+
+        previous = set()
+        for width in SWEEP_WIDTHS:
+            headers = _header_cells(_render_layout(data, width))
+            assert previous <= headers, (
+                f"{gpu_count} GPU: {sorted(previous - headers)} disappeared at width {width}"
+            )
+            previous = headers
+
+    @pytest.mark.parametrize("gpu_count", [0, 1, 3, 5])
+    def test_nothing_is_drawn_past_the_terminals_last_column(self, gpu_count):
+        """Rich pads to the console width; anything longer is a broken render."""
+        data = _stats(gpu_count)
+
+        for width in SWEEP_WIDTHS:
+            rendered = _render_layout(data, width)
+            assert all(len(line) <= width for line in rendered.splitlines())
+
+
+class TestAdaptiveColumnFitting:
+    """Unit-level guarantees of the column fitting the panels share."""
+
+    def _panel(self):
+        """The Ollama panel, the widest and most crowded of them all."""
+        return build_ollama_panel(
+            {"ollama_processes": {"models": _ollama_models()}},
+            gpu_processes=_gpu_processes(),
+        )
+
+    def test_a_wide_panel_shows_every_column(self):
+        """Nothing is dropped when there is room for everything."""
+        assert _headers(_table(self._panel(), 200)) == [
+            "Model", "GPU", "Ctx", "Size", "VRAM", "GPU%", "Expires",
+        ]
+
+    def test_the_context_column_is_never_ellipsised(self):
+        """Regression: ``Ctx`` was declared 3 wide while its values are 4, so
+        ``128K`` rendered as ``12…`` at every width up to 200.
+
+        A column that cannot show its own widest value is dropped, never
+        shown mangled, so wherever ``Ctx`` survives it is legible.
+        """
+        for width in range(10, 201):
+            table = _table(self._panel(), width)
+            if "Ctx" not in _headers(table):
+                continue
+            assert "128K" in _render(table, width=width)
+
+    @pytest.mark.parametrize("factory", TABLE_FACTORIES.values(), ids=TABLE_FACTORIES)
+    def test_a_table_never_outgrows_the_width_it_was_given(self, factory):
+        """The whole point of measuring: every table fits, at every width."""
+        for width in range(12, 161):
+            rendered = _render(factory(width), width=width)
+
+            assert all(len(line.rstrip()) <= width for line in rendered.splitlines()), width
+            assert not _clipped_lines(rendered), width
+            # A column starved for room has to truncate its text: wrapping it
+            # would stretch the row and leave the other cells looking like
+            # blank rows underneath it.
+            assert not _has_blank_row(rendered), width
+
+    @pytest.mark.parametrize("factory", TABLE_FACTORIES.values(), ids=TABLE_FACTORIES)
+    def test_columns_only_ever_appear_as_the_table_widens(self, factory):
+        """The column set grows with the width, it never shuffles."""
+        previous = set()
+        for width in range(10, 201):
+            headers = set(_headers(factory(width)))
+            assert previous <= headers, f"lost {sorted(previous - headers)} at width {width}"
+            previous = headers
+
+    def test_the_last_column_standing_is_the_most_important_one(self):
+        """Squeezed to nothing, the Ollama table keeps the model name."""
+        assert _headers(_table(self._panel(), 10)) == ["Model"]
 
 
 class TestBuildGpuSummary:
@@ -128,33 +480,95 @@ class TestBuildGpuSummary:
         assert build_gpu_summary({"has_gpu": False, "gpu": []}).renderables == []
 
 
-class TestBuildProcessTable:
-    @pytest.mark.parametrize(("key", "title"), [("top_cpu", "CPU"), ("top_memory", "Memory")])
-    def test_empty_rankings_render_a_placeholder_panel(self, key, title):
-        """No data yields an explanatory panel rather than an empty table."""
-        panel = build_process_table([], key, title)
+class TestBuildSummary:
+    def _data(self):
+        """Two cards with distinct figures, so a sum differs from a mean."""
+        data = {
+            "cpu": 10.0,
+            "ram": {"percent": 25.0, "total": 32 * 1024**3},
+            "has_gpu": True,
+            "gpu": [_gpu(0, "RTX 3090"), _gpu(1, "RTX 4090")],
+        }
+        data["gpu"][1]["load"] = 62.0
+        data["gpu"][1]["temperature"] = 78.0
+        return data
 
-        assert title in str(panel.renderable)
+    def test_multi_gpu_mode_condenses_the_cards_into_totals(self):
+        """Regression: the multi-GPU summary must cumulate, not list.
+
+        Listing one vertical table per card is what overflows the narrow
+        region the summary gets in multi-GPU mode, and it duplicates the
+        panel that already shows the per-card detail.
+        """
+        text = _render(build_summary(self._data(), 5, multi_gpu=True))
+
+        assert "GPU Totals" in text
+        assert "52.0 % (mean)" in text
+        assert "440 W (total)" in text
+        assert "RTX 3090" not in text
+
+    def test_mono_gpu_mode_keeps_the_per_card_tables(self):
+        """One card has no total worth computing, so the detail stays here."""
+        text = _render(build_summary(self._data(), 5))
+
+        assert "RTX 3090" in text
+        assert "RTX 4090" in text
+        assert "GPU Totals" not in text
+
+
+class TestBuildProcessTable:
+    def _processes(self):
+        """Two processes with distinct, identifiable names."""
+        return [
+            {"pid": 4242, "name": "python3.12", "cpu_percent": 412.0,
+             "cmdline": "/usr/bin/python3.12 -m sys_stats.server"},
+            {"pid": 8888, "name": "ollama", "cpu_percent": 88.5,
+             "cmdline": "/usr/local/bin/ollama serve"},
+        ]
+
+    @pytest.mark.parametrize(("key", "title"), [("top_cpu", "Top CPU"), ("top_memory", "Top Memory")])
+    def test_empty_rankings_render_a_placeholder(self, key, title):
+        """No data yields an explanatory line rather than an empty table."""
+        panel = build_process_panel([], key, title)
+
+        assert f"No data for {title}." == panel.renderable
 
     def test_cpu_table_has_one_row_per_process(self):
         """Each process becomes a row under the PID/Name/CPU%/Cmdline columns."""
-        processes = [
-            {"pid": 1, "name": "busy", "cpu_percent": 90.0, "cmdline": "busy --go"},
-            {"pid": 2, "name": "idle", "cpu_percent": 0.1, "cmdline": "idle"},
-        ]
-
-        table = build_process_table(processes, "top_cpu", "CPU")
+        table = build_process_table(self._processes(), "top_cpu", 200)
 
         assert table.row_count == 2
-        assert [column.header for column in table.columns] == ["PID", "Name", "CPU%", "Cmdline"]
+        assert _headers(table) == ["PID", "Name", "CPU%", "Cmdline"]
 
     def test_memory_table_uses_the_memory_columns(self):
         """The memory ranking swaps the CPU% column for Memory%."""
         processes = [{"pid": 1, "name": "big", "memory_percent": 50.0, "cmdline": "big"}]
 
-        table = build_process_table(processes, "top_memory", "Memory")
+        table = build_process_table(processes, "top_memory", 200)
 
-        assert [column.header for column in table.columns] == ["PID", "Name", "Memory%", "Cmdline"]
+        assert _headers(table) == ["PID", "Name", "Memory%", "Cmdline"]
+
+    def test_a_narrow_ranking_keeps_its_name_and_its_metric(self):
+        """Regression: the Name and Cmdline columns used to vanish entirely,
+        leaving a PID and a percentage with no way to tell which process they
+        belonged to. The metric now outranks the PID as well: a ranking
+        without the figure it ranks by says nothing."""
+        table = build_process_table(self._processes(), "top_cpu", 20)
+
+        assert _headers(table) == ["Name", "CPU%"]
+        assert "python3" in _render(table, width=20)
+
+    def test_each_ranking_sizes_itself_from_its_half_of_the_region(self):
+        """Regression: both tables used to be sized against an estimate of the
+        whole region, ignoring that the grid splits it in two."""
+        grid = build_processes_panel({"top_cpu": self._processes(), "top_memory": []})
+
+        rendered = _render(grid, width=80)
+
+        assert "Top CPU" in rendered
+        assert "Top Memory" in rendered
+        assert not _clipped_lines(rendered)
+        assert all(len(line) <= 80 for line in rendered.splitlines())
 
 
 class TestOptionalPanels:
@@ -181,15 +595,13 @@ class TestOptionalPanels:
             }
         }
 
-        panel = build_ollama_panel(data)
-
-        assert panel.renderable.row_count == 2
+        assert _table(build_ollama_panel(data)).row_count == 2
 
     def test_ollama_panel_survives_a_zero_sized_model(self):
         """A model reporting ``size`` 0 must not raise ZeroDivisionError."""
         data = {"ollama_processes": {"models": [{"name": "ghost", "size": 0, "size_vram": 0}]}}
 
-        assert build_ollama_panel(data).renderable.row_count == 1
+        assert _table(build_ollama_panel(data)).row_count == 1
 
 
 class TestGpuMemoryTotalBytes:
@@ -251,14 +663,22 @@ class TestBuildGpuTotals:
         assert table.row_count == 1
         assert "0" in _render(table)
 
+    def test_cards_reporting_no_vram_at_all_do_not_divide_by_zero(self):
+        """A driver exposing neither total nor percentage leaves the summed
+        total at zero, which the VRAM ratio has to survive."""
+        gpus = [_null_gpu(), _null_gpu()]
+
+        text = _render(build_gpu_totals({"has_gpu": True, "gpu": gpus}))
+
+        assert "0.0 B / 0.0 B (0.0 %)" in text
+
 
 class TestBuildGpuDetailPanel:
     def test_up_to_three_gpus_are_laid_out_side_by_side(self):
         """One grid column per card, each holding the vertical per-GPU table."""
         gpus = [_gpu(index, f"GPU{index}") for index in range(3)]
 
-        panel = build_gpu_detail_panel({"has_gpu": True, "gpu": gpus}, terminal_width=200)
-        grid = panel.renderable
+        grid = _table(build_gpu_detail_panel({"has_gpu": True, "gpu": gpus}), 200)
 
         assert len(grid.columns) == 3
         assert grid.row_count == 1
@@ -271,25 +691,46 @@ class TestBuildGpuDetailPanel:
         """Four vertical tables side by side are unreadable, so rows take over."""
         gpus = [_gpu(index, f"GPU{index}") for index in range(4)]
 
-        panel = build_gpu_detail_panel({"has_gpu": True, "gpu": gpus}, terminal_width=200)
-        table = panel.renderable
+        table = _table(build_gpu_detail_panel({"has_gpu": True, "gpu": gpus}), 200)
 
         assert table.row_count == 4
         assert _headers(table) == ["GPU", "Name", "Util", "VRAM", "%", "Temp", "Fan", "Power"]
 
-    def test_a_narrow_terminal_switches_to_rows_below_the_threshold(self):
-        """Three cards on 80 columns leave ~13 columns each: rows are the only option."""
+    def test_a_narrow_region_switches_to_rows_below_the_threshold(self):
+        """Three cards in 60 columns leave 20 each: rows are the only option."""
         gpus = [_gpu(index, f"GPU{index}") for index in range(3)]
 
-        panel = build_gpu_detail_panel({"has_gpu": True, "gpu": gpus}, terminal_width=80)
+        table = _table(build_gpu_detail_panel({"has_gpu": True, "gpu": gpus}), 60)
 
-        assert panel.renderable.row_count == 3
+        assert table.row_count == 3
 
     def test_degrades_gracefully_without_a_gpu(self):
         """A GPU-less host gets a message, not an empty grid."""
         panel = build_gpu_detail_panel({"has_gpu": False, "gpu": []})
 
         assert "No GPU detected." in str(panel.renderable)
+
+    def test_rows_use_the_driver_index_not_the_position_in_the_list(self):
+        """``id`` is what nvidia-smi and every other tool call the card."""
+        gpus = [_gpu(3, "GPU3"), _gpu(7, "GPU7")]
+
+        table = build_gpu_rows_table(gpus, 200)
+
+        assert list(table.columns[0]._cells) == ["3", "7"]
+
+    def test_narrow_rows_keep_the_index_and_the_vram(self):
+        """Regression: the GPU column used to be starved to zero width and the
+        Power column ran past the panel's right edge."""
+        gpus = [_gpu(index, f"GPU{index}") for index in range(3)]
+
+        table = build_gpu_rows_table(gpus, 30)
+        text = _render(table, width=30)
+
+        assert _headers(table)[:1] == ["GPU"]
+        assert "VRAM" in _headers(table)
+        assert "12.0 GB" in text
+        assert not _clipped_lines(text)
+        assert not _has_blank_row(text)
 
 
 class TestFormatContextLength:
@@ -330,8 +771,8 @@ class TestOllamaPanelColumns:
 
         panel = build_ollama_panel(data)
 
-        assert "Ctx" in _headers(panel.renderable)
-        assert "32K" in _render(panel)
+        assert "Ctx" in _headers(_table(panel))
+        assert "32K" in _render(_table(panel))
 
     def test_a_missing_context_length_renders_na(self):
         """Older Ollama servers omit the field entirely."""
@@ -349,7 +790,7 @@ class TestOllamaPanelColumns:
         }
 
         # The expiry is far in the future, so N/A can only come from the Ctx column.
-        assert "N/A" in _render(build_ollama_panel(data))
+        assert "N/A" in _render(_table(build_ollama_panel(data)))
 
     def test_gpu_column_lists_the_indices_held_by_ollama(self):
         """The indices come from the compute apps named ``ollama``."""
@@ -360,10 +801,10 @@ class TestOllamaPanelColumns:
             {"pid": 2, "name": "python", "memory_used": 1, "gpu_index": 2},
         ]
 
-        panel = build_ollama_panel(data, gpu_processes=gpu_processes)
+        table = _table(build_ollama_panel(data, gpu_processes=gpu_processes))
 
-        assert "GPU" in _headers(panel.renderable)
-        assert "0,1" in _render(panel)
+        assert "GPU" in _headers(table)
+        assert "0,1" in _render(table)
 
     def test_gpu_column_is_absent_without_an_ollama_process(self):
         """Nothing to attribute means no column at all."""
@@ -371,17 +812,17 @@ class TestOllamaPanelColumns:
 
         panel = build_ollama_panel(data, gpu_processes=[{"pid": 2, "name": "python"}])
 
-        assert "GPU" not in _headers(panel.renderable)
+        assert "GPU" not in _headers(_table(panel))
 
     def test_unresolved_indices_render_a_dash(self):
         """A driver too old to report ``gpu_uuid`` leaves the attribution unknown."""
         data = {"ollama_processes": {"models": [{"name": "llama3", "size": 1, "size_vram": 1}]}}
         gpu_processes = [{"pid": 1, "name": "ollama", "memory_used": 1, "gpu_index": None}]
 
-        panel = build_ollama_panel(data, gpu_processes=gpu_processes)
+        table = _table(build_ollama_panel(data, gpu_processes=gpu_processes))
 
-        assert "GPU" in _headers(panel.renderable)
-        assert "-" in _render(panel)
+        assert "GPU" in _headers(table)
+        assert "-" in _render(table)
 
     def test_a_model_absent_from_vram_gets_the_placeholder_not_the_indices(self):
         """Regression: a model with ``size_vram`` 0 must not show the indices held
@@ -399,8 +840,7 @@ class TestOllamaPanelColumns:
             {"pid": 1, "name": "ollama", "memory_used": 1, "gpu_index": 2},
         ]
 
-        panel = build_ollama_panel(data, gpu_processes=gpu_processes)
-        table = panel.renderable
+        table = _table(build_ollama_panel(data, gpu_processes=gpu_processes))
         gpu_cells = table.columns[_headers(table).index("GPU")]._cells
 
         assert gpu_cells[0] == "0,2"
@@ -408,61 +848,68 @@ class TestOllamaPanelColumns:
 
 
 class TestGpuProcessesPanelColumns:
-    def _processes(self):
-        """Two compute apps, one of them owned by Ollama, one unattributed."""
-        return [
-            {"pid": 1, "name": "ollama", "memory_used": 1024**3, "cmdline": "ollama serve",
-             "gpu_index": 1, "gpu_uuid": "GPU-1"},
-            {"pid": 2, "name": "python", "memory_used": 1024**3, "cmdline": "python train.py",
-             "gpu_index": None, "gpu_uuid": None},
-        ]
-
     def test_multi_gpu_mode_adds_the_gpu_column(self):
         """The index is only worth a column when there is more than one card."""
-        panel = build_gpu_processes_panel({"top_gpu_processes": self._processes()}, multi_gpu=True)
+        panel = build_gpu_processes_panel({"top_gpu_processes": _gpu_processes()}, multi_gpu=True)
 
-        assert _headers(panel.renderable) == ["GPU", "PID", "Name", "Memory Used", "Cmdline"]
+        assert _headers(_table(panel)) == ["GPU", "PID", "Name", "Memory Used", "Cmdline"]
 
     def test_mono_gpu_mode_keeps_the_original_columns(self):
         """On a single card the column would only repeat ``0`` on every row."""
-        panel = build_gpu_processes_panel({"top_gpu_processes": self._processes()})
+        panel = build_gpu_processes_panel({"top_gpu_processes": _gpu_processes()})
 
-        assert _headers(panel.renderable) == ["PID", "Name", "Memory Used", "Cmdline"]
+        assert _headers(_table(panel)) == ["PID", "Name", "Memory Used", "Cmdline"]
 
     def test_an_unresolved_index_renders_a_question_mark(self):
         """``gpu_index`` is ``None`` when the driver did not report ``gpu_uuid``."""
-        panel = build_gpu_processes_panel({"top_gpu_processes": self._processes()}, multi_gpu=True)
+        panel = build_gpu_processes_panel({"top_gpu_processes": _gpu_processes()}, multi_gpu=True)
 
-        assert "?" in _render(panel)
+        assert "?" in _render(_table(panel))
 
     def test_ollama_rows_are_highlighted(self):
         """Ollama's share of the VRAM must be spottable among the other apps."""
-        panel = build_gpu_processes_panel({"top_gpu_processes": self._processes()}, multi_gpu=True)
-        rows = panel.renderable.rows
+        panel = build_gpu_processes_panel({"top_gpu_processes": _gpu_processes()}, multi_gpu=True)
+        rows = _table(panel).rows
 
         assert rows[0].style == OLLAMA_ROW_STYLE
-        assert rows[1].style is None
+        assert rows[3].style is None
+
+    def test_a_long_process_name_is_truncated(self):
+        """A compute app can be named after its whole binary path; the column
+        exists to identify it, not to reproduce it."""
+        processes = [{"pid": 1, "name": "a-very-long-process-name", "memory_used": 1}]
+
+        table = build_gpu_processes_table(processes, False, 200)
+        name_cells = table.columns[_headers(table).index("Name")]._cells
+
+        assert name_cells[0] == "a-very-long-pr…"
+
+    def test_a_narrow_panel_keeps_the_memory_value_and_its_unit(self):
+        """Regression: the memory figure used to lose its unit (``16.6``
+        instead of ``16.6 GB``) and the table its right border."""
+        panel = build_gpu_processes_panel(
+            {"top_gpu_processes": _gpu_processes()}, multi_gpu=True
+        )
+
+        # 36 columns is what the panel's content really gets on a mono-GPU
+        # dashboard in an 80 column terminal, measured rather than guessed.
+        table = _table(panel, 36)
+        text = _render(table, width=36)
+
+        assert _headers(table) == ["GPU", "PID", "Name", "Memory Used"]
+        assert "16.6 GB" in text
+        assert "4242" in text
+        assert not _clipped_lines(text)
+        assert not _has_blank_row(text)
+        assert all(len(line) <= 36 for line in text.splitlines())
 
 
 class TestBuildLayoutContent:
-    def _data(self, gpu_count: int) -> dict:
-        """Build a minimal ``/stats`` payload with the requested number of GPUs."""
-        return {
-            "cpu": 10.0,
-            "ram": {"percent": 25.0, "total": 32 * 1024**3},
-            "has_gpu": gpu_count > 0,
-            "gpu": [_gpu(index, f"GPU{index}") for index in range(gpu_count)],
-            "top_cpu": [],
-            "top_memory": [],
-            "top_gpu_processes": [],
-            "ollama_processes": {"models": []},
-        }
-
     def test_mono_gpu_keeps_the_summary_bottom_right(self):
         """One card: Ollama top left, GPU processes bottom left, summary bottom right."""
         layout = create_layout()
 
-        build_layout_content(layout, self._data(1), 5, 200)
+        build_layout_content(layout, _stats(1), 5)
 
         assert "Ollama" in str(layout["top_left"].renderable.title)
         assert "GPU Processes" in str(layout["bottom_left"].renderable.title)
@@ -472,7 +919,7 @@ class TestBuildLayoutContent:
         """Two cards: the left column carries both VRAM panels, detail goes bottom right."""
         layout = create_layout()
 
-        build_layout_content(layout, self._data(2), 5, 200)
+        build_layout_content(layout, _stats(2), 5)
 
         top_left = layout["top_left"].renderable
         assert isinstance(top_left, Group)
@@ -481,14 +928,26 @@ class TestBuildLayoutContent:
         assert "Refresh rate" in str(layout["bottom_left"].renderable.subtitle)
         assert "GPU Detail" in str(layout["bottom_right"].renderable.title)
 
+    def test_multi_gpu_summary_is_the_cumulated_one(self):
+        """Regression: the multi-GPU layout must ask for totals, not for the
+        stack of per-card tables the mono layout uses."""
+        layout = create_layout()
+
+        build_layout_content(layout, _stats(2), 5)
+        text = _render(layout["bottom_left"].renderable)
+
+        assert "GPU Totals" in text
+        assert "(mean)" in text
+        assert "RTX 3090" not in text
+
     def test_the_ratios_flip_between_modes(self):
         """Multi-GPU widens the left column and the detail region."""
         layout = create_layout()
 
-        build_layout_content(layout, self._data(1), 5, 200)
+        build_layout_content(layout, _stats(1), 5)
         mono = [layout[name].ratio for name in ("top_left", "top_right", "bottom_right")]
 
-        build_layout_content(layout, self._data(2), 5, 200)
+        build_layout_content(layout, _stats(2), 5)
         multi = [layout[name].ratio for name in ("top_left", "top_right", "bottom_right")]
 
         assert mono == [1, 2, 1]
@@ -498,250 +957,10 @@ class TestBuildLayoutContent:
         """No GPU must never trigger the multi-GPU layout."""
         layout = create_layout()
 
-        build_layout_content(layout, self._data(0), 5, 200)
+        build_layout_content(layout, _stats(0), 5)
 
         assert "Ollama" in str(layout["top_left"].renderable.title)
         assert layout["top_left"].ratio == 1
-
-
-class TestOllamaPanelNarrowWidth:
-    """Regression tests for the Model/GPU/Ctx columns collapsing at 80 columns."""
-
-    def _data(self):
-        """A realistic multi-GPU Ollama payload, shaped like ``/api/ps``."""
-        return {
-            "ollama_processes": {
-                "models": [
-                    {
-                        "name": "qwen3-coder:30b",
-                        "size": 19_000_000_000,
-                        "size_vram": 19_000_000_000,
-                        "context_length": 32768,
-                        "expires_at": "2099-01-01T00:00:00Z",
-                    },
-                    {
-                        "name": "llama3.3:70b-instruct-q4_K_M",
-                        "size": 43_000_000_000,
-                        "size_vram": 21_000_000_000,
-                        "context_length": 131072,
-                        "expires_at": "2099-01-01T00:00:00Z",
-                    },
-                    {
-                        "name": "mistral-small:24b",
-                        "size": 14_000_000_000,
-                        "size_vram": 0,
-                        "context_length": 5000,
-                        "expires_at": "2099-01-01T00:00:00Z",
-                    },
-                ]
-            }
-        }
-
-    def _gpu_processes(self):
-        """Ollama holding VRAM on GPUs 0 and 2, as reported by ``top_gpu_processes``."""
-        return [
-            {"pid": 4242, "name": "ollama", "memory_used": 1, "gpu_index": 0},
-            {"pid": 4242, "name": "ollama", "memory_used": 1, "gpu_index": 2},
-        ]
-
-    def test_narrow_region_keeps_model_and_ctx_readable(self):
-        """Regression: at 80 columns Model/GPU/Ctx used to collapse to zero width.
-
-        ``terminal_width=80`` mirrors what :func:`build_layout_content` passes on a
-        standard terminal; 30 columns is a realistic estimate of the region that
-        panel actually renders into once split off the rest of the layout.
-        """
-        panel = build_ollama_panel(
-            self._data(), gpu_processes=self._gpu_processes(), terminal_width=80
-        )
-
-        text = _render(panel, width=30)
-
-        assert "qwen3-coder" in text
-        assert "32K" in text
-        assert not _has_blank_row(text)
-
-    def test_unconstrained_width_still_shows_every_column(self):
-        """``terminal_width=None`` must keep the pre-fix, all-columns behaviour."""
-        panel = build_ollama_panel(self._data(), gpu_processes=self._gpu_processes())
-
-        assert _headers(panel.renderable) == [
-            "Model", "GPU", "Ctx", "Size", "VRAM", "GPU%", "Expires",
-        ]
-
-
-class TestGpuProcessesPanelNarrowWidth:
-    """Regression tests for the blank rows produced by a starved Cmdline column."""
-
-    def _processes(self):
-        """Two Ollama workers plus two unrelated compute apps, one unattributed."""
-        return [
-            {
-                "pid": 4242, "name": "ollama", "memory_used": 17_825_792_000,
-                "cmdline": "/usr/local/bin/ollama runner --model qwen3-coder",
-                "gpu_uuid": "GPU-0", "gpu_index": 0,
-            },
-            {
-                "pid": 4242, "name": "ollama", "memory_used": 9_437_184_000,
-                "cmdline": "/usr/local/bin/ollama runner --model llama3.3",
-                "gpu_uuid": "GPU-2", "gpu_index": 2,
-            },
-            {
-                "pid": 8888, "name": "python3", "memory_used": 3_145_728_000,
-                "cmdline": "python3 train.py --epochs 40 --batch 8",
-                "gpu_uuid": "GPU-1", "gpu_index": 1,
-            },
-            {
-                "pid": 9999, "name": "blender", "memory_used": 1_258_291_200,
-                "cmdline": "blender -b scene.blend -f 120",
-                "gpu_uuid": None, "gpu_index": None,
-            },
-        ]
-
-    def test_narrow_region_emits_no_blank_rows(self):
-        """Regression: a starved Cmdline column used to wrap onto blank rows.
-
-        ``terminal_width=80`` mirrors what :func:`build_layout_content` passes on a
-        standard terminal; 30 columns is a realistic estimate of the region that
-        panel actually renders into once split off the rest of the layout.
-        """
-        panel = build_gpu_processes_panel(
-            {"top_gpu_processes": self._processes()}, multi_gpu=True, terminal_width=80
-        )
-
-        text = _render(panel, width=30)
-
-        # The Name column itself may still be squeezed down to an ellipsis at
-        # this width; what this fix guarantees is that every process keeps its
-        # own single-line row instead of one bleeding into blank continuation
-        # lines underneath it.
-        assert "8888" in text
-        assert "9999" in text
-        assert not _has_blank_row(text)
-
-    def test_narrow_region_keeps_the_memory_value_and_unit_intact(self):
-        """Regression: even with Cmdline dropped, an uncapped Name and Memory
-        Used still overflowed the panel, clipping the unit off the memory
-        figure (e.g. ``16.6`` instead of ``16.6 GB``) and losing the right
-        border entirely.
-
-        ``terminal_width=80`` mirrors what :func:`build_layout_content` passes
-        on a standard terminal; 32 columns is a realistic estimate of the
-        panel's actual box width once split off the rest of the layout.
-        """
-        panel = build_gpu_processes_panel(
-            {"top_gpu_processes": self._processes()}, multi_gpu=True, terminal_width=80
-        )
-
-        text = _render(panel, width=32)
-
-        # 17_825_792_000 bytes converts to exactly "16.6 GB": the unit must
-        # survive alongside the GPU index and PID.
-        assert "16.6 GB" in text
-        assert "4242" in text
-        assert not _first_column_collapsed(text)
-        assert not _has_blank_row(text)
-        assert all(len(line) <= 32 for line in text.splitlines())
-
-    def test_unconstrained_width_still_shows_the_cmdline_column(self):
-        """``terminal_width=None`` must keep the pre-fix, all-columns behaviour."""
-        panel = build_gpu_processes_panel(
-            {"top_gpu_processes": self._processes()}, multi_gpu=True
-        )
-
-        assert _headers(panel.renderable) == ["GPU", "PID", "Name", "Memory Used", "Cmdline"]
-
-
-class TestGpuDetailPanelNarrowWidth:
-    """Regression tests for the row-per-GPU fallback collapsing at 80 columns."""
-
-    def _gpus(self):
-        """Three cards, shaped so the row fallback is the only viable layout."""
-        return [_gpu(index, f"GPU{index}") for index in range(3)]
-
-    def test_narrow_region_keeps_gpu_and_vram_intact(self):
-        """Regression: at 80 columns the GPU column used to collapse to zero
-        width (missing ``no_wrap`` on Name let Rich starve the whole table
-        unpredictably), the Power column ran past the panel's right edge, and
-        even with proactive column-dropping, uncapped columns (Name, Temp,
-        Fan, Power, ``%``) still let Rich's last-resort shrink crush the Fan
-        and Power columns to nothing and clip the unit off the Temp value
-        (``78`` instead of ``78 °C``), because Rich measures a column's full
-        *natural* content width regardless of ``min_width``/``no_wrap``.
-
-        ``terminal_width=80`` mirrors what :func:`build_layout_content` passes
-        on a standard terminal; 54 columns is the actual box width measured
-        for the bottom-right region at that terminal width with 3 GPUs.
-        """
-        panel = build_gpu_detail_panel({"has_gpu": True, "gpu": self._gpus()}, terminal_width=80)
-
-        text = _render(panel, width=54)
-
-        assert not _first_column_collapsed(text)
-        assert "12.0 GB" in text
-        # Temp/Fan/Power must keep their units, not just their digits: this
-        # is exactly what a partial Rich last-resort shrink used to clip.
-        assert "61 °C" in text
-        assert "30 %" in text
-        assert "220 W" in text
-        assert not _has_blank_row(text)
-        assert all(len(line) <= 54 for line in text.splitlines())
-
-    def test_unconstrained_width_still_shows_every_column(self):
-        """``terminal_width=None`` must keep the pre-fix, all-columns behaviour."""
-        gpus = [_gpu(index, f"GPU{index}") for index in range(4)]
-
-        panel = build_gpu_detail_panel({"has_gpu": True, "gpu": gpus})
-
-        assert _headers(panel.renderable) == [
-            "GPU", "Name", "Util", "VRAM", "%", "Temp", "Fan", "Power",
-        ]
-
-
-class TestProcessTableNarrowWidth:
-    """Regression tests for the Name/Cmdline columns vanishing at 80 columns."""
-
-    def _processes(self):
-        """Two processes with distinct, identifiable names."""
-        return [
-            {"pid": 4242, "name": "python3.12", "cpu_percent": 412.0,
-             "cmdline": "/usr/bin/python3.12 -m sys_stats.server"},
-            {"pid": 8888, "name": "ollama", "cpu_percent": 88.5,
-             "cmdline": "/usr/local/bin/ollama serve"},
-        ]
-
-    def test_narrow_region_keeps_the_process_name_readable(self):
-        """Regression: at 80 columns the Name and Cmdline columns used to
-        vanish entirely, leaving a PID and a percentage with no way to tell
-        which process they belonged to.
-
-        ``terminal_width=80`` mirrors what :func:`build_layout_content` passes
-        on a standard terminal; 26 columns is a realistic estimate of what
-        each of the two side-by-side tables gets once top_right is split.
-        """
-        table = build_process_table(self._processes(), "top_cpu", "CPU", terminal_width=80)
-
-        text = _render(table, width=26)
-
-        assert "python3" in text
-        assert "4242" in text
-        assert not _has_blank_row(text)
-
-    def test_unconstrained_width_still_shows_every_column(self):
-        """``terminal_width=None`` must keep the pre-fix, all-columns behaviour."""
-        table = build_process_table(self._processes(), "top_cpu", "CPU")
-
-        assert _headers(table) == ["PID", "Name", "CPU%", "Cmdline"]
-
-    def test_build_processes_panel_threads_the_terminal_width(self):
-        """The Top CPU / Top Memory tables must see their halved share of
-        top_right, not the full terminal width."""
-        data = {"top_cpu": self._processes(), "top_memory": []}
-
-        grid = build_processes_panel(data, terminal_width=80)
-        cpu_panel = grid.columns[0]._cells[0]
-
-        assert _headers(cpu_panel.renderable) == ["PID", "Name"]
 
 
 class _FakeLive:
