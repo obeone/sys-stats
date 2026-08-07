@@ -110,21 +110,24 @@ unprivileged hosts.
 ## Versioning
 
 **Any user-visible change bumps the version, and the bump touches every file that
-spells it out.** There is no automation reconciling these, so a partial bump ships an
-image whose `org.opencontainers.image.version` label lies about its own contents.
+spells it out.** Two files do:
 
-| File                       | Reference                          |
-| -------------------------- | ---------------------------------- |
-| `pyproject.toml`           | `version = "X.Y.Z"` — source of truth |
-| `Dockerfile`               | `ARG VERSION=X.Y.Z` — fallback when the build arg is not passed |
-| `compose.yaml`             | `image: obeoneorg/sys-stats:X.Y.Z` |
+| File             | Reference                             |
+| ---------------- | ------------------------------------- |
+| `pyproject.toml` | `version = "X.Y.Z"` — source of truth |
+| `compose.yaml`   | `image: obeoneorg/sys-stats:X.Y.Z`    |
 
-`src/sys_stats/__init__.py` derives `__version__` from the installed package metadata,
-so it needs no edit. [compose/](compose/) is generated output and stays out of this.
+Nothing reconciles the two, and bumping `pyproject.toml` alone leaves `compose.yaml`
+pointing at a tag nobody published.
 
-CI reads `pyproject.toml` and pushes both `:latest` and `:X.Y.Z` to the two registries,
-passing `VERSION` as a build arg. Bumping `pyproject.toml` without bumping
-`compose.yaml` therefore leaves the compose file pointing at a tag nobody published.
+Everything else derives the version instead of repeating it, and must stay that way:
+`src/sys_stats/__init__.py` reads it from the installed package metadata, and
+[the workflow](.github/workflows/build-and-publish.yaml) parses `pyproject.toml` to
+produce both the `:X.Y.Z` image tag and the `org.opencontainers.image.version` label.
+The Dockerfile deliberately carries no version: `LABEL` can only expand `ARG`/`ENV`,
+never the output of a `RUN`, so it cannot read `pyproject.toml` and hardcoding the
+value there would only add a fourth place to forget. [compose/](compose/) is generated
+output and stays out of this.
 
 Semver applies to the package as a whole: the `/stats` payload is a public contract
 (see [Architecture](#architecture)), so renaming or removing a key there is a major

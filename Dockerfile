@@ -19,16 +19,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # --- Runtime stage: slim image with just the venv ---
 FROM python:3.12-slim
 
-# Version of the packaged application, kept in sync with pyproject.toml.
-ARG VERSION=1.0.0
-
+# Only the labels that never change live here. LABEL cannot read pyproject.toml
+# (its values expand ARG/ENV, never the output of a RUN), so duplicating the
+# version would just be one more place to forget on a bump. The workflow reads
+# pyproject.toml and injects org.opencontainers.image.version and .revision at
+# build time instead; a local build legitimately has neither.
 LABEL org.opencontainers.image.title="sys-stats" \
       org.opencontainers.image.description="Real-time system, GPU and Ollama monitoring dashboard (terminal + web)." \
       org.opencontainers.image.source="https://github.com/obeone/sys-stats" \
       org.opencontainers.image.url="https://github.com/obeone/sys-stats" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.authors="obeone <obeone@obeone.org>" \
-      org.opencontainers.image.version="${VERSION}"
+      org.opencontainers.image.authors="obeone <obeone@obeone.org>"
 
 # High UID/GID to stay clear of host users mapped into the container.
 RUN groupadd -r -g 10001 stats && \
