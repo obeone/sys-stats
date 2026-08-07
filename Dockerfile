@@ -12,9 +12,15 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
+# uv comes from PyPI rather than from ghcr.io/astral-sh/uv: that image only
+# publishes linux/amd64 and linux/arm64, while this build also targets i386 and
+# arm/v7. The PyPI wheels cover all four (i686, armv7l, x86_64, aarch64).
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m venv /opt/venv && \
-    /opt/venv/bin/pip install .
+    pip install uv
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv /opt/venv && \
+    uv pip install --python /opt/venv/bin/python .
 
 # --- Runtime stage: slim image with just the venv ---
 FROM python:3.12-slim
