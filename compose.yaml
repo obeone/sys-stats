@@ -1,8 +1,8 @@
 services:
   sys-stats:
-    # CI only publishes a rolling :latest tag, so the reference is explicit
-    # rather than implicit. Pin to a version once the workflow tags releases.
-    image: obeoneorg/sys-stats:latest
+    # Kept in sync with the version in pyproject.toml, which is what the
+    # workflow tags the published image with.
+    image: obeoneorg/sys-stats:1.0.0
     restart: unless-stopped
     ports:
       - "5000:5000"
