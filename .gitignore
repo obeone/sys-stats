@@ -1,8 +1,6 @@
 /.DS_Store
 /.venv
 __pycache__/
-/sys-stats
-/build
 /dist
 *.egg-info/
 .qodo

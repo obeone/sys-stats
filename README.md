@@ -86,6 +86,15 @@ uv tool install ./sys-stats
 Upgrade later with `uv tool upgrade sys-stats`, remove with
 `uv tool uninstall sys-stats`.
 
+To run the dashboard once without installing anything permanent:
+
+```bash
+uvx --from git+https://github.com/obeone/sys-stats.git sys-stats
+```
+
+Building the distributable artifacts from a checkout is `uv build`, which drops
+a wheel and an sdist in `dist/`.
+
 #### With pipx
 
 [`pipx`](https://pipx.pypa.io/) also installs the CLI in a dedicated virtual
