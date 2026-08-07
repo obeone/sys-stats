@@ -225,6 +225,42 @@ class TestGetGpuProcesses:
 
         assert [p["pid"] for p in processes] == [2, 3, 1]
 
+    def test_limit_selects_by_vram_before_grouping_by_gpu(self, monkeypatch):
+        """The limit must select the heaviest processes across all cards.
+
+        Regression guard: the sort used to key on ``gpu_index`` first and
+        truncate to ``limit`` afterwards, so on a multi-GPU host the cutoff
+        kept whichever cards sorted first by index and dropped heavier
+        processes sitting on higher-numbered cards. Here GPU 1 (the
+        higher-index card) carries the single heaviest process (an "ollama"
+        job) among five lighter ones on GPU 0; it must survive a ``limit=5``
+        truncation, and the surviving rows must still be grouped by card for
+        display.
+        """
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            _fake_run(
+                "GPU-aaa, 1, small1, 100\n"
+                "GPU-aaa, 2, small2, 200\n"
+                "GPU-aaa, 3, small3, 300\n"
+                "GPU-aaa, 4, small4, 400\n"
+                "GPU-aaa, 5, small5, 500\n"
+                "GPU-bbb, 6, ollama, 999999\n"
+            ),
+        )
+
+        processes = server.get_gpu_processes(
+            limit=5, uuid_to_index={"GPU-aaa": 0, "GPU-bbb": 1}
+        )
+
+        pids = [p["pid"] for p in processes]
+        assert len(pids) == 5
+        assert 6 in pids, "heaviest process, on the higher-index card, was truncated away"
+        assert 1 not in pids, "the lightest process should have been dropped instead"
+        # Rows of the same card stay contiguous, heaviest first within the card.
+        assert pids == [5, 4, 3, 2, 6]
+
     def test_falls_back_to_the_legacy_query_when_gpu_uuid_is_rejected(self, monkeypatch):
         """An old driver rejects ``gpu_uuid``; losing the card beats losing the list."""
         queries = []
