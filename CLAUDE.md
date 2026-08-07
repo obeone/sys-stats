@@ -74,8 +74,10 @@ sys-stats --url http://localhost:5000/stats --interval 5
 docker compose up -d                                    # no GPU
 docker compose -f compose.yaml -f compose.gpu.yaml up -d # NVIDIA
 
-# Standalone binary of the CLI
-./nuitka.sh                            # outputs build/sys-stats
+# Distribution (uv)
+uv build                               # wheel + sdist in dist/
+uvx --from . sys-stats                 # run the CLI without installing it
+uv tool install .                      # install both scripts on PATH
 ```
 
 On macOS port 5000 is taken by AirPlay Receiver — run the server with `PORT=5051`
