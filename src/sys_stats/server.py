@@ -190,9 +190,10 @@ def get_gpu_processes(
     Returns
     -------
     list of dict
-        Processes sorted by GPU index then by descending VRAM usage, so the
-        processes of a single card stay contiguous. Entries whose card could
-        not be resolved are pushed to the end. Empty when nvidia-smi is
+        The ``limit`` processes with the highest VRAM usage across every
+        card, ordered for display by GPU index then by descending VRAM usage
+        so the processes of a single card stay contiguous. Entries whose card
+        could not be resolved are pushed to the end. Empty when nvidia-smi is
         missing or fails.
     """
     stdout = _query_compute_apps()
@@ -210,13 +211,22 @@ def get_gpu_processes(
             logger.warning(f"Skipping malformed GPU process line: '{line}'")
             continue
 
+    # Selection happens first, purely by VRAM usage, so ``limit`` picks the
+    # heaviest processes regardless of which card they run on. Grouping by
+    # GPU is then applied only to the surviving slice, for display: sorting
+    # by card index before truncating would instead keep whichever cards
+    # happen to sort first and silently drop heavier processes on
+    # higher-numbered cards.
+    gpu_processes.sort(key=lambda x: -x["memory_used"])
+    top_processes = gpu_processes[:limit]
+
     # ``gpu_index`` may be None, which does not compare with int: sort on a
     # tuple whose first element pushes the unresolved rows last, deterministically.
-    gpu_processes.sort(
+    top_processes.sort(
         key=lambda x: (x["gpu_index"] is None, x["gpu_index"] or 0, -x["memory_used"])
     )
-    logger.debug(f"Top GPU processes: {gpu_processes[:limit]}")
-    return gpu_processes[:limit]
+    logger.debug(f"Top GPU processes: {top_processes}")
+    return top_processes
 
 def get_gpu_fan_and_power() -> dict[int, dict[str, float]]:
     """
