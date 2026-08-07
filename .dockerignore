@@ -21,6 +21,10 @@ sys-stats-service.yaml
 # Ignore log files
 *.log
 
+# Ignore development-only trees, never copied into the image
+tests/
+docs/
+
 # Ignore the following directories
 templates/templates/
 chart/
