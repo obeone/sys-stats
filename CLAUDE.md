@@ -107,6 +107,29 @@ unprivileged hosts.
 | `FLASK_DEBUG`        | server      | `true` enables Flask debug mode                 |
 | `SYS_STATS_API_URL`  | CLI         | Default `--url`, default `http://localhost:5000/stats` |
 
+## Versioning
+
+**Any user-visible change bumps the version, and the bump touches every file that
+spells it out.** There is no automation reconciling these, so a partial bump ships an
+image whose `org.opencontainers.image.version` label lies about its own contents.
+
+| File                       | Reference                          |
+| -------------------------- | ---------------------------------- |
+| `pyproject.toml`           | `version = "X.Y.Z"` — source of truth |
+| `Dockerfile`               | `ARG VERSION=X.Y.Z` — fallback when the build arg is not passed |
+| `compose.yaml`             | `image: obeoneorg/sys-stats:X.Y.Z` |
+
+`src/sys_stats/__init__.py` derives `__version__` from the installed package metadata,
+so it needs no edit. [compose/](compose/) is generated output and stays out of this.
+
+CI reads `pyproject.toml` and pushes both `:latest` and `:X.Y.Z` to the two registries,
+passing `VERSION` as a build arg. Bumping `pyproject.toml` without bumping
+`compose.yaml` therefore leaves the compose file pointing at a tag nobody published.
+
+Semver applies to the package as a whole: the `/stats` payload is a public contract
+(see [Architecture](#architecture)), so renaming or removing a key there is a major
+bump, not a patch.
+
 ## Deployment constraints worth knowing
 
 - The container needs `pid: host` and `privileged: true` (see [compose.yaml](compose.yaml))
