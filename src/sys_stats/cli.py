@@ -1216,6 +1216,19 @@ def keyboard_listener():
                     rebuild_layout_event.set()  # Rebuild layout to show new interval
 
 
+def read_dashboard_state():
+    """Take a consistent snapshot of the state the keyboard thread owns.
+
+    Returns
+    -------
+    tuple of (bool, bool, int)
+        Whether the help screen is up, whether refreshing is paused, and the
+        current refresh interval in seconds.
+    """
+    with state_lock:
+        return show_help_flag, is_paused, refresh_interval
+
+
 def main():
     """Main function to run the server statistics CLI dashboard."""
     global latest_stats
@@ -1245,10 +1258,23 @@ def main():
         # than every loop iteration.
         previous_help_flag = False
         while not exit_event.is_set():
-            with state_lock:
-                current_interval = refresh_interval
-                paused = is_paused
-                help_flag = show_help_flag
+            # Consume any pending wake-up *before* reading the state it
+            # announces. A key press landing after this point sets the event
+            # again, which cuts the sleep at the end of the iteration short
+            # instead of being swallowed until the next refresh.
+            rebuild_layout_event.clear()
+            help_flag, paused, current_interval = read_dashboard_state()
+
+            if not help_flag and not paused:
+                stats = fetch_stats(args.url)
+                if stats:
+                    with stats_lock:
+                        latest_stats = stats
+                # The request blocks for as long as the server takes to
+                # answer, and every key press in that window changed the
+                # state behind our back. Acting on the pre-fetch snapshot is
+                # what used to swallow a key press for a whole interval.
+                help_flag, paused, current_interval = read_dashboard_state()
 
             if help_flag:
                 # Show the help panel in full screen. ``layout.update`` would
@@ -1264,29 +1290,12 @@ def main():
                     # Coming back from the help screen: restore the live
                     # layout so refreshes resume underneath it.
                     live.update(layout)
-                if not paused:
-                    # Fetch statistics if not paused
-                    stats = fetch_stats(args.url)
-                    if stats:
-                        with stats_lock:
-                            latest_stats = stats
-                        build_layout_content(layout, latest_stats, current_interval)
-                else:
-                    # If paused, only rebuild the layout with the latest data
-                    if latest_stats:
-                        build_layout_content(layout, latest_stats, current_interval)
+                with stats_lock:
+                    stats_snapshot = latest_stats
+                if stats_snapshot:
+                    build_layout_content(layout, stats_snapshot, current_interval)
 
             previous_help_flag = help_flag
-
-            # Check if a layout rebuild is required
-            if rebuild_layout_event.is_set():
-                if help_flag:
-                    live.update(build_full_screen_help())
-                elif not paused and latest_stats:
-                    build_layout_content(layout, latest_stats, current_interval)
-                elif paused and latest_stats:
-                    build_layout_content(layout, latest_stats, current_interval)
-                rebuild_layout_event.clear()
 
             # Wait for the refresh interval or an event
             sleep_time = current_interval
