@@ -141,11 +141,15 @@ bump, not a patch.
   and `arm/v7`; those were dropped in 1.1.0. Adding a platform back means re-checking
   that both uv and the native deps have wheels for it, or that the build stage can
   compile them.
-- The Dockerfile's build stage uses the **full** `python:3.12` image (not slim) so a
-  native dep can still compile if a wheel is missing; the runtime stage is slim and
-  only carries the venv. uv is installed from PyPI rather than
-  `COPY --from=ghcr.io/astral-sh/uv`, which keeps the build independent of that
-  image's own platform coverage.
+- Both Dockerfile stages are `python:3.12-slim`, and the build stage carries no C
+  toolchain: on amd64 and arm64 every dependency resolves to a manylinux wheel, psutil
+  included (its `abi3` wheels cover `x86_64` and `aarch64`). Restoring a platform
+  without wheels means restoring the full `python:3.12` builder along with it. The two
+  stages share a base on purpose, so the venv copied across matches the interpreter
+  that runs it.
+- uv arrives via `COPY --from=ghcr.io/astral-sh/uv:<version>`, pinned. That image
+  publishes only `linux/amd64` and `linux/arm64` — fine today, and one more thing to
+  revisit before widening the platform list.
 - [.github/workflows/build-and-publish.yaml](.github/workflows/build-and-publish.yaml)
   pushes and cosign-signs to both `ghcr.io/obeone/sys-stats` and
   `docker.io/obeoneorg/sys-stats` on `main` only; PRs build without pushing.

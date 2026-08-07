@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
 
 # --- Build stage: install the package into an isolated venv ---
-# Use the full python image (ships a C toolchain) so native deps such as psutil
-# still build when no prebuilt wheel matches the target platform.
-FROM python:3.12 AS builder
+# Same base as the runtime stage, so the venv copied across is built against the
+# very interpreter that will run it. Slim is enough because every dependency has
+# a manylinux wheel for the two platforms this image targets — psutil's abi3
+# wheels cover x86_64 and aarch64 — so nothing compiles from source. Adding a
+# platform without wheels means going back to the full image for its toolchain.
+FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
@@ -11,10 +14,14 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
-# uv comes from PyPI rather than from ghcr.io/astral-sh/uv, so the build stays
-# independent of that image's own platform coverage.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install uv
+# uv as a static binary from its own image, pinned so builds stay reproducible.
+# That image publishes linux/amd64 and linux/arm64, exactly the platform list in
+# .github/workflows/build-and-publish.yaml.
+COPY --from=ghcr.io/astral-sh/uv:0.12.2 /uv /bin/uv
+
+# The cache mount is a different filesystem from /opt/venv, so let uv copy
+# instead of trying to hardlink and falling back with a warning.
+ENV UV_LINK_MODE=copy
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv /opt/venv && \
