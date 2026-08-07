@@ -1,10 +1,16 @@
 services:
   sys-stats:
-    image: obeoneorg/sys-stats
+    # CI only publishes a rolling :latest tag, so the reference is explicit
+    # rather than implicit. Pin to a version once the workflow tags releases.
+    image: obeoneorg/sys-stats:latest
+    restart: unless-stopped
     ports:
       - "5000:5000"
     environment:
       OLLAMA_API_URL: "http://localhost:11434"
 
+    # Both are required for the process listing to mean anything: pid: host
+    # exposes the host's /proc, privileged lets the container actually read it
+    # (and reach the NVIDIA devices when compose.gpu.yaml is layered on top).
     pid: host
     privileged: true
