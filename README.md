@@ -187,6 +187,11 @@ This launches the dashboard with a 5-second refresh interval (adjustable at
 runtime with `+` / `-`; press `h` for the full keyboard help). The API URL can
 also be set via the `SYS_STATS_API_URL` environment variable.
 
+On a machine with several GPUs the layout rearranges itself: the summary keeps
+cumulated figures, each card gets its own detail table (or one row per card when
+they no longer fit side by side), and the GPU processes list tells you which card
+each process is holding VRAM on.
+
 You're all set! Enjoy the Sys-Stats Dashboard.
 
 ## 🧑‍💻 Contributing
