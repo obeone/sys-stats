@@ -137,10 +137,15 @@ bump, not a patch.
 
 - The container needs `pid: host` and `privileged: true` (see [compose.yaml](compose.yaml))
   to see the host's processes — process listings are meaningless without it.
-- The Dockerfile intentionally builds on the **full** `python:3.12` image (not slim/uv):
-  the CI matrix targets `linux/amd64,arm64,i386,arm/v7` and `psutil` must compile from
-  source on the exotic arches. Don't "optimise" that back to slim without checking the
-  workflow's platform list.
+- The Dockerfile's build stage intentionally uses the **full** `python:3.12` image (not
+  slim): the CI matrix targets `linux/amd64,arm64,i386,arm/v7` and `psutil` must compile
+  from source on the exotic arches, which needs the C toolchain. Don't "optimise" that
+  back to slim without checking the workflow's platform list. The runtime stage is slim
+  and only carries the venv.
+- That same platform list rules out `COPY --from=ghcr.io/astral-sh/uv`, which is the
+  usual way to get uv into an image: that image only publishes `linux/amd64` and
+  `linux/arm64`. uv is installed from PyPI instead, whose wheels cover `i686` and
+  `armv7l` as well.
 - [.github/workflows/build-and-publish.yaml](.github/workflows/build-and-publish.yaml)
   pushes and cosign-signs to both `ghcr.io/obeone/sys-stats` and
   `docker.io/obeoneorg/sys-stats` on `main` only; PRs build without pushing.
