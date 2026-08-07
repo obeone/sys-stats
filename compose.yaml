@@ -2,7 +2,7 @@ services:
   sys-stats:
     # Kept in sync with the version in pyproject.toml, which is what the
     # workflow tags the published image with.
-    image: obeoneorg/sys-stats:1.1.0
+    image: obeoneorg/sys-stats:1.2.0
     restart: unless-stopped
     ports:
       - "5000:5000"

@@ -138,7 +138,8 @@ bump, not a patch.
 - The container needs `pid: host` and `privileged: true` (see [compose.yaml](compose.yaml))
   to see the host's processes — process listings are meaningless without it.
 - The CI matrix targets `linux/amd64,linux/arm64` only. It used to also carry `i386`
-  and `arm/v7`; those were dropped in 1.1.0. Adding a platform back means re-checking
+  and `arm/v7`; those were dropped in 1.2.0, and `1.1.0` is the last tag that carries
+  all four — it stays published as-is. Adding a platform back means re-checking
   that both uv and the native deps have wheels for it, or that the build stage can
   compile them.
 - Both Dockerfile stages are `python:3.12-slim`, and the build stage carries no C
