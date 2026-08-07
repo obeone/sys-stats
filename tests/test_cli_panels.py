@@ -31,6 +31,7 @@ from sys_stats.cli import (
     build_process_panel,
     build_process_table,
     build_processes_panel,
+    build_single_gpu_table,
     build_summary,
     create_layout,
     format_context_length,
@@ -731,6 +732,35 @@ class TestBuildGpuDetailPanel:
         assert "12.0 GB" in text
         assert not _clipped_lines(text)
         assert not _has_blank_row(text)
+
+
+class TestNullGpuFields:
+    """A card the driver cannot query reports ``null`` for every figure.
+
+    Which of the two GPU renderings runs is decided by the width, so an
+    unguarded one turns a working dashboard into a ``TypeError`` the moment
+    the terminal is resized.
+    """
+
+    def test_the_vertical_table_survives_null_figures(self):
+        """Regression: this path formatted ``None`` as a number and crashed."""
+        text = _render(build_single_gpu_table(_null_gpu()))
+
+        assert "0 W" in text
+        assert "0 °C" in text
+
+    def test_the_row_per_gpu_table_survives_null_figures(self):
+        """The wide fallback has always guarded them; it must keep doing so."""
+        text = _render(build_gpu_rows_table([_null_gpu()], 200))
+
+        assert "0 W" in text
+
+    @pytest.mark.parametrize("width", [20, 30, 60, 100, 200])
+    def test_the_detail_panel_survives_null_figures_at_every_width(self, width):
+        """Both renderings are reachable from the same payload."""
+        panel = build_gpu_detail_panel({"has_gpu": True, "gpu": [_null_gpu()]})
+
+        assert _render(_table(panel, width), width=width)
 
 
 class TestFormatContextLength:
