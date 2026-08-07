@@ -6,11 +6,13 @@ many tables, which rows), never the ANSI output.
 """
 
 import io
+import sys
 
 import pytest
 from rich.console import Console, Group
 from rich.table import Table
 
+from sys_stats import cli
 from sys_stats.cli import (
     OLLAMA_ROW_STYLE,
     build_gpu_detail_panel,
@@ -740,3 +742,103 @@ class TestProcessTableNarrowWidth:
         cpu_panel = grid.columns[0]._cells[0]
 
         assert _headers(cpu_panel.renderable) == ["PID", "Name"]
+
+
+class _FakeLive:
+    """Stand-in for :class:`rich.live.Live` that records ``update`` calls.
+
+    Real ``Live`` needs a live terminal and would otherwise try to render to
+    stdout in a background thread; this only has to prove which renderable
+    ``main`` hands it and when.
+    """
+
+    def __init__(self, renderable, **kwargs):
+        self.initial_renderable = renderable
+        self.updates = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def update(self, renderable):
+        self.updates.append(renderable)
+
+
+class TestMainHelpToggleUsesLiveUpdate:
+    """Regression: ``layout.update(help_panel)`` is a no-op once ``layout``
+    has children (Rich renders a layout's children in preference to its own
+    set renderable), which used to freeze the whole dashboard as soon as help
+    was toggled on, since the loop also stopped calling
+    :func:`build_layout_content` while ``show_help_flag`` was set."""
+
+    def test_toggling_help_swaps_the_lives_renderable(self, monkeypatch):
+        """Two ``h`` presses: show help, then return to the live layout."""
+        live_instances = []
+
+        def fake_live_factory(renderable, **kwargs):
+            instance = _FakeLive(renderable, **kwargs)
+            live_instances.append(instance)
+            return instance
+
+        stats_payload = {
+            "cpu": 1.0,
+            "ram": {"percent": 1.0, "total": 1},
+            "has_gpu": False,
+            "gpu": [],
+            "top_cpu": [],
+            "top_memory": [],
+            "top_gpu_processes": [],
+            "ollama_processes": {"models": []},
+        }
+
+        monkeypatch.setattr(cli, "Live", fake_live_factory)
+        monkeypatch.setattr(cli, "keyboard_listener", lambda: None)
+        monkeypatch.setattr(cli, "fetch_stats", lambda url: stats_payload)
+        monkeypatch.setattr(
+            sys, "argv", ["sys-stats", "--url", "http://example.invalid/stats", "--interval", "1"]
+        )
+
+        # The inner sleep loop checks ``exit_event``/``rebuild_layout_event``
+        # before every ``time.sleep`` call, so driving those two events from
+        # a faked ``time.sleep`` steps the outer loop deterministically
+        # without any real waiting: call 1 mirrors the first ``h`` press
+        # (help on), call 2 the second (help off), call 3 quits.
+        calls = {"count": 0}
+
+        def fake_sleep(_seconds):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                with cli.state_lock:
+                    cli.show_help_flag = True
+                cli.rebuild_layout_event.set()
+            elif calls["count"] == 2:
+                with cli.state_lock:
+                    cli.show_help_flag = False
+                cli.rebuild_layout_event.set()
+            else:
+                cli.exit_event.set()
+
+        monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+
+        cli.exit_event.clear()
+        cli.rebuild_layout_event.clear()
+        cli.show_help_flag = False
+        cli.is_paused = False
+        cli.latest_stats = None
+
+        try:
+            cli.main()
+        finally:
+            cli.exit_event.clear()
+            cli.rebuild_layout_event.clear()
+            cli.show_help_flag = False
+
+        assert len(live_instances) == 1
+        live = live_instances[0]
+        assert live.updates, "expected at least one live.update() call"
+        # First press: the help panel is swapped in, not the layout.
+        assert live.updates[0] is not live.initial_renderable
+        # Second press: the live layout is restored so refreshes resume.
+        assert live.updates[-1] is live.initial_renderable
