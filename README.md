@@ -183,14 +183,31 @@ To use the terminal dashboard for live monitoring, run:
 sys-stats [--url http://localhost:5000/stats] [--interval 5]
 ```
 
-This launches the dashboard with a 5-second refresh interval (adjustable at
-runtime with `+` / `-`; press `h` for the full keyboard help). The API URL can
+This launches the dashboard with a 5-second refresh interval. The API URL can
 also be set via the `SYS_STATS_API_URL` environment variable.
 
-On a machine with several GPUs the layout rearranges itself: the summary keeps
-cumulated figures, each card gets its own detail table (or one row per card when
-they no longer fit side by side), and the GPU processes list tells you which card
-each process is holding VRAM on.
+Every panel carries a number in its title, and a one line key helper is pinned
+at the bottom of the screen. Press `h` for the full list.
+
+| Key | Action |
+| --- | --- |
+| `q` / `r` | Quit, force a refresh |
+| `p` / `-` / `+` | Pause, slow down, speed up |
+| `1`..`9` | Focus the panel carrying that number |
+| `Tab` / `Shift+Tab` | Focus the next or previous panel |
+| `Enter` / `Esc` | Zoom the focused panel full screen, and come back |
+| arrows, `PgUp`/`PgDn`, `Home`/`End` | Scroll the focused panel |
+
+A panel that cannot show every row says how many it is hiding, so a busy host
+never drops rows silently. A zoomed panel keeps refreshing and keeps scrolling.
+
+The layout follows the terminal: a wide one gets a row of columns, a narrower one
+falls back to a grid, and panels stop where their content stops instead of
+framing empty space. On a machine with several GPUs the summary keeps cumulated
+figures, each card gets its own detail table (or one row per card when they no
+longer fit side by side), and the GPU processes list tells you which card each
+process is holding VRAM on. The Ollama panel shows each model's context window
+next to its VRAM footprint.
 
 You're all set! Enjoy the Sys-Stats Dashboard.
 
