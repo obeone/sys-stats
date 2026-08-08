@@ -12,6 +12,7 @@ Rich tells them how wide they are, so a panel's table is obtained through
 
 import functools
 import io
+import re
 import sys
 
 import pytest
@@ -21,6 +22,7 @@ from rich.table import Table
 from sys_stats import cli
 from sys_stats.cli import (
     OLLAMA_ROW_STYLE,
+    build_full_screen_help,
     build_gpu_detail_panel,
     build_gpu_processes_panel,
     build_gpu_processes_table,
@@ -242,15 +244,14 @@ def _table(panel, width: int = 200) -> Table:
 
     Parameters
     ----------
-    panel : rich.panel.Panel
-        A panel whose renderable is an
-        :class:`~sys_stats.cli.AdaptiveRenderable`.
+    panel : sys_stats.cli.ScrollablePanel
+        Any panel of the dashboard that lists rows.
     width : int, optional
         Width in columns handed to the builder. Note this is the width of the
         table itself, not of the panel: Rich deducts the panel's borders and
         padding before the renderable ever sees it.
     """
-    return panel.renderable.build(width)
+    return panel.build_table(width)
 
 
 def _has_blank_row(text: str) -> bool:
@@ -671,7 +672,8 @@ class TestBuildProcessTable:
         """No data yields an explanatory line rather than an empty table."""
         panel = build_process_panel([], key, title)
 
-        assert f"No data for {title}." == panel.renderable
+        assert panel.empty_message == f"No data for {title}."
+        assert "No data for" in _render(panel)
 
     def test_cpu_table_has_one_row_per_process(self):
         """Each process becomes a row under the PID/Name/CPU%/Cmdline columns."""
@@ -716,13 +718,15 @@ class TestOptionalPanels:
         """Hosts without GPU compute apps get a message, not a crash."""
         panel = build_gpu_processes_panel({"top_gpu_processes": []})
 
-        assert "No GPU processes." in str(panel.renderable)
+        assert panel.empty_message == "No GPU processes."
+        assert "No GPU processes." in _render(panel)
 
     def test_ollama_panel_degrades_gracefully(self):
         """An unset or unreachable Ollama renders an empty-state panel."""
         panel = build_ollama_panel({"ollama_processes": {"models": []}})
 
-        assert "No Ollama models." in str(panel.renderable)
+        assert panel.empty_message == "No Ollama models."
+        assert "No Ollama models." in _render(panel)
 
     def test_ollama_panel_lists_loaded_models(self):
         """Each loaded model becomes a row of the Ollama table."""
@@ -848,7 +852,8 @@ class TestBuildGpuDetailPanel:
         """A GPU-less host gets a message, not an empty grid."""
         panel = build_gpu_detail_panel({"has_gpu": False, "gpu": []})
 
-        assert "No GPU detected." in str(panel.renderable)
+        assert panel.empty_message == "No GPU detected."
+        assert "No GPU detected." in _render(panel)
 
     def test_rows_use_the_driver_index_not_the_position_in_the_list(self):
         """``id`` is what nvidia-smi and every other tool call the card."""
@@ -1082,20 +1087,14 @@ class TestGpuProcessesPanelColumns:
         assert all(len(line) <= 36 for line in text.splitlines())
 
 
-def _plain_title(title) -> str:
-    """Strip the cyan/bold markup wrapping a plain panel's title."""
-    text = str(title)
-    return text.removeprefix("[bold cyan]").removesuffix("[/bold cyan]")
-
-
 def _titles(region) -> list:
     """Return the title of every panel stacked in a layout region."""
     titles = []
     for panel in region.renderable.panels:
         if hasattr(panel, "panels"):
-            titles.extend(_plain_title(inner.title) for inner in panel.panels)
+            titles.extend(inner.title for inner in panel.panels)
         else:
-            titles.append(_plain_title(panel.title))
+            titles.append(str(panel.title))
     return titles
 
 
@@ -1258,6 +1257,319 @@ class TestGpuColumnReachesTheScreen:
         assert "?" not in text
 
 
+def _scroll_processes(count: int) -> list:
+    """Compute apps named so the rendered window can be read straight back."""
+    return [
+        {
+            "pid": 1000 + index,
+            "name": f"proc{index:02d}",
+            "memory_used": 1024 ** 3,
+            "cmdline": "compute",
+        }
+        for index in range(count)
+    ]
+
+
+def _render_panel(panel, width: int = 60, height: int = 12) -> str:
+    """Render one panel at an exact size, the way a layout region would.
+
+    ``publish=True`` is what the real render pass uses, so the row count and
+    page size the keyboard thread reads are the ones this render resolved.
+    """
+    return _render(panel.render_panel(width, height, publish=True), width=width, height=height)
+
+
+def _press(monkeypatch, keys):
+    """Run the keyboard listener over a scripted sequence of key presses.
+
+    The listener loops on ``readchar.readkey`` until ``q`` sets the exit
+    event, so the sequence is simply terminated with one.
+    """
+    sequence = iter([*keys, "q"])
+
+    class _ScriptedReadchar:
+        @staticmethod
+        def readkey():
+            return next(sequence)
+
+    monkeypatch.setattr(cli, "readchar", _ScriptedReadchar)
+    cli.exit_event.clear()
+    try:
+        cli.keyboard_listener()
+    finally:
+        cli.exit_event.clear()
+
+
+@pytest.fixture
+def scroll_state():
+    """Give a test the shared scrolling state to itself, and clean up after."""
+    def reset():
+        cli.scroll_offsets.clear()
+        cli.panel_row_counts.clear()
+        cli.panel_page_sizes.clear()
+        cli.scrollable_panel_keys[:] = []
+        cli.focused_panel = None
+
+    reset()
+    yield
+    reset()
+
+
+class TestPanelScrolling:
+    """A panel with more rows than lines shows a window over them.
+
+    No layout fixes a host running twelve models: the rows simply outnumber
+    the screen. These drive the very keys a user would, then read the window
+    back out of the characters that were drawn.
+    """
+
+    WIDTH = 60
+    HEIGHT = 12
+
+    def _panel(self, count: int = 12):
+        """The GPU processes panel over a list too long for :attr:`HEIGHT`."""
+        return build_gpu_processes_panel({"top_gpu_processes": _scroll_processes(count)})
+
+    def _visible(self, panel) -> list:
+        """Names of the rows the panel actually drew, in order."""
+        return re.findall(r"proc\d\d", _render_panel(panel, self.WIDTH, self.HEIGHT))
+
+    def _focus(self, key=None):
+        """Point the scroll keys at one panel, as the layout would."""
+        cli.scrollable_panel_keys[:] = [key or cli.PANEL_GPU_PROCESSES]
+        cli.focused_panel = cli.scrollable_panel_keys[0]
+
+    def test_a_panel_that_fits_shows_every_row_and_says_nothing(self, scroll_state):
+        """The indicator is a statement about hidden rows, not decoration."""
+        panel = self._panel(3)
+
+        text = _render_panel(panel, self.WIDTH, self.HEIGHT)
+
+        assert re.findall(r"proc\d\d", text) == ["proc00", "proc01", "proc02"]
+        assert "more row" not in text
+
+    def test_a_panel_that_overflows_counts_what_it_hides(self, scroll_state):
+        """Below only, at the top of a list: there is nothing above yet."""
+        text = _render_panel(self._panel(12), self.WIDTH, self.HEIGHT)
+
+        hidden = 12 - len(re.findall(r"proc\d\d", text))
+        assert f"↓ {hidden} more rows below" in text
+        assert "above" not in text
+
+    def test_scrolling_down_names_what_is_now_hidden_above(self, monkeypatch, scroll_state):
+        """Both indicators once the window sits in the middle of the list."""
+        panel = self._panel(12)
+        self._visible(panel)
+        self._focus()
+
+        _press(monkeypatch, [cli.readchar_key.DOWN] * 3)
+        text = _render_panel(panel, self.WIDTH, self.HEIGHT)
+
+        assert "↑ 3 more rows above" in text
+        assert "more rows below" in text
+
+    def test_the_arrows_move_the_window_by_one_row(self, monkeypatch, scroll_state):
+        """Down then up is a round trip, at the very top of the list."""
+        panel = self._panel(12)
+        assert self._visible(panel)[0] == "proc00"
+        self._focus()
+
+        _press(monkeypatch, [cli.readchar_key.DOWN])
+        assert self._visible(panel)[0] == "proc01"
+
+        _press(monkeypatch, [cli.readchar_key.UP])
+        assert self._visible(panel)[0] == "proc00"
+
+    def test_up_at_the_top_stays_at_the_top(self, monkeypatch, scroll_state):
+        """A negative offset would render a window over nothing."""
+        panel = self._panel(12)
+        self._visible(panel)
+        self._focus()
+
+        _press(monkeypatch, [cli.readchar_key.UP] * 5)
+
+        assert self._visible(panel)[0] == "proc00"
+        assert cli.scroll_offsets[cli.PANEL_GPU_PROCESSES] == 0
+
+    def test_the_page_keys_move_by_a_screenful_and_come_back(self, monkeypatch, scroll_state):
+        """Regression risk: paging back has to land where paging forward left.
+
+        The window is one row shorter as soon as something is hidden above,
+        so a page measured from the window as rendered would drift by a row
+        on every round trip.
+        """
+        panel = self._panel(12)
+        page = len(self._visible(panel))
+        self._focus()
+
+        _press(monkeypatch, [cli.readchar_key.PAGE_DOWN])
+        assert self._visible(panel)[0] == f"proc{page:02d}"
+
+        _press(monkeypatch, [cli.readchar_key.PAGE_UP])
+        assert self._visible(panel)[0] == "proc00"
+
+    def test_end_shows_the_last_rows_and_home_comes_back(self, monkeypatch, scroll_state):
+        """End fills the window with the tail of the list, not with one row."""
+        panel = self._panel(12)
+        page = len(self._visible(panel))
+        self._focus()
+
+        _press(monkeypatch, [cli.readchar_key.END])
+        text = _render_panel(panel, self.WIDTH, self.HEIGHT)
+
+        assert re.findall(r"proc\d\d", text)[-1] == "proc11"
+        assert len(re.findall(r"proc\d\d", text)) == page
+        assert "more rows below" not in text
+        assert "↑ " in text
+
+        _press(monkeypatch, [cli.readchar_key.HOME])
+        assert self._visible(panel)[0] == "proc00"
+
+    def test_an_offset_past_the_end_is_clamped_when_the_list_shrinks(
+        self, monkeypatch, scroll_state
+    ):
+        """Regression risk: the row count changes on every single fetch.
+
+        A panel left scrolled near the bottom of a long list, whose next
+        payload is a short one, would render a window over rows that no
+        longer exist: an empty panel, with no key that brings it back. Two
+        shapes of shrink are checked, because they take different paths: one
+        that still overflows, so the offset has to be pulled back to the last
+        full window, and one that now fits, where there is no offset left to
+        keep at all.
+        """
+        page = len(self._visible(self._panel(12)))
+        self._focus()
+        _press(monkeypatch, [cli.readchar_key.END])
+        stale = cli.scroll_offsets[cli.PANEL_GPU_PROCESSES]
+        assert stale > 0
+
+        still_overflowing = re.findall(
+            r"proc\d\d", _render_panel(self._panel(8), self.WIDTH, self.HEIGHT)
+        )
+
+        assert cli.scroll_offsets[cli.PANEL_GPU_PROCESSES] < stale
+        assert still_overflowing[-1] == "proc07"
+        assert len(still_overflowing) == page
+
+        now_fits = re.findall(r"proc\d\d", _render_panel(self._panel(2), self.WIDTH, self.HEIGHT))
+
+        assert cli.scroll_offsets[cli.PANEL_GPU_PROCESSES] == 0
+        assert now_fits == ["proc00", "proc01"]
+
+    @pytest.mark.parametrize(
+        ("sequence", "expected_first"),
+        [
+            # readchar's own spellings, which is what a bare xterm sends.
+            ("\x1b[F", "last"),
+            ("\x1b[H", "proc00"),
+            # tmux, screen and the Linux console. readchar stops one byte
+            # short of the End sequence and returns the rest separately.
+            ("\x1b[4", "last"),
+            ("\x1b[1~", "proc00"),
+            # xterm with application cursor keys on.
+            ("\x1bOF", "last"),
+            ("\x1bOH", "proc00"),
+        ],
+    )
+    def test_home_and_end_answer_to_every_spelling_terminals_use(
+        self, monkeypatch, scroll_state, sequence, expected_first
+    ):
+        """Regression: driving the real dashboard under tmux, End did nothing.
+
+        Terminals disagree on what Home and End send and readchar only knows
+        one spelling of each, so matching its constant alone left both keys
+        dead under tmux, screen and the Linux console.
+        """
+        panel = self._panel(12)
+        page = len(self._visible(panel))
+        self._focus()
+        # Start away from both ends, so either key has somewhere to go.
+        _press(monkeypatch, [cli.readchar_key.DOWN] * 2)
+
+        _press(monkeypatch, [sequence])
+        visible = self._visible(panel)
+
+        if expected_first == "last":
+            assert visible[-1] == "proc11"
+            assert len(visible) == page
+        else:
+            assert visible[0] == expected_first
+
+    def test_a_panel_too_short_for_a_row_says_how_much_it_holds(self, scroll_state):
+        """Four lines cannot hold a header, a rule and a row, let alone eight."""
+        text = _render_panel(self._panel(8), self.WIDTH, 4)
+
+        assert "8 more rows hidden" in text
+        assert text.count("╭") == text.count("╰") == 1
+
+
+class TestPanelFocus:
+    """Which panel the scroll keys drive, and how a user can tell."""
+
+    def test_the_focused_panel_gets_a_distinct_border(self, scroll_state):
+        """Otherwise the keys act on a panel nobody can point at."""
+        panel = build_gpu_processes_panel({"top_gpu_processes": _scroll_processes(4)})
+
+        cli.focused_panel = None
+        assert panel.render_panel(60, 12).border_style == cli.PANEL_BORDER_STYLE
+
+        cli.focused_panel = cli.PANEL_GPU_PROCESSES
+        assert panel.render_panel(60, 12).border_style == cli.FOCUSED_PANEL_BORDER_STYLE
+
+    def test_building_the_layout_focuses_the_first_panel(self, scroll_state):
+        """Something has to be focused, or the keys do nothing at all."""
+        layout = create_layout()
+
+        build_layout_content(layout, _stats(3), 5)
+
+        assert cli.scrollable_panel_keys[0] == cli.PANEL_OLLAMA
+        assert cli.focused_panel == cli.PANEL_OLLAMA
+
+    def test_tab_cycles_through_every_scrollable_panel(self, monkeypatch, scroll_state):
+        """And wraps around, so Tab alone reaches all of them."""
+        layout = create_layout()
+        build_layout_content(layout, _stats(3), 5)
+        order = list(cli.scrollable_panel_keys)
+        assert len(order) == 5
+
+        for expected in order[1:]:
+            _press(monkeypatch, [cli.readchar_key.TAB])
+            assert cli.focused_panel == expected
+
+        _press(monkeypatch, [cli.readchar_key.TAB])
+        assert cli.focused_panel == order[0]
+
+    def test_a_panel_with_nothing_to_list_is_not_in_the_tab_order(self, scroll_state):
+        """There is no window to move over an empty-state panel."""
+        data = _stats(1)
+        data["ollama_processes"] = {"models": []}
+        layout = create_layout()
+
+        build_layout_content(layout, data, 5)
+
+        assert cli.PANEL_OLLAMA not in cli.scrollable_panel_keys
+        assert cli.focused_panel == cli.PANEL_GPU_PROCESSES
+
+    def test_a_focus_left_on_a_vanished_panel_falls_back(self, scroll_state):
+        """A card removed between two fetches takes its panel with it."""
+        layout = create_layout()
+        build_layout_content(layout, _stats(3), 5)
+        cli.focused_panel = cli.PANEL_GPU_DETAIL
+
+        build_layout_content(layout, _stats(1), 5)
+
+        assert cli.PANEL_GPU_DETAIL not in cli.scrollable_panel_keys
+        assert cli.focused_panel == cli.scrollable_panel_keys[0]
+
+    def test_the_help_screen_documents_every_scrolling_key(self):
+        """It is the only place a user ever learns they exist."""
+        text = _render(build_full_screen_help())
+
+        for documented in ("Tab", "Up/Down", "PgUp/PgDn", "Home/End"):
+            assert documented in text
+
+
 class _FakeLive:
     """Stand-in for :class:`rich.live.Live` that records ``update`` calls.
 
@@ -1349,6 +1661,11 @@ class _MainHarness:
             cli.show_help_flag = False
             cli.is_paused = False
             cli.latest_stats = None
+            cli.scroll_offsets.clear()
+            cli.panel_row_counts.clear()
+            cli.panel_page_sizes.clear()
+            cli.scrollable_panel_keys[:] = []
+            cli.focused_panel = None
 
         assert len(self.live_instances) == 1
         return self.live_instances[0]
