@@ -807,6 +807,19 @@ def panel_minimum_height(renderable):
 def distribute_heights(naturals, minimums, available):
     """Share the lines of a column between the panels stacked in it.
 
+    Free space is never handed out. A natural height is already the height at
+    which a panel shows every row it has, so stretching one past it buys no
+    information: it only draws a border around blank lines. The lines a column
+    does not need are left unpainted instead, which is the whole reason a
+    column is one region holding a stack rather than one region per panel.
+
+    Room only has to be *taken* from a panel, and it is taken from whichever
+    one has the most of it above its own minimum, so the crowded panels give
+    way before the ones already down to a header and a row. That is also what
+    hands a growable panel the lines its neighbours do not use: a stack of a
+    four-row table and a fifty-row one settles with the short one whole and
+    the long one filling the rest of the column.
+
     Parameters
     ----------
     naturals : list of int
@@ -819,9 +832,10 @@ def distribute_heights(naturals, minimums, available):
     Returns
     -------
     list of int
-        One height per panel, summing to ``available`` whenever the panels fit
-        and never exceeding it. Shorter than ``naturals`` when the column is
-        too short to hold every panel, the trailing ones being dropped.
+        One height per panel, never summing to more than ``available``, and
+        summing to less whenever the panels' own content does not fill the
+        column. Shorter than ``naturals`` when the column is too short to hold
+        every panel, the trailing ones being dropped.
     """
     if not naturals:
         return []
@@ -829,9 +843,8 @@ def distribute_heights(naturals, minimums, available):
     sizes = list(naturals)
     total = sum(sizes)
     if total <= available:
-        # The slack goes to the last panel, so the column ends flush with the
-        # bottom of the screen instead of trailing off into a gap.
-        sizes[-1] += available - total
+        # Everything fits at the height of its own content. Whatever is left
+        # of the column stays blank rather than inflating the last panel.
         return sizes
 
     # Over-subscribed. Lines are taken back from whichever panel has the most
@@ -901,13 +914,15 @@ class StackedPanels:
 
 
 class SideBySidePanels:
-    """Renders panels next to each other, all at the height of the row.
+    """Renders panels next to each other, each as tall as it needs to be.
 
     A :class:`~rich.table.Table` grid would do the horizontal split just as
     well, but it renders each cell at that cell's own natural height and then
     pads the row to the tallest, which puts the shorter panel's border in the
     wrong place and lets the taller one be cropped by whatever sits above.
-    Here both panels are handed the same height, and they honour it.
+    Here every panel is handed the row's height capped by its own content, so
+    a ranking of two processes closes right under its second row instead of
+    framing the blank lines its neighbour needed.
 
     Parameters
     ----------
@@ -936,16 +951,22 @@ class SideBySidePanels:
         return max(panel_minimum_height(panel) for panel in self.panels)
 
     def __rich_console__(self, console, options):
-        """Render every panel at the row's height and stitch the lines."""
+        """Render every panel at its own height and stitch the lines."""
         widths = self._widths(options.max_width)
-        columns = [
-            console.render_lines(
-                panel, options.update(width=share, height=options.height), pad=True
+        columns = []
+        for panel, share in zip(self.panels, widths, strict=True):
+            # Never taller than the row it was given, never taller than what
+            # it has to show. The cap is what keeps the shorter of two
+            # rankings from being padded out to its neighbour's row count.
+            height = panel_natural_height(panel, share)
+            if options.height is not None:
+                height = min(height, options.height)
+            columns.append(
+                console.render_lines(panel, options.update(width=share, height=height), pad=True)
             )
-            for panel, share in zip(self.panels, widths, strict=True)
-        ]
-        # Only equal when Rich constrained the height; unconstrained, the
-        # shorter panels are padded with blanks so the row stays rectangular.
+        # The columns rarely have the same number of lines; the shorter ones
+        # are padded with blanks below their closing border so the row stays
+        # rectangular for whatever is stacked underneath it.
         line_count = max(len(column) for column in columns)
         for index in range(line_count):
             for column, share in zip(columns, widths, strict=True):
