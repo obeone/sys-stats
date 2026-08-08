@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
 import io
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 
-import readchar  # To capture key presses
+import readchar  # Fallback key reader on the platforms without termios
 import requests
 from readchar import key as readchar_key
 from rich.cells import cell_len
@@ -19,6 +21,15 @@ from rich.panel import Panel
 from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
+
+try:  # pragma: no cover - the fallback is only ever taken on Windows
+    import select
+    import termios
+except ImportError:
+    # Windows has neither, so the dashboard falls back to readchar's own
+    # reader there. It loses the lone-Esc handling and nothing else.
+    select = None
+    termios = None
 
 # Default API URL
 SYS_STATS_API_URL = os.getenv('SYS_STATS_API_URL', 'http://localhost:5000/stats')
@@ -38,11 +49,18 @@ refresh_interval = 5  # Default refresh interval in seconds
 scroll_offsets = {}
 panel_row_counts = {}
 panel_page_sizes = {}
-# Keys of the scrollable panels currently on screen, in Tab order, and the one
-# the scroll keys drive. Both are refreshed by :func:`build_layout_content`,
-# because which panels exist depends on the payload and on the layout mode.
-scrollable_panel_keys = []
+# Every panel currently on screen, in reading order, and the one the keys act
+# on. The order is the Tab order, and it is also the numbering the digit keys
+# and the panel titles use, so a panel's number is its position here plus one.
+# Both are refreshed by :func:`build_layout_content`, because which panels
+# exist depends on the payload and on the layout mode. ``panel_renderables``
+# additionally keeps the renderable itself, which is what the zoom screen draws.
+panel_keys = []
+panel_renderables = {}
 focused_panel = None
+
+# Whether the focused panel is currently drawn on its own, full screen.
+is_zoomed = False
 
 # Locks for thread-safe operations
 state_lock = threading.Lock()
@@ -122,9 +140,14 @@ OLLAMA_ROW_STYLE = "bold magenta"
 PANEL_BORDER_STYLE = "cyan"
 FOCUSED_PANEL_BORDER_STYLE = "bold yellow"
 
-# Identity of every scrollable panel. These double as the keys of
-# :data:`scroll_offsets` and as the Tab order once
-# :func:`build_layout_content` has listed the ones actually on screen.
+# Title of the one panel that is not a :class:`ScrollablePanel`, kept here
+# because :func:`register_panels` has to rewrite it to carry its number.
+SUMMARY_PANEL_TITLE = "Summary"
+
+# Identity of every panel. These double as the keys of :data:`scroll_offsets`
+# and as the Tab order once :func:`build_layout_content` has listed the ones
+# actually on screen.
+PANEL_SUMMARY = "summary"
 PANEL_OLLAMA = "ollama"
 PANEL_GPU_PROCESSES = "gpu_processes"
 PANEL_TOP_CPU = "top_cpu"
@@ -132,18 +155,44 @@ PANEL_TOP_MEMORY = "top_memory"
 PANEL_GPU_DETAIL = "gpu_detail"
 
 # What each scrolling key can arrive as. Terminals do not agree on the escape
-# sequences, and :mod:`readchar` only knows one spelling of each: it answers
-# ``\x1b[F`` for End, while tmux, screen and the Linux console send ``\x1b[4~``
-# and xterm in application mode sends ``\x1bOF``. Worse, readchar's escape
-# parser does not expect a ``4`` in that position and stops one byte short,
-# handing back ``\x1b[4`` and then a stray ``~`` on the next read. Every
-# spelling is accepted, and the leftover ``~`` matches nothing and is ignored.
+# sequences, and the :mod:`readchar` constants only spell one variant of each:
+# they hold ``\x1b[F`` for End, while tmux, screen and the Linux console send
+# ``\x1b[4~`` and xterm in application cursor mode sends ``\x1bOF``. Every
+# spelling is accepted, and :func:`read_key` reads each one whole whatever its
+# length, so no half sequence ever has to be matched here.
 SCROLL_UP_KEYS = frozenset({readchar_key.UP, "\x1bOA"})
 SCROLL_DOWN_KEYS = frozenset({readchar_key.DOWN, "\x1bOB"})
 SCROLL_PAGE_UP_KEYS = frozenset({readchar_key.PAGE_UP, "\x1b[5~", "\x1bOy"})
 SCROLL_PAGE_DOWN_KEYS = frozenset({readchar_key.PAGE_DOWN, "\x1b[6~", "\x1bOs"})
 SCROLL_HOME_KEYS = frozenset({readchar_key.HOME, "\x1bOH", "\x1b[1~", "\x1b[7~"})
-SCROLL_END_KEYS = frozenset({readchar_key.END, "\x1bOF", "\x1b[4~", "\x1b[4", "\x1b[8~"})
+SCROLL_END_KEYS = frozenset({readchar_key.END, "\x1bOF", "\x1b[4~", "\x1b[8~"})
+
+# Focus keys. Shift+Tab has no ASCII code of its own: terminals spell it
+# ``\x1b[Z``, which is what :data:`readchar.key.SHIFT_TAB` holds and what a
+# real xterm, tmux and the macOS terminal were all observed to send.
+FOCUS_NEXT_KEYS = frozenset({readchar_key.TAB})
+FOCUS_PREVIOUS_KEYS = frozenset({readchar_key.SHIFT_TAB})
+
+# Enter arrives as a line feed once the terminal's ``ICRNL`` has translated the
+# carriage return, but not every terminal has it set, so both are accepted.
+ZOOM_KEYS = frozenset({readchar_key.ENTER, readchar_key.CR, readchar_key.LF})
+
+# How long :func:`read_key` waits for the rest of an escape sequence before
+# concluding that Esc was pressed on its own. A terminal emits the bytes of a
+# sequence back to back, so anything still missing after this window was never
+# part of one. 50 ms is what vim uses for the same decision: short enough to
+# feel instant, long enough to survive a laggy ssh hop.
+ESCAPE_SEQUENCE_TIMEOUT = 0.05
+
+# How long a single read waits for a key before handing control back to
+# :func:`keyboard_listener`, which is what lets that thread notice
+# :data:`exit_event` instead of blocking forever on a key nobody will press.
+KEY_READ_TIMEOUT = 0.1
+
+# One byte read while looking for the rest of an escape sequence, turning out
+# not to belong to one, and handed to the next read instead of being thrown
+# away. Only the keyboard thread ever touches it, so it needs no lock.
+pending_byte = None
 
 # Chrome a panel adds around its content: one border column on each side plus
 # the ``(0, 1)`` padding horizontally, one border line above and below
@@ -168,6 +217,13 @@ MIN_PLAIN_PANEL_HEIGHT = 3
 WIDE_LAYOUT_MIN_WIDTH = 200
 LAYOUT_MODE_WIDE = "wide"
 LAYOUT_MODE_NARROW = "narrow"
+
+# The three things the main loop can put on the screen. Only a change of
+# screen, or a layout rebuilt under it, calls for a ``live.update``; everything
+# else is picked up by the ``Live`` instance's own refresh.
+SCREEN_DASHBOARD = "dashboard"
+SCREEN_HELP = "help"
+SCREEN_ZOOM = "zoom"
 
 # Width and height handed to the measurement console below. They only have to
 # be larger than anything this dashboard can produce: Rich clamps a measurement
@@ -236,6 +292,30 @@ def truncate_cmdline(cmdline, width):
 def truncate_name(name, max_length=15):
     """Truncates the name if it exceeds a specified maximum length."""
     return name if len(name) <= max_length else name[:max_length - 1] + "…"
+
+
+def numbered_title(number, title):
+    """Return the markup of a panel title carrying its jump number.
+
+    The number is the whole point of the prefix: it is what the user types to
+    focus that panel, so it is drawn where the panel names itself rather than
+    hidden in the help screen.
+
+    Parameters
+    ----------
+    number : int or None
+        Position of the panel in :data:`panel_keys`, one-based, or ``None``
+        for a panel that has not been registered yet.
+    title : str
+        Panel title, without markup.
+
+    Returns
+    -------
+    str
+        The title, prefixed with ``[n] `` and wrapped in the panel style.
+    """
+    label = title if number is None else f"[{number}] {title}"
+    return f"[bold cyan]{label}[/bold cyan]"
 
 
 class AdaptiveRenderable:
@@ -564,6 +644,9 @@ class ScrollablePanel:
         self.rows = list(rows)
         self.empty_message = empty_message
         self._table_builder = table_builder
+        # Assigned by :func:`register_panels` once the reading order is known,
+        # which is also what the digit keys jump by.
+        self.number = None
 
     def build_table(self, available_width, rows=None):
         """Build the table listing a window of rows, all of them by default.
@@ -717,7 +800,7 @@ class ScrollablePanel:
 
         border_style = FOCUSED_PANEL_BORDER_STYLE if focused else PANEL_BORDER_STYLE
         panel_options = {
-            "title": f"[bold cyan]{self.title}[/bold cyan]",
+            "title": numbered_title(self.number, self.title),
             "border_style": border_style,
             "padding": (0, 1),
             "height": height,
@@ -745,7 +828,13 @@ class ScrollablePanel:
 
         if not count:
             # Too short for even one row and its indicators. Saying how much
-            # is there beats drawing a table the panel would have to cut.
+            # is there beats drawing a table the panel would have to cut, and
+            # the box closes right under that line: a panel with one line to
+            # show has no use for the rest of the room it was handed, and
+            # stretching it would only frame the lines it could not fill.
+            panel_options["height"] = (
+                None if height is None else min(height, MIN_PLAIN_PANEL_HEIGHT)
+            )
             return Panel(_overflow_indicator("↕", len(self.rows), "hidden"), **panel_options)
 
         parts = []
@@ -1029,6 +1118,76 @@ def terminal_width():
     return console.size.width
 
 
+def build_key_helper(available_width):
+    """Build the one line key reminder pinned to the bottom of the screen.
+
+    Read at render time rather than assembled once, for two reasons: the
+    number of panels changes with the payload, and the room the line gets
+    changes with the terminal. A full line does not fit a narrow terminal, so
+    a shorter spelling is used below its own width rather than letting the
+    reminder be cut mid-word.
+
+    Parameters
+    ----------
+    available_width : int
+        Room the line has, in columns, as reported by Rich.
+
+    Returns
+    -------
+    rich.text.Text
+        A single line, never wrapped: the footer region is one row tall and a
+        second line would simply be cropped away.
+    """
+    with state_lock:
+        count = len(panel_keys)
+
+    # Nothing to jump to before the first payload has been laid out.
+    jump = f"1-{count} Jump  " if count > 1 else ""
+    full = (
+        f"{jump}Tab/S-Tab Focus  Enter Zoom  ^/v Scroll  p Pause  h Help  q Quit"
+    )
+    compact = f"{jump}Tab Focus  Enter Zoom  p Pause  h Help  q Quit"
+
+    return Text(
+        full if cell_len(full) <= available_width else compact,
+        style="dim",
+        justify="center",
+        no_wrap=True,
+        overflow="ellipsis",
+    )
+
+
+def build_screen(body=None):
+    """Wrap a full screen renderable in the permanent key helper row.
+
+    Every screen the dashboard shows goes through here, which is what keeps
+    the reminder visible in both layout modes, on the help screen and on a
+    zoomed panel. The footer is a region of its own with a fixed size, so the
+    body is handed one line less than the terminal has and nothing it draws
+    can ever be pushed under the reminder or cropped by it.
+
+    Parameters
+    ----------
+    body : rich.console.RenderableType, optional
+        What to draw above the reminder. Left unset by :func:`create_layout`,
+        which splits the body region into columns instead.
+
+    Returns
+    -------
+    rich.layout.Layout
+        A layout of a ``body`` region and a one line ``footer`` region.
+    """
+    screen = Layout()
+    screen.split_column(
+        Layout(name="body", ratio=1),
+        Layout(name="footer", size=1),
+    )
+    if body is not None:
+        screen["body"].update(body)
+    screen["footer"].update(AdaptiveRenderable(build_key_helper))
+    return screen
+
+
 def create_layout(mode=LAYOUT_MODE_NARROW, multi_gpu=False):
     """Create the region tree backing the dashboard, for one layout shape.
 
@@ -1039,7 +1198,9 @@ def create_layout(mode=LAYOUT_MODE_NARROW, multi_gpu=False):
 
     In both cases the regions only carry the horizontal split. The vertical
     one lives inside :class:`StackedPanels`, which is the only place that
-    knows how tall each panel's content actually is.
+    knows how tall each panel's content actually is. The whole thing hangs
+    under the ``body`` region of :func:`build_screen`, so the key helper keeps
+    its own row whatever the mode.
 
     Parameters
     ----------
@@ -1057,19 +1218,26 @@ def create_layout(mode=LAYOUT_MODE_NARROW, multi_gpu=False):
         Root layout. Region names are unique across the whole tree, because
         Rich resolves ``layout["name"]`` by searching it.
     """
-    layout = Layout()
+    layout = build_screen()
+    body = layout["body"]
 
     if mode == LAYOUT_MODE_WIDE:
-        names = ["wide_vram", "wide_processes", "wide_summary"]
+        # Reading order, left to right: the summary first, then the cards it
+        # sums up, then the two panels sharing the VRAM story, then the
+        # rankings.
+        names = ["wide_summary"]
         if multi_gpu:
             names.append("wide_gpu_detail")
-        layout.split_row(*[Layout(name=name, ratio=1) for name in names])
+        names.extend(["wide_vram", "wide_processes"])
+        body.split_row(*[Layout(name=name, ratio=1) for name in names])
         return layout
 
-    # Narrow: two columns, their ratio set per mode at render time.
-    layout.split_row(
-        Layout(name="narrow_left", ratio=1),
-        Layout(name="narrow_right", ratio=2),
+    # Narrow: two columns. The left one carries the summary and the two VRAM
+    # panels in both GPU configurations, so its share no longer depends on the
+    # number of cards.
+    body.split_row(
+        Layout(name="narrow_left", ratio=2),
+        Layout(name="narrow_right", ratio=3),
     )
     return layout
 
@@ -1132,7 +1300,6 @@ def build_summary(data, interval, multi_gpu=False):
     current_time = f"[bold]{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}[/bold]"
 
     table.add_row("Current Time", current_time)
-    table.add_row("", "")
 
     # CPU and RAM information
     cpu_usage = f"[bold green]CPU:[/bold green] {data.get('cpu', 0):.1f}%"
@@ -1141,19 +1308,25 @@ def build_summary(data, interval, multi_gpu=False):
     ram_usage = f"[bold yellow]RAM:[/bold yellow] {ram_percent:.1f}% / {ram_total}"
     table.add_row(cpu_usage, ram_usage)
 
-    # Status (Paused or Running)
     with state_lock:
-        status = "[bold red]PAUSED[/bold red]" if is_paused else ""
+        paused = is_paused
+        focused = focused_panel == PANEL_SUMMARY
 
-    table.add_row("", status)
+    # The pause marker lives in the subtitle rather than in a row of its own:
+    # this panel names itself now, so an empty slot kept for a word that is
+    # usually absent would be a border drawn around a blank line.
+    subtitle = f"Refresh rate: {interval}s"
+    if paused:
+        subtitle = f"[bold red]PAUSED[/bold red] - {subtitle}"
 
     gpu_section = build_gpu_totals(data) if multi_gpu else build_gpu_summary(data)
 
     summary_panel = Panel(
         Group(table, gpu_section),
-        border_style="cyan",
+        title=numbered_title(None, SUMMARY_PANEL_TITLE),
+        border_style=FOCUSED_PANEL_BORDER_STYLE if focused else PANEL_BORDER_STYLE,
         padding=(0, 1),
-        subtitle=f"Refresh rate: {interval}s"
+        subtitle=subtitle,
     )
     return summary_panel
 
@@ -1736,20 +1909,27 @@ def build_ollama_panel(data, gpu_processes=None):
     )
 
 
-def register_scrollable_panels(panels):
-    """Publish the panels the scroll keys can drive, and keep focus valid.
+def register_panels(entries):
+    """Publish the panels on screen, number them, and keep the focus valid.
 
-    Which panels exist depends on the payload and on the layout mode, and a
-    panel with nothing to list has no window to move, so the Tab order is
-    rebuilt on every render pass rather than fixed once. A focus left pointing
-    at a panel that has since gone away falls back to the first one, and the
-    offsets of vanished panels are dropped so a panel coming back starts at
-    the top rather than wherever it was left months of uptime ago.
+    Which panels exist depends on the payload and on the layout mode, so the
+    order is rebuilt on every render pass rather than fixed once. It is a
+    single order for three purposes: the one Tab walks, the one the digit keys
+    jump by, and the one the numbers drawn in the panel titles come from, which
+    is the only way a number a user reads is a number a user can type. A focus
+    left pointing at a panel that has since gone away falls back to the first
+    one, and the offsets of vanished panels are dropped so a panel coming back
+    starts at the top rather than wherever it was left months of uptime ago.
+
+    Panels with nothing to list stay in the order. They have no window to move,
+    but they do carry a number, and a number that skips or refuses to be typed
+    is worse than a focus that scrolls nowhere.
 
     Parameters
     ----------
-    panels : list of ScrollablePanel
-        Every scrollable panel currently in the layout, in Tab order.
+    entries : list of tuple of (str, rich.console.RenderableType)
+        Every panel currently in the layout, in reading order, keyed by its
+        panel identity.
 
     Returns
     -------
@@ -1757,13 +1937,24 @@ def register_scrollable_panels(panels):
     """
     global focused_panel
 
-    keys = [panel.key for panel in panels if panel.rows]
+    keys = [key for key, _ in entries]
     with state_lock:
-        scrollable_panel_keys[:] = keys
+        panel_keys[:] = keys
+        panel_renderables.clear()
+        panel_renderables.update(dict(entries))
         if focused_panel not in keys:
             focused_panel = keys[0] if keys else None
         for stale in [key for key in scroll_offsets if key not in keys]:
             del scroll_offsets[stale]
+
+    for number, (_key, panel) in enumerate(entries, start=1):
+        if isinstance(panel, ScrollablePanel):
+            panel.number = number
+        else:
+            # The summary is the one panel that is a plain ``Panel``, so its
+            # title is rewritten outright instead of being resolved when it
+            # renders itself.
+            panel.title = numbered_title(number, SUMMARY_PANEL_TITLE)
 
 
 def build_layout_content(layout, data, interval, mode=LAYOUT_MODE_NARROW):
@@ -1771,9 +1962,10 @@ def build_layout_content(layout, data, interval, mode=LAYOUT_MODE_NARROW):
 
     The routing depends on the number of GPUs. With zero or one card the
     per-GPU detail fits inside the summary panel, so there is no separate
-    detail panel at all. From two cards on, the detail gets its own region,
-    the GPU processes join Ollama in the same column (they describe the same
-    VRAM), and the summary keeps only cumulated figures.
+    detail panel at all. From two cards on, the detail gets its own region and
+    the summary keeps only cumulated figures. The summary itself always opens
+    the reading order, so it is the top left panel and panel number 1 in both
+    modes; Ollama and the GPU processes stay together, as do the two rankings.
 
     No size is threaded through: every panel sizes itself from the room Rich
     hands it at render time (see :class:`AdaptiveRenderable` for the columns
@@ -1809,35 +2001,71 @@ def build_layout_content(layout, data, interval, mode=LAYOUT_MODE_NARROW):
     rankings = build_processes_panel(data)
     summary_panel = build_summary(data, interval, multi_gpu=multi_gpu)
 
-    # Tab order: down the leftmost column first, then across. It follows the
-    # reading order of both layouts, which is the only order a user can guess.
-    scrollable = [ollama_panel, gpu_processes_panel, *rankings.panels]
+    gpu_detail_panel = build_gpu_detail_panel(data) if multi_gpu else None
+
+    # Reading order, which is both the Tab order and the numbering: the
+    # summary first, because it is the panel a glance goes to, then the cards
+    # it sums up, then Ollama with the GPU processes it accounts for, then the
+    # two rankings. It runs down the leftmost column and then across, which is
+    # how both layouts read.
+    order = [(PANEL_SUMMARY, summary_panel)]
 
     if mode == LAYOUT_MODE_WIDE:
+        layout["wide_summary"].update(StackedPanels(summary_panel))
+        if gpu_detail_panel is not None:
+            order.append((PANEL_GPU_DETAIL, gpu_detail_panel))
+            layout["wide_gpu_detail"].update(StackedPanels(gpu_detail_panel))
+        order.extend([
+            (PANEL_OLLAMA, ollama_panel),
+            (PANEL_GPU_PROCESSES, gpu_processes_panel),
+            *[(panel.key, panel) for panel in rankings.panels],
+        ])
         layout["wide_vram"].update(StackedPanels(ollama_panel, gpu_processes_panel))
         layout["wide_processes"].update(StackedPanels(*rankings.panels))
-        layout["wide_summary"].update(StackedPanels(summary_panel))
-        if multi_gpu:
-            gpu_detail_panel = build_gpu_detail_panel(data)
-            scrollable.append(gpu_detail_panel)
-            layout["wide_gpu_detail"].update(StackedPanels(gpu_detail_panel))
-    elif multi_gpu:
-        # The left column carries three stacked panels, hence a bit more room.
-        layout["narrow_left"].ratio = 2
-        layout["narrow_right"].ratio = 3
-        gpu_detail_panel = build_gpu_detail_panel(data)
-        scrollable.append(gpu_detail_panel)
-        layout["narrow_left"].update(
-            StackedPanels(ollama_panel, gpu_processes_panel, summary_panel)
-        )
-        layout["narrow_right"].update(StackedPanels(rankings, gpu_detail_panel))
     else:
-        layout["narrow_left"].ratio = 1
-        layout["narrow_right"].ratio = 2
-        layout["narrow_left"].update(StackedPanels(ollama_panel, gpu_processes_panel))
-        layout["narrow_right"].update(StackedPanels(rankings, summary_panel))
+        # The left column carries the same three panels in both GPU
+        # configurations; only the right one gains the per-card detail.
+        order.extend([
+            (PANEL_OLLAMA, ollama_panel),
+            (PANEL_GPU_PROCESSES, gpu_processes_panel),
+            *[(panel.key, panel) for panel in rankings.panels],
+        ])
+        layout["narrow_left"].update(
+            StackedPanels(summary_panel, ollama_panel, gpu_processes_panel)
+        )
+        if gpu_detail_panel is not None:
+            order.append((PANEL_GPU_DETAIL, gpu_detail_panel))
+            layout["narrow_right"].update(StackedPanels(rankings, gpu_detail_panel))
+        else:
+            layout["narrow_right"].update(StackedPanels(rankings))
 
-    register_scrollable_panels(scrollable)
+    register_panels(order)
+
+
+class ZoomedPanel:
+    """Draws whichever panel is focused, on its own, full screen.
+
+    The panel is resolved when this object renders rather than when the zoom
+    was entered, which is what lets Tab, Shift+Tab and the digit keys move the
+    zoom from one panel to the next without waking the main loop: the ``Live``
+    instance redraws this four times a second and it reads the focus back on
+    every pass, exactly as the panel borders do. It is also what keeps the
+    zoomed panel refreshing, since the main loop replaces the registered
+    renderables with freshly fetched ones on every interval.
+    """
+
+    def __rich_console__(self, console, options):
+        """Render the focused panel into the whole body of the screen."""
+        with state_lock:
+            panel = panel_renderables.get(focused_panel)
+
+        if panel is None:
+            yield Text("No panel to zoom.", style="dim italic")
+            return
+
+        # ``StackedPanels`` of one is what caps the panel at the height of its
+        # own content, so a short panel does not frame the rest of the screen.
+        yield from console.render(StackedPanels(panel), options)
 
 
 def build_full_screen_help():
@@ -1856,9 +2084,20 @@ def build_full_screen_help():
 [bold green]-[/bold green] - Decrease interval
 [bold green]+[/bold green] - Increase interval
 
-[bold yellow]Scrolling:[/bold yellow]
+[bold yellow]Focus and zoom:[/bold yellow]
 
 [bold green]Tab[/bold green]         - Focus the next panel (highlighted border)
+[bold green]Shift+Tab[/bold green]   - Focus the previous panel
+[bold green]1..9[/bold green]        - Focus the panel carrying that number
+[bold green]Enter[/bold green]       - Zoom the focused panel to full screen
+[bold green]Esc[/bold green]         - Leave the zoom (or this help screen)
+
+Every panel shows its number in its title, so what you read is what you type.
+A zoomed panel keeps refreshing and keeps scrolling. Help wins over zoom: it
+covers a zoomed panel, and leaving it puts the panel back.
+
+[bold yellow]Scrolling:[/bold yellow]
+
 [bold green]Up/Down[/bold green]     - Scroll the focused panel by one row
 [bold green]PgUp/PgDn[/bold green]   - Scroll the focused panel by one screenful
 [bold green]Home/End[/bold green]    - Jump to the first or last row
@@ -1878,14 +2117,15 @@ Press [bold green]h[/bold green] again to return.
 
 
 def cycle_panel_focus(step=1):
-    """Move the focus to the next scrollable panel.
+    """Move the focus to the next panel in reading order.
 
     The caller must hold :data:`state_lock`.
 
     Parameters
     ----------
     step : int, optional
-        How many panels to move by, negative to go backwards. Wraps around.
+        How many panels to move by, negative to go backwards, which is what
+        Shift+Tab does. Wraps around either way.
 
     Returns
     -------
@@ -1893,13 +2133,36 @@ def cycle_panel_focus(step=1):
     """
     global focused_panel
 
-    if not scrollable_panel_keys:
+    if not panel_keys:
         focused_panel = None
-    elif focused_panel in scrollable_panel_keys:
-        position = scrollable_panel_keys.index(focused_panel)
-        focused_panel = scrollable_panel_keys[(position + step) % len(scrollable_panel_keys)]
+    elif focused_panel in panel_keys:
+        position = panel_keys.index(focused_panel)
+        focused_panel = panel_keys[(position + step) % len(panel_keys)]
     else:
-        focused_panel = scrollable_panel_keys[0]
+        focused_panel = panel_keys[0]
+
+
+def focus_panel_by_number(number):
+    """Focus the panel drawing a given number in its title.
+
+    The caller must hold :data:`state_lock`. A number no panel carries is
+    ignored rather than clamped: jumping to a panel that is not on screen
+    would move the focus somewhere the user did not point at.
+
+    Parameters
+    ----------
+    number : int
+        One-based position in :data:`panel_keys`, as drawn by
+        :func:`numbered_title`.
+
+    Returns
+    -------
+    None
+    """
+    global focused_panel
+
+    if 1 <= number <= len(panel_keys):
+        focused_panel = panel_keys[number - 1]
 
 
 def scroll_focused_panel(rows=0, pages=0, to=None):
@@ -1941,54 +2204,329 @@ def scroll_focused_panel(rows=0, pages=0, to=None):
     scroll_offsets[focused_panel] = max(0, min(offset, max(0, total - 1)))
 
 
-def keyboard_listener():
-    """Listens for keyboard input and modifies state accordingly.
+def leave_overlay():
+    """Close whichever screen is covering the dashboard.
 
-    The scrolling keys deliberately do not set :data:`rebuild_layout_event`.
-    They change nothing about *what* is on screen, only which slice of it is
-    drawn, and the offsets are read back by the panels on every render, so the
-    ``Live`` instance's own refresh picks them up within its next frame. Waking
-    the main loop would fire an HTTP request per key press for nothing.
+    The caller must hold :data:`state_lock`. Help wins over zoom, here and in
+    the main loop: it is drawn on top of a zoomed panel, so it is also what
+    Esc dismisses first, and the panel is still zoomed underneath it.
+
+    Returns
+    -------
+    None
     """
-    global is_paused, show_help_flag, refresh_interval, latest_stats
-    while not exit_event.is_set():
-        key = readchar.readkey()
-        with state_lock:
-            if key.lower() == 'q':
-                exit_event.set()
-            elif key.lower() == 'r':
-                # Signal to refresh data
-                rebuild_layout_event.set()  # We want to rebuild the layout with the same data
-            elif key.lower() == 'h':
-                show_help_flag = not show_help_flag
-                rebuild_layout_event.set()  # Rebuild layout to show/hide help
-            elif key.lower() == 'p':
-                is_paused = not is_paused
-                rebuild_layout_event.set()  # Rebuild layout to show pause state
-            elif key == '-':
-                if refresh_interval > 1:
-                    refresh_interval -= 1
-                    rebuild_layout_event.set()  # Rebuild layout to show new interval
-            elif key == '+':
-                if refresh_interval < 60:
-                    refresh_interval += 1
-                    rebuild_layout_event.set()  # Rebuild layout to show new interval
-            elif key == readchar_key.TAB:
-                cycle_panel_focus()
-            elif key in SCROLL_UP_KEYS:
-                scroll_focused_panel(rows=-1)
-            elif key in SCROLL_DOWN_KEYS:
-                scroll_focused_panel(rows=1)
-            elif key in SCROLL_PAGE_UP_KEYS:
-                scroll_focused_panel(pages=-1)
-            elif key in SCROLL_PAGE_DOWN_KEYS:
-                scroll_focused_panel(pages=1)
-            elif key in SCROLL_HOME_KEYS:
-                scroll_focused_panel(to=0)
-            elif key in SCROLL_END_KEYS:
-                # Past the last row on purpose: the render clamps it down to
-                # the offset that fills the window with the final rows.
-                scroll_focused_panel(to=panel_row_counts.get(focused_panel, 0))
+    global show_help_flag, is_zoomed
+
+    if show_help_flag:
+        show_help_flag = False
+    else:
+        is_zoomed = False
+    rebuild_layout_event.set()
+
+
+@contextlib.contextmanager
+def raw_terminal():
+    """Put the terminal in the mode a key-at-a-time reader needs.
+
+    Only ``ICANON`` and ``ECHO`` are cleared. A full raw mode would also clear
+    ``OPOST`` and cost the dashboard its newline translation, which is what
+    turns Rich output into a staircase, and would clear ``ISIG`` and take
+    Ctrl+C away with it. ``VMIN``/``VTIME`` are set so a read returns as soon
+    as one byte is there.
+
+    Yields
+    ------
+    int or None
+        The file descriptor now in that mode, or ``None`` when standard input
+        is not a terminal, which is the case under pytest and when the CLI is
+        run with its input piped in.
+    """
+    if termios is None or not sys.stdin.isatty():
+        yield None
+        return
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    mode = termios.tcgetattr(fd)
+    mode[3] &= ~(termios.ICANON | termios.ECHO)
+    mode[6][termios.VMIN] = 1
+    mode[6][termios.VTIME] = 0
+    # TCSANOW rather than TCSAFLUSH: flushing here would throw away whatever
+    # the user typed while the previous frame was still being drawn.
+    termios.tcsetattr(fd, termios.TCSANOW, mode)
+    try:
+        yield fd
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def read_byte(fd, timeout):
+    """Read one byte from a file descriptor, waiting at most *timeout*.
+
+    Parameters
+    ----------
+    fd : int
+        File descriptor of the terminal to read from.
+    timeout : float or None
+        Seconds to wait for a byte to show up. ``None`` waits forever.
+
+    Returns
+    -------
+    bytes or None
+        The byte that was read, or ``None`` if the wait timed out, the
+        descriptor reached end of file, or it stopped being readable at all.
+    """
+    try:
+        ready, _, _ = select.select([fd], [], [], timeout)
+    except (OSError, ValueError):
+        # The descriptor was closed under us, which is what a terminal going
+        # away looks like. Nothing more will ever be read from it.
+        return None
+    if not ready:
+        return None
+    try:
+        return os.read(fd, 1) or None
+    except OSError:
+        return None
+
+
+def utf8_continuation_length(lead_byte):
+    """Say how many bytes follow a UTF-8 lead byte.
+
+    Standard input is read a byte at a time, so a key outside ASCII arrives in
+    pieces that have to be put back together before they mean anything.
+
+    Parameters
+    ----------
+    lead_byte : int
+        The first byte of the character, as an integer.
+
+    Returns
+    -------
+    int
+        The number of continuation bytes still to read, ``0`` for ASCII and
+        for any byte that is not a valid lead.
+    """
+    if lead_byte < 0x80:
+        return 0
+    if lead_byte >= 0xF0:
+        return 3
+    if lead_byte >= 0xE0:
+        return 2
+    if lead_byte >= 0xC0:
+        return 1
+    return 0
+
+
+def read_escape_sequence(fd):
+    """Read whatever follows an escape byte, or decide that nothing did.
+
+    This is the whole reason :func:`readchar.readkey` is not used: it reads the
+    escape and then *blocks* on the next byte, so a lone Esc is only delivered
+    once some other key is struck, glued in front of it. Here the byte after
+    the escape is waited for with :data:`ESCAPE_SEQUENCE_TIMEOUT`, which is
+    what tells a real Esc apart from the start of a sequence, and the key
+    struck next is left in the buffer for the next read instead of being
+    swallowed.
+
+    The grammar read here is the one terminals actually speak: ``Esc O`` plus a
+    single byte for the SS3 keys xterm sends in application cursor mode, and
+    ``Esc [`` plus parameter and intermediate bytes up to a final byte in the
+    ``@``..``~`` range for everything else. Reading up to that final byte
+    rather than up to a fixed length is what keeps ``\\x1b[4~`` and
+    ``\\x1b[1;5A`` intact however long they are.
+
+    Parameters
+    ----------
+    fd : int
+        File descriptor of the terminal, already read up to and including the
+        escape byte.
+
+    Returns
+    -------
+    str
+        The complete sequence, escape byte included. A bare ``"\\x1b"`` means
+        Esc was pressed on its own.
+    """
+    global pending_byte
+
+    second = read_byte(fd, ESCAPE_SEQUENCE_TIMEOUT)
+    if second is None:
+        return readchar_key.ESC
+    if second not in (b"[", b"O"):
+        # Esc and another key, struck close enough together that the terminal
+        # cannot tell the pair from Alt+key: both are spelled as an escape
+        # glued to the key. Nothing here binds Alt+key, so the byte is kept
+        # for the next read rather than glued onto the escape, and Esc lands
+        # without ever costing the press that followed it.
+        pending_byte = second
+        return readchar_key.ESC
+
+    sequence = bytearray(readchar_key.ESC.encode("ascii"))
+    sequence += second
+    if second == b"O":
+        final = read_byte(fd, ESCAPE_SEQUENCE_TIMEOUT)
+        if final is not None:
+            sequence += final
+        return sequence.decode("utf-8", "replace")
+
+    while True:
+        byte = read_byte(fd, ESCAPE_SEQUENCE_TIMEOUT)
+        if byte is None:
+            # A sequence cut short by the terminal. It matches nothing and is
+            # ignored, which is better than blocking on the rest of it.
+            break
+        sequence += byte
+        if 0x40 <= byte[0] <= 0x7E:
+            break
+    return sequence.decode("utf-8", "replace")
+
+
+def read_key(timeout=None):
+    """Read one key press, telling a lone Esc from the start of a sequence.
+
+    The caller is expected to have put the terminal in the mode
+    :func:`raw_terminal` sets up, otherwise nothing is readable until the user
+    presses Enter.
+
+    A byte left over by :func:`read_escape_sequence` is served before anything
+    is read from the terminal, which is what makes Esc immediately followed by
+    another key two key presses rather than one unbound Alt+key.
+
+    Parameters
+    ----------
+    timeout : float or None, optional
+        Seconds to wait for a key. ``None``, the default, waits forever. It is
+        ignored when a leftover byte is already waiting.
+
+    Returns
+    -------
+    str or None
+        The key, spelled the way :mod:`readchar` spells it, or ``None`` if the
+        wait timed out or standard input went away.
+    """
+    if termios is None:  # pragma: no cover - Windows only
+        return readchar.readkey()
+
+    global pending_byte
+
+    fd = sys.stdin.fileno()
+    if pending_byte is not None:
+        first, pending_byte = pending_byte, None
+    else:
+        first = read_byte(fd, timeout)
+        if first is None:
+            return None
+    if first == readchar_key.ESC.encode("ascii"):
+        return read_escape_sequence(fd)
+
+    character = bytearray(first)
+    for _ in range(utf8_continuation_length(first[0])):
+        continuation = read_byte(fd, ESCAPE_SEQUENCE_TIMEOUT)
+        if continuation is None:
+            break
+        character += continuation
+    return character.decode("utf-8", "replace")
+
+
+def handle_key(key):
+    """Apply one key press to the shared dashboard state.
+
+    The caller must hold :data:`state_lock`.
+
+    The scrolling and focus keys deliberately do not set
+    :data:`rebuild_layout_event`. They change nothing about *what* is on
+    screen, only which slice of it is drawn and which panel is highlighted or
+    zoomed, and all of that is read back on every render, so the ``Live``
+    instance's own refresh picks them up within its next frame. Waking the main
+    loop would fire an HTTP request per key press for nothing.
+
+    Parameters
+    ----------
+    key : str
+        Whatever :func:`read_key` handed back.
+
+    Returns
+    -------
+    None
+    """
+    global is_paused, show_help_flag, refresh_interval, is_zoomed
+
+    if key.lower() == 'q':
+        exit_event.set()
+    elif key.lower() == 'r':
+        # Signal to refresh data
+        rebuild_layout_event.set()  # We want to rebuild the layout with the same data
+    elif key.lower() == 'h':
+        show_help_flag = not show_help_flag
+        rebuild_layout_event.set()  # Rebuild layout to show/hide help
+    elif key.lower() == 'p':
+        is_paused = not is_paused
+        rebuild_layout_event.set()  # Rebuild layout to show pause state
+    elif key == '-':
+        if refresh_interval > 1:
+            refresh_interval -= 1
+            rebuild_layout_event.set()  # Rebuild layout to show new interval
+    elif key == '+':
+        if refresh_interval < 60:
+            refresh_interval += 1
+            rebuild_layout_event.set()  # Rebuild layout to show new interval
+    elif key in FOCUS_NEXT_KEYS:
+        cycle_panel_focus(1)
+    elif key in FOCUS_PREVIOUS_KEYS:
+        cycle_panel_focus(-1)
+    elif key in ZOOM_KEYS:
+        if show_help_flag:
+            leave_overlay()
+        else:
+            is_zoomed = not is_zoomed
+            rebuild_layout_event.set()
+    elif len(key) == 1 and key in "123456789":
+        focus_panel_by_number(int(key))
+    elif key in SCROLL_UP_KEYS:
+        scroll_focused_panel(rows=-1)
+    elif key in SCROLL_DOWN_KEYS:
+        scroll_focused_panel(rows=1)
+    elif key in SCROLL_PAGE_UP_KEYS:
+        scroll_focused_panel(pages=-1)
+    elif key in SCROLL_PAGE_DOWN_KEYS:
+        scroll_focused_panel(pages=1)
+    elif key in SCROLL_HOME_KEYS:
+        scroll_focused_panel(to=0)
+    elif key in SCROLL_END_KEYS:
+        # Past the last row on purpose: the render clamps it down to
+        # the offset that fills the window with the final rows.
+        scroll_focused_panel(to=panel_row_counts.get(focused_panel, 0))
+    elif key == readchar_key.ESC:
+        # Esc on its own, and only that: :func:`read_key` waits to see whether
+        # anything follows the escape byte, so a sequence this dashboard does
+        # not bind arrives whole and falls through here instead of being taken
+        # for an Esc.
+        leave_overlay()
+
+
+def keyboard_listener():
+    """Read key presses and apply them to the shared dashboard state.
+
+    Runs in its own daemon thread for the lifetime of the dashboard. The
+    terminal is put in a key-at-a-time mode once, for the whole loop, rather
+    than around every read: switching back and forth would let a key struck
+    between two reads be echoed onto the screen the ``Live`` instance owns.
+    Each read gives up after :data:`KEY_READ_TIMEOUT` so the loop comes back to
+    :data:`exit_event` regularly and the thread cannot outlive the dashboard
+    waiting on a key that never comes.
+
+    Returns
+    -------
+    None
+    """
+    with raw_terminal():
+        while not exit_event.is_set():
+            key = read_key(timeout=KEY_READ_TIMEOUT)
+            if key is None:
+                continue
+            with state_lock:
+                handle_key(key)
 
 
 def read_dashboard_state():
@@ -1996,12 +2534,13 @@ def read_dashboard_state():
 
     Returns
     -------
-    tuple of (bool, bool, int)
-        Whether the help screen is up, whether refreshing is paused, and the
-        current refresh interval in seconds.
+    tuple of (bool, bool, int, bool)
+        Whether the help screen is up, whether refreshing is paused, the
+        current refresh interval in seconds, and whether the focused panel is
+        zoomed to full screen.
     """
     with state_lock:
-        return show_help_flag, is_paused, refresh_interval
+        return show_help_flag, is_paused, refresh_interval, is_zoomed
 
 
 def main():
@@ -2031,17 +2570,17 @@ def main():
     listener_thread.start()
 
     with Live(layout, refresh_per_second=4, screen=True) as live:
-        # Tracks whether the previous iteration was showing the help screen,
+        # Which of the three screens the previous iteration left on display,
         # so ``live.update`` is only called on an actual transition rather
         # than every loop iteration.
-        previous_help_flag = False
+        previous_screen = SCREEN_DASHBOARD
         while not exit_event.is_set():
             # Consume any pending wake-up *before* reading the state it
             # announces. A key press landing after this point sets the event
             # again, which cuts the sleep at the end of the iteration short
             # instead of being swallowed until the next refresh.
             rebuild_layout_event.clear()
-            help_flag, paused, current_interval = read_dashboard_state()
+            help_flag, paused, current_interval, zoomed = read_dashboard_state()
 
             if not help_flag and not paused:
                 stats = fetch_stats(args.url)
@@ -2052,7 +2591,7 @@ def main():
                 # answer, and every key press in that window changed the
                 # state behind our back. Acting on the pre-fetch snapshot is
                 # what used to swallow a key press for a whole interval.
-                help_flag, paused, current_interval = read_dashboard_state()
+                help_flag, paused, current_interval, zoomed = read_dashboard_state()
 
             if help_flag:
                 # Show the help panel in full screen. ``layout.update`` would
@@ -2061,8 +2600,9 @@ def main():
                 # the help screen has to be swapped in on the ``Live``
                 # instance instead, which is what actually controls what
                 # gets drawn.
-                if not previous_help_flag:
-                    live.update(build_full_screen_help())
+                if previous_screen != SCREEN_HELP:
+                    live.update(build_screen(build_full_screen_help()))
+                previous_screen = SCREEN_HELP
             else:
                 with stats_lock:
                     stats_snapshot = latest_stats
@@ -2078,17 +2618,26 @@ def main():
                     shape = new_shape
                     layout = create_layout(*shape)
 
-                if previous_help_flag or reshaped:
-                    # Coming back from the help screen, or onto a layout that
-                    # did not exist a moment ago: either way the ``Live``
-                    # instance is the thing that decides what gets drawn, so
-                    # the new object has to be pushed through it.
-                    live.update(layout)
-
+                # The dashboard is filled in even while a panel is zoomed: it
+                # is what rebuilds the panels from the fresh payload and
+                # republishes them, and the zoom screen draws whichever one
+                # of them is focused.
                 if stats_snapshot:
                     build_layout_content(layout, stats_snapshot, current_interval, shape[0])
 
-            previous_help_flag = help_flag
+                if zoomed:
+                    if previous_screen != SCREEN_ZOOM:
+                        live.update(build_screen(ZoomedPanel()))
+                    previous_screen = SCREEN_ZOOM
+                else:
+                    if previous_screen != SCREEN_DASHBOARD or reshaped:
+                        # Coming back from another screen, or onto a layout
+                        # that did not exist a moment ago: either way the
+                        # ``Live`` instance is the thing that decides what
+                        # gets drawn, so the new object has to be pushed
+                        # through it.
+                        live.update(layout)
+                    previous_screen = SCREEN_DASHBOARD
 
             # Wait for the refresh interval or an event
             sleep_time = current_interval

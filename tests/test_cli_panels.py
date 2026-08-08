@@ -12,10 +12,18 @@ Rich tells them how wide they are, so a panel's table is obtained through
 
 import functools
 import io
+import os
 import re
 import sys
 
 import pytest
+
+try:  # pragma: no cover - the reader tests are skipped where these are missing
+    import termios
+    import tty
+except ImportError:
+    termios = None
+    tty = None
 from rich.console import Console
 from rich.table import Table
 
@@ -1278,35 +1286,45 @@ class TestGpuProcessesPanelColumns:
 
 
 def _titles(region) -> list:
-    """Return the title of every panel stacked in a layout region."""
+    """Return the title of every panel stacked in a layout region.
+
+    A :class:`~sys_stats.cli.ScrollablePanel` carries its plain title and
+    resolves its number when it renders, while the summary is a plain
+    :class:`~rich.panel.Panel` whose title is the markup it draws, so the
+    style tags are stripped to compare like with like.
+    """
     titles = []
     for panel in region.renderable.panels:
         if hasattr(panel, "panels"):
             titles.extend(inner.title for inner in panel.panels)
         else:
-            titles.append(str(panel.title))
+            titles.append(re.sub(r"\[/?bold cyan\]", "", str(panel.title)))
     return titles
 
 
 class TestBuildLayoutContent:
-    def test_mono_gpu_keeps_the_summary_in_the_right_column(self):
-        """One card: the VRAM panels on the left, rankings and summary right."""
+    def test_mono_gpu_opens_the_left_column_with_the_summary(self):
+        """One card: summary and the VRAM panels left, the rankings right."""
         layout = create_layout()
 
         build_layout_content(layout, _stats(1), 5)
 
-        assert _titles(layout["narrow_left"]) == ["Ollama Statistics", "GPU Processes"]
-        assert _titles(layout["narrow_right"])[:2] == ["Top CPU", "Top Memory"]
-        assert "Refresh rate" in str(layout["narrow_right"].renderable.panels[-1].subtitle)
+        assert _titles(layout["narrow_left"]) == [
+            "[1] Summary", "Ollama Statistics", "GPU Processes"
+        ]
+        assert _titles(layout["narrow_right"]) == ["Top CPU", "Top Memory"]
+        assert "Refresh rate" in str(layout["narrow_left"].renderable.panels[0].subtitle)
 
     def test_multi_gpu_stacks_ollama_with_the_gpu_processes(self):
-        """Two cards: the left column carries both VRAM panels and the totals."""
+        """Two cards: the left column keeps the same three panels."""
         layout = create_layout()
 
         build_layout_content(layout, _stats(2), 5)
 
-        assert _titles(layout["narrow_left"])[:2] == ["Ollama Statistics", "GPU Processes"]
-        assert "Refresh rate" in str(layout["narrow_left"].renderable.panels[-1].subtitle)
+        assert _titles(layout["narrow_left"]) == [
+            "[1] Summary", "Ollama Statistics", "GPU Processes"
+        ]
+        assert "Refresh rate" in str(layout["narrow_left"].renderable.panels[0].subtitle)
         assert _titles(layout["narrow_right"])[-1] == "GPU Detail"
 
     def test_multi_gpu_summary_is_the_cumulated_one(self):
@@ -1315,14 +1333,19 @@ class TestBuildLayoutContent:
         layout = create_layout()
 
         build_layout_content(layout, _stats(2), 5)
-        text = _render(layout["narrow_left"].renderable.panels[-1])
+        text = _render(layout["narrow_left"].renderable.panels[0])
 
         assert "GPU Totals" in text
         assert "(mean)" in text
         assert "RTX 3090" not in text
 
-    def test_the_ratios_flip_between_modes(self):
-        """Multi-GPU widens the left column, which then carries three panels."""
+    def test_both_narrow_modes_share_the_same_ratio(self):
+        """The left column carries the same three panels either way.
+
+        The ratio used to flip because the summary moved from one column to
+        the other with the number of cards; it now opens the left column in
+        both configurations, so the split no longer depends on the payload.
+        """
         layout = create_layout()
 
         build_layout_content(layout, _stats(1), 5)
@@ -1331,8 +1354,7 @@ class TestBuildLayoutContent:
         build_layout_content(layout, _stats(2), 5)
         multi = [layout[name].ratio for name in ("narrow_left", "narrow_right")]
 
-        assert mono == [1, 2]
-        assert multi == [2, 3]
+        assert mono == multi == [2, 3]
 
     def test_a_gpu_less_host_uses_the_mono_routing(self):
         """No GPU must never trigger the multi-GPU layout."""
@@ -1340,8 +1362,10 @@ class TestBuildLayoutContent:
 
         build_layout_content(layout, _stats(0), 5)
 
-        assert _titles(layout["narrow_left"]) == ["Ollama Statistics", "GPU Processes"]
-        assert layout["narrow_left"].ratio == 1
+        assert _titles(layout["narrow_left"]) == [
+            "[1] Summary", "Ollama Statistics", "GPU Processes"
+        ]
+        assert _titles(layout["narrow_right"]) == ["Top CPU", "Top Memory"]
 
 
 class TestLayoutModes:
@@ -1368,8 +1392,8 @@ class TestLayoutModes:
         mono = create_layout(cli.LAYOUT_MODE_WIDE, multi_gpu=False)
         multi = create_layout(cli.LAYOUT_MODE_WIDE, multi_gpu=True)
 
-        assert len(mono.children) == 3
-        assert len(multi.children) == 4
+        assert len(mono["body"].children) == 3
+        assert len(multi["body"].children) == 4
 
     @pytest.mark.parametrize("gpu_count", [0, 1, 3])
     @pytest.mark.parametrize("width", [120, 240])
@@ -1381,10 +1405,11 @@ class TestLayoutModes:
 
         build_layout_content(layout, data, 5, mode)
 
-        for region in layout.children:
+        columns = layout["body"].children
+        for region in columns:
             assert isinstance(region.renderable, cli.StackedPanels)
             assert region.renderable.panels
-            assert _render(region.renderable, width=width // len(layout.children)).strip()
+            assert _render(region.renderable, width=width // len(columns)).strip()
 
 
 class TestGpuColumnReachesTheScreen:
@@ -1472,17 +1497,17 @@ def _render_panel(panel, width: int = 60, height: int = 12) -> str:
 def _press(monkeypatch, keys):
     """Run the keyboard listener over a scripted sequence of key presses.
 
-    The listener loops on ``readchar.readkey`` until ``q`` sets the exit
-    event, so the sequence is simply terminated with one.
+    The listener loops on ``read_key`` until ``q`` sets the exit event, so the
+    sequence is simply terminated with one. Each key is handed over already
+    decoded, exactly as the real reader hands it over, so a lone Esc is the
+    single character ``"\\x1b"`` and nothing else.
     """
     sequence = iter([*keys, "q"])
 
-    class _ScriptedReadchar:
-        @staticmethod
-        def readkey():
-            return next(sequence)
+    def _scripted_read_key(timeout=None):
+        return next(sequence)
 
-    monkeypatch.setattr(cli, "readchar", _ScriptedReadchar)
+    monkeypatch.setattr(cli, "read_key", _scripted_read_key)
     cli.exit_event.clear()
     try:
         cli.keyboard_listener()
@@ -1497,8 +1522,10 @@ def scroll_state():
         cli.scroll_offsets.clear()
         cli.panel_row_counts.clear()
         cli.panel_page_sizes.clear()
-        cli.scrollable_panel_keys[:] = []
+        cli.panel_keys[:] = []
+        cli.panel_renderables.clear()
         cli.focused_panel = None
+        cli.is_zoomed = False
 
     reset()
     yield
@@ -1526,8 +1553,8 @@ class TestPanelScrolling:
 
     def _focus(self, key=None):
         """Point the scroll keys at one panel, as the layout would."""
-        cli.scrollable_panel_keys[:] = [key or cli.PANEL_GPU_PROCESSES]
-        cli.focused_panel = cli.scrollable_panel_keys[0]
+        cli.panel_keys[:] = [key or cli.PANEL_GPU_PROCESSES]
+        cli.focused_panel = cli.panel_keys[0]
 
     def test_a_panel_that_fits_shows_every_row_and_says_nothing(self, scroll_state):
         """The indicator is a statement about hidden rows, not decoration."""
@@ -1653,9 +1680,8 @@ class TestPanelScrolling:
             # readchar's own spellings, which is what a bare xterm sends.
             ("\x1b[F", "last"),
             ("\x1b[H", "proc00"),
-            # tmux, screen and the Linux console. readchar stops one byte
-            # short of the End sequence and returns the rest separately.
-            ("\x1b[4", "last"),
+            # tmux, screen and the Linux console.
+            ("\x1b[4~", "last"),
             ("\x1b[1~", "proc00"),
             # xterm with application cursor keys on.
             ("\x1bOF", "last"),
@@ -1713,15 +1739,15 @@ class TestPanelFocus:
 
         build_layout_content(layout, _stats(3), 5)
 
-        assert cli.scrollable_panel_keys[0] == cli.PANEL_OLLAMA
-        assert cli.focused_panel == cli.PANEL_OLLAMA
+        assert cli.panel_keys[0] == cli.PANEL_SUMMARY
+        assert cli.focused_panel == cli.PANEL_SUMMARY
 
-    def test_tab_cycles_through_every_scrollable_panel(self, monkeypatch, scroll_state):
+    def test_tab_cycles_through_every_panel(self, monkeypatch, scroll_state):
         """And wraps around, so Tab alone reaches all of them."""
         layout = create_layout()
         build_layout_content(layout, _stats(3), 5)
-        order = list(cli.scrollable_panel_keys)
-        assert len(order) == 5
+        order = list(cli.panel_keys)
+        assert len(order) == 6
 
         for expected in order[1:]:
             _press(monkeypatch, [cli.readchar_key.TAB])
@@ -1730,16 +1756,26 @@ class TestPanelFocus:
         _press(monkeypatch, [cli.readchar_key.TAB])
         assert cli.focused_panel == order[0]
 
-    def test_a_panel_with_nothing_to_list_is_not_in_the_tab_order(self, scroll_state):
-        """There is no window to move over an empty-state panel."""
+    def test_a_panel_with_nothing_to_list_keeps_its_place(self, scroll_state):
+        """It carries a number, so it has to answer to it.
+
+        An empty panel has no window to move, but dropping it from the order
+        would either make the numbers skip or renumber the panels after it,
+        and a number a user reads has to be the number a user types.
+        """
         data = _stats(1)
         data["ollama_processes"] = {"models": []}
         layout = create_layout()
 
         build_layout_content(layout, data, 5)
 
-        assert cli.PANEL_OLLAMA not in cli.scrollable_panel_keys
-        assert cli.focused_panel == cli.PANEL_GPU_PROCESSES
+        assert cli.panel_keys == [
+            cli.PANEL_SUMMARY,
+            cli.PANEL_OLLAMA,
+            cli.PANEL_GPU_PROCESSES,
+            cli.PANEL_TOP_CPU,
+            cli.PANEL_TOP_MEMORY,
+        ]
 
     def test_a_focus_left_on_a_vanished_panel_falls_back(self, scroll_state):
         """A card removed between two fetches takes its panel with it."""
@@ -1749,15 +1785,479 @@ class TestPanelFocus:
 
         build_layout_content(layout, _stats(1), 5)
 
-        assert cli.PANEL_GPU_DETAIL not in cli.scrollable_panel_keys
-        assert cli.focused_panel == cli.scrollable_panel_keys[0]
+        assert cli.PANEL_GPU_DETAIL not in cli.panel_keys
+        assert cli.focused_panel == cli.panel_keys[0]
 
-    def test_the_help_screen_documents_every_scrolling_key(self):
+    def test_shift_tab_walks_the_focus_the_other_way(self, monkeypatch, scroll_state):
+        """The counterpart of Tab, and the only way back to the panel before.
+
+        The sequence is the one a real terminal sends: Shift+Tab has no code
+        of its own, terminals spell it ``\\x1b[Z``.
+        """
+        layout = create_layout()
+        build_layout_content(layout, _stats(3), 5)
+        order = list(cli.panel_keys)
+
+        # From the first panel, backwards wraps around to the last one.
+        _press(monkeypatch, ["\x1b[Z"])
+        assert cli.focused_panel == order[-1]
+
+        _press(monkeypatch, ["\x1b[Z"])
+        assert cli.focused_panel == order[-2]
+
+        # And it undoes exactly what Tab did.
+        _press(monkeypatch, [cli.readchar_key.TAB, "\x1b[Z"])
+        assert cli.focused_panel == order[-2]
+
+    def test_a_digit_jumps_straight_to_the_panel_carrying_it(
+        self, monkeypatch, scroll_state
+    ):
+        """The whole point of drawing the number in the title."""
+        layout = create_layout()
+        build_layout_content(layout, _stats(3), 5)
+        order = list(cli.panel_keys)
+
+        for number, expected in enumerate(order, start=1):
+            _press(monkeypatch, [str(number)])
+            assert cli.focused_panel == expected
+
+    def test_a_digit_no_panel_carries_leaves_the_focus_alone(
+        self, monkeypatch, scroll_state
+    ):
+        """Six panels on screen, so 7 to 9 point at nothing."""
+        layout = create_layout()
+        build_layout_content(layout, _stats(3), 5)
+        _press(monkeypatch, ["2"])
+        focused = cli.focused_panel
+
+        _press(monkeypatch, ["9"])
+
+        assert cli.focused_panel == focused
+
+    def test_the_help_screen_documents_every_key(self):
         """It is the only place a user ever learns they exist."""
         text = _render(build_full_screen_help())
 
-        for documented in ("Tab", "Up/Down", "PgUp/PgDn", "Home/End"):
+        for documented in (
+            "Tab", "Shift+Tab", "1..9", "Enter", "Esc",
+            "Up/Down", "PgUp/PgDn", "Home/End",
+        ):
             assert documented in text
+
+
+def _first_box_line(text: str, box) -> str:
+    """Return the top border of a panel box, cut to that panel's own columns."""
+    top, _bottom, left, right = box
+    return text.splitlines()[top][left:right + 1]
+
+
+class TestPanelNumbering:
+    """A panel says which digit focuses it, and the digits never lie.
+
+    The number is drawn in the title, so it is only useful if it is exactly
+    the position :func:`~sys_stats.cli.focus_panel_by_number` jumps to, and if
+    it neither skips nor repeats whatever the payload and the layout mode.
+    """
+
+    @pytest.mark.parametrize("gpu_count", [0, 1, 3])
+    @pytest.mark.parametrize("width", [120, 240])
+    def test_every_panel_draws_a_number_of_its_own(self, gpu_count, width, scroll_state):
+        """One number per panel, from one, with no gap and no duplicate."""
+        data = _stats(gpu_count)
+
+        text = _render_layout(data, width)
+
+        drawn = sorted(int(number) for number in re.findall(r"\[(\d)\]", text))
+        assert drawn == list(range(1, _expected_panel_count(data) + 1))
+
+    @pytest.mark.parametrize("gpu_count", [0, 1, 3])
+    @pytest.mark.parametrize("width", [120, 240])
+    def test_the_summary_is_panel_one_and_sits_top_left(
+        self, gpu_count, width, scroll_state
+    ):
+        """The change of mind: the summary opens both layouts."""
+        text = _render_layout(_stats(gpu_count), width)
+
+        boxes = _panel_boxes(text)
+        top_left = min(boxes, key=lambda box: (box[0], box[2]))
+
+        assert "[1] Summary" in _first_box_line(text, top_left)
+
+    @pytest.mark.parametrize("width", [120, 240])
+    def test_the_numbers_are_what_the_digit_keys_jump_to(
+        self, monkeypatch, width, scroll_state
+    ):
+        """Read the number off the screen, type it, land on that panel."""
+        data = _stats(3)
+        mode, multi_gpu = cli.layout_shape(data, width)
+        layout = create_layout(mode, multi_gpu)
+        build_layout_content(layout, data, 5, mode)
+        text = _render(layout, width=width, height=50)
+
+        for box in _panel_boxes(text):
+            border = _first_box_line(text, box)
+            number = re.search(r"\[(\d)\] ([\w ]+?) ", border)
+            assert number, border
+
+            _press(monkeypatch, [number.group(1)])
+
+            focused = cli.panel_renderables[cli.focused_panel]
+            title = getattr(focused, "title", "")
+            assert number.group(2).strip() in re.sub(r"\[/?bold cyan\]|\[\d\] ", "", title)
+
+    @pytest.mark.parametrize("gpu_count", [1, 3])
+    def test_the_numbering_holds_still_across_refreshes(self, gpu_count, scroll_state):
+        """Same mode, same cards, same numbers: they are typed from memory."""
+        data = _stats(gpu_count)
+        layout = create_layout()
+
+        build_layout_content(layout, data, 5)
+        first = list(cli.panel_keys)
+        build_layout_content(layout, data, 5)
+
+        assert list(cli.panel_keys) == first
+
+
+class TestKeyHelperFooter:
+    """The reminder pinned to the very bottom, on every screen."""
+
+    @pytest.mark.parametrize(("width", "height"), [(60, 20), (120, 30), (240, 50)])
+    def test_the_last_line_of_the_dashboard_is_the_reminder(self, width, height):
+        """Both layout modes, and the narrow terminals the short form is for."""
+        data = _stats(3)
+
+        lines = _render_layout(data, width, height).splitlines()
+
+        assert len(lines) == height
+        assert "q Quit" in lines[-1]
+        assert f"1-{_expected_panel_count(data)} Jump" in lines[-1]
+
+    def test_the_reminder_gives_up_words_rather_than_be_cut(self):
+        """A line cut mid-word teaches nothing; the short spelling still does."""
+        wide = _render_layout(_stats(3), 240, 40).splitlines()[-1]
+        narrow = _render_layout(_stats(3), 60, 40).splitlines()[-1]
+
+        assert "S-Tab" in wide and "^/v Scroll" in wide
+        assert "S-Tab" not in narrow
+        assert narrow.strip().endswith("q Quit")
+
+    def test_the_help_screen_keeps_the_reminder(self):
+        """It is permanent, which means it survives every screen swap."""
+        text = _render(cli.build_screen(build_full_screen_help()), width=120, height=40)
+
+        assert "q Quit" in text.splitlines()[-1]
+
+    def test_the_reminder_never_eats_a_panel(self):
+        """The footer is a region of its own, so nothing is drawn under it."""
+        data = _stats(3)
+
+        text = _render_layout(data, 120, 30)
+
+        assert text.count("╭") == text.count("╰") == _expected_panel_count(data)
+        assert not _clipped_lines(text)
+        assert not _blank_panel_interiors(text)
+
+
+class TestPanelZoom:
+    """Enter draws the focused panel alone, Esc puts the dashboard back."""
+
+    def _dashboard(self, data, width=120, height=30):
+        """Assemble and render the dashboard, which is what registers panels."""
+        mode, multi_gpu = cli.layout_shape(data, width)
+        layout = create_layout(mode, multi_gpu)
+        build_layout_content(layout, data, 5, mode)
+        _render(layout, width=width, height=height)
+        return layout
+
+    def _zoom(self, width=120, height=30):
+        """Render the zoom screen, exactly as ``main`` hands it to ``Live``."""
+        return _render(cli.build_screen(cli.ZoomedPanel()), width=width, height=height)
+
+    def test_enter_zooms_and_both_esc_and_enter_return(self, monkeypatch, scroll_state):
+        """Two ways back, because a terminal only spells one of them reliably."""
+        self._dashboard(_stats(3))
+
+        _press(monkeypatch, ["\n"])
+        assert cli.is_zoomed
+
+        _press(monkeypatch, ["\x1b"])
+        assert not cli.is_zoomed
+
+        _press(monkeypatch, ["\n", "\n"])
+        assert not cli.is_zoomed
+
+    def test_a_lone_escape_leaves_the_zoom_on_its_own(self, monkeypatch, scroll_state):
+        """Regression: Esc used to do nothing until another key was struck.
+
+        The reader now waits to see whether anything follows the escape byte,
+        so the press lands by itself, with no second key involved.
+        """
+        self._dashboard(_stats(3))
+        _press(monkeypatch, ["\n"])
+        assert cli.is_zoomed
+
+        _press(monkeypatch, ["\x1b"])
+
+        assert not cli.is_zoomed
+
+    def test_an_escape_never_swallows_the_key_that_follows_it(
+        self, monkeypatch, scroll_state
+    ):
+        """Regression: the two presses used to arrive glued into one.
+
+        Esc with nothing to dismiss must be harmless, and the key struck after
+        it must still be acted on in full.
+        """
+        self._dashboard(_stats(3))
+        with cli.state_lock:
+            cli.focused_panel = cli.panel_keys[0]
+
+        _press(monkeypatch, ["\x1b", "3"])
+
+        assert not cli.is_zoomed
+        assert not cli.show_help_flag
+        assert cli.focused_panel == cli.panel_keys[2]
+
+    def test_a_lone_escape_closes_the_help(self, monkeypatch, scroll_state):
+        """The other overlay Esc is advertised as dismissing."""
+        self._dashboard(_stats(3))
+        _press(monkeypatch, ["h"])
+        assert cli.show_help_flag
+
+        _press(monkeypatch, ["\x1b"])
+
+        assert not cli.show_help_flag
+
+    def test_an_unbound_escape_sequence_is_not_taken_for_an_escape(
+        self, monkeypatch, scroll_state
+    ):
+        """Ctrl+Up and friends arrive whole and must leave the zoom alone."""
+        self._dashboard(_stats(3))
+        _press(monkeypatch, ["\n"])
+        assert cli.is_zoomed
+
+        _press(monkeypatch, ["\x1b[1;5A"])
+
+        assert cli.is_zoomed
+        _press(monkeypatch, ["\x1b"])
+
+    def test_the_zoom_screen_draws_the_focused_panel_and_nothing_else(
+        self, scroll_state
+    ):
+        """One box, the one the border was highlighting a moment ago."""
+        self._dashboard(_stats(3))
+        with cli.state_lock:
+            cli.focused_panel = cli.PANEL_OLLAMA
+
+        text = self._zoom()
+
+        assert text.count("╭") == text.count("╰") == 1
+        assert "Ollama Statistics" in text
+        assert "Top CPU" not in text
+        assert "q Quit" in text.splitlines()[-1]
+
+    def test_the_zoom_follows_the_focus_keys(self, monkeypatch, scroll_state):
+        """Which is why the panel is resolved when it renders, not when zoomed."""
+        self._dashboard(_stats(3))
+
+        _press(monkeypatch, ["1"])
+        assert "[1] Summary" in self._zoom()
+
+        _press(monkeypatch, ["3"])
+        text = self._zoom()
+        assert "[3] GPU Processes" in text
+        assert "Summary" not in text
+
+    def test_a_zoomed_panel_keeps_showing_the_latest_payload(self, scroll_state):
+        """The panels are rebuilt on every refresh; the zoom must follow them."""
+        data = _stats(3)
+        self._dashboard(data)
+        with cli.state_lock:
+            cli.focused_panel = cli.PANEL_OLLAMA
+        assert "qwen3-coder:30b" in self._zoom()
+
+        refreshed = _stats(3)
+        refreshed["ollama_processes"] = {
+            "models": [{"name": "brand-new:7b", "size": 1, "size_vram": 1}]
+        }
+        self._dashboard(refreshed)
+
+        text = self._zoom()
+        assert "brand-new:7b" in text
+        assert "qwen3-coder:30b" not in text
+
+    def test_a_zoomed_panel_still_scrolls(self, monkeypatch, scroll_state):
+        """The keys act on the focused panel wherever it happens to be drawn."""
+        data = _stats(1)
+        data["top_gpu_processes"] = _scroll_processes(40)
+        self._dashboard(data)
+        with cli.state_lock:
+            cli.focused_panel = cli.PANEL_GPU_PROCESSES
+        assert re.findall(r"proc\d\d", self._zoom())[0] == "proc00"
+
+        _press(monkeypatch, [cli.readchar_key.DOWN])
+
+        assert re.findall(r"proc\d\d", self._zoom())[0] == "proc01"
+
+    def test_help_covers_the_zoom_and_gives_it_back(self, monkeypatch, scroll_state):
+        """The precedence, stated once and applied everywhere.
+
+        Help is drawn on top, so Esc dismisses it first and the panel is still
+        zoomed underneath.
+        """
+        self._dashboard(_stats(3))
+
+        _press(monkeypatch, ["\n", "h"])
+        assert cli.show_help_flag and cli.is_zoomed
+
+        _press(monkeypatch, ["\x1b"])
+        assert not cli.show_help_flag
+        assert cli.is_zoomed
+
+        _press(monkeypatch, ["\x1b"])
+        assert not cli.is_zoomed
+
+
+class _PtyStdin:
+    """Stand-in for ``sys.stdin`` backed by the slave end of a pty.
+
+    Only the two methods the reader calls are needed: it asks for the file
+    descriptor and whether it is a terminal, and does everything else itself.
+    """
+
+    def __init__(self, fd):
+        self._fd = fd
+
+    def fileno(self):
+        """Return the file descriptor the reader should read from."""
+        return self._fd
+
+    def isatty(self):
+        """Report a terminal, which a pty slave genuinely is."""
+        return True
+
+
+@pytest.mark.skipif(termios is None, reason="POSIX terminal handling only")
+class TestKeyReader:
+    """What :func:`sys_stats.cli.read_key` makes of the bytes a terminal sends.
+
+    Driven through a real pty, because the whole point of the function is what
+    it does with the *timing* of those bytes, which no scripted fake can
+    reproduce: a lone Esc is the same first byte as an arrow key and is only
+    told apart by nothing following it.
+    """
+
+    @pytest.fixture
+    def terminal(self, monkeypatch):
+        """Give the reader a pty to read from, and its writing end to a test.
+
+        The slave end is put in raw mode because that is the state
+        :func:`sys_stats.cli.raw_terminal` leaves the real one in; a canonical
+        pty would deliver nothing until a newline.
+        """
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        monkeypatch.setattr(sys, "stdin", _PtyStdin(slave))
+        monkeypatch.setattr(cli, "pending_byte", None)
+        try:
+            yield master
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_a_lone_escape_comes_back_on_its_own(self, terminal):
+        """The defect this reader exists for: Esc used to need a second key."""
+        os.write(terminal, b"\x1b")
+
+        assert cli.read_key(timeout=1) == "\x1b"
+
+    @pytest.mark.parametrize(
+        "sequence",
+        [
+            "\x1b[A",
+            "\x1b[B",
+            "\x1b[Z",
+            "\x1b[5~",
+            "\x1b[6~",
+            "\x1b[4~",
+            "\x1b[H",
+            "\x1b[F",
+            "\x1bOF",
+            "\x1bOH",
+            "\x1b[1;5A",
+        ],
+    )
+    def test_an_escape_sequence_comes_back_whole(self, terminal, sequence):
+        """Shift+Tab, the arrows and the page keys must survive the timeout.
+
+        They all start with the same byte as Esc, so mistaking one for the
+        other would kill the very keys the timeout is meant to preserve.
+        """
+        os.write(terminal, sequence.encode("ascii"))
+
+        assert cli.read_key(timeout=1) == sequence
+
+    def test_an_escape_does_not_swallow_the_key_after_it(self, terminal):
+        """Even glued together, which is the worst case a terminal can send."""
+        os.write(terminal, b"\x1b3")
+
+        assert cli.read_key(timeout=1) == "\x1b"
+        assert cli.read_key(timeout=1) == "3"
+
+    def test_two_escapes_in_a_row_are_two_key_presses(self, terminal):
+        """The leftover byte is an escape itself here, and starts over."""
+        os.write(terminal, b"\x1b\x1b")
+
+        assert cli.read_key(timeout=1) == "\x1b"
+        assert cli.read_key(timeout=1) == "\x1b"
+
+    def test_a_plain_key_comes_back_as_itself(self, terminal):
+        """Nothing about the escape handling may get in an ordinary key's way."""
+        os.write(terminal, b"qh+")
+
+        assert [cli.read_key(timeout=1) for _ in range(3)] == ["q", "h", "+"]
+
+    def test_a_key_outside_ascii_is_reassembled(self, terminal):
+        """Read a byte at a time, a multi-byte character arrives in pieces."""
+        os.write(terminal, "é".encode())
+
+        assert cli.read_key(timeout=1) == "é"
+
+    def test_an_idle_read_gives_the_listener_thread_a_way_out(self, terminal):
+        """Which is what lets the thread notice the exit event and stop."""
+        assert cli.read_key(timeout=0.01) is None
+
+    def test_the_raw_mode_is_put_back_exactly_as_it_was(self, monkeypatch):
+        """A dashboard that exits leaving the terminal deaf is a bug of its own."""
+        master, slave = os.openpty()
+        try:
+            monkeypatch.setattr(sys, "stdin", _PtyStdin(slave))
+            before = termios.tcgetattr(slave)
+            assert before[3] & termios.ICANON
+
+            with cli.raw_terminal() as fd:
+                assert fd == slave
+                during = termios.tcgetattr(slave)
+                assert not during[3] & termios.ICANON
+                assert not during[3] & termios.ECHO
+
+            restored = termios.tcgetattr(slave)
+            # ``PENDIN`` is a status bit the kernel raises by itself when a
+            # ``tcsetattr`` lands on input that has not been read yet, so the
+            # local flags are compared without it.
+            assert restored[3] & ~termios.PENDIN == before[3] & ~termios.PENDIN
+            assert restored[:3] == before[:3]
+            assert restored[4:] == before[4:]
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_a_terminal_that_is_not_one_is_left_alone(self, monkeypatch):
+        """Under pytest, and behind a pipe, there is nothing to configure."""
+        monkeypatch.setattr(sys, "stdin", io.StringIO())
+
+        with cli.raw_terminal() as fd:
+            assert fd is None
 
 
 class _FakeLive:
@@ -1842,6 +2342,7 @@ class _MainHarness:
         cli.rebuild_layout_event.clear()
         cli.show_help_flag = False
         cli.is_paused = False
+        cli.is_zoomed = False
         cli.latest_stats = None
         try:
             cli.main()
@@ -1850,11 +2351,13 @@ class _MainHarness:
             cli.rebuild_layout_event.clear()
             cli.show_help_flag = False
             cli.is_paused = False
+            cli.is_zoomed = False
             cli.latest_stats = None
             cli.scroll_offsets.clear()
             cli.panel_row_counts.clear()
             cli.panel_page_sizes.clear()
-            cli.scrollable_panel_keys[:] = []
+            cli.panel_keys[:] = []
+            cli.panel_renderables.clear()
             cli.focused_panel = None
 
         assert len(self.live_instances) == 1
@@ -1933,7 +2436,7 @@ class TestMainLoop:
         live = _MainHarness(monkeypatch, on_sleep).run()
 
         assert live.updates == []
-        assert len(live.initial_renderable.children) == 2
+        assert len(live.initial_renderable["body"].children) == 2
 
     def test_a_terminal_resized_past_the_threshold_gets_the_wide_layout(self, monkeypatch):
         """Regression risk: a rebuilt layout that never reaches the screen.
@@ -1956,7 +2459,7 @@ class TestMainLoop:
         assert live.updates, "the wide layout was never pushed through Live"
         assert live.updates[-1] is not live.initial_renderable
         # Three columns: one card means no separate GPU detail panel.
-        assert len(live.updates[-1].children) == 3
+        assert len(live.updates[-1]["body"].children) == 3
 
     def test_pausing_during_the_fetch_stops_the_next_request(self, monkeypatch):
         """The same staleness used to keep a paused dashboard fetching once more."""
