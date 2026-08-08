@@ -10,11 +10,12 @@ Rich tells them how wide they are, so a panel's table is obtained through
 ``panel.renderable.build(width)`` (see :class:`sys_stats.cli.AdaptiveRenderable`).
 """
 
+import functools
 import io
 import sys
 
 import pytest
-from rich.console import Console, Group
+from rich.console import Console
 from rich.table import Table
 
 from sys_stats import cli
@@ -42,6 +43,17 @@ from sys_stats.cli import (
 # anything usable and 260 is wider than an ultrawide terminal, so the range
 # brackets reality on both sides.
 SWEEP_WIDTHS = range(60, 261)
+
+# The two dimensional sweep is sampled rather than exhaustive: the full cross
+# product is 201 widths x 41 heights x 5 payloads, which is over forty thousand
+# full dashboard renders and minutes of wall clock. Widths are sampled every 10
+# columns and heights every 4 lines, for 21 x 11 = 231 renders per payload.
+# Sampling is safe on the width axis because the one dimensional sweep above
+# still walks every single column; on the height axis because a panel's height
+# only ever changes by whole rows, so four lines cannot hide a transition that
+# the neighbouring samples do not also show.
+SWEEP_LAYOUT_WIDTHS = range(60, 261, 10)
+SWEEP_LAYOUT_HEIGHTS = range(20, 61, 4)
 
 # Openers and their closers, for the box-integrity check below. A table that
 # overflows the panel it lives in keeps the character that starts its border
@@ -175,6 +187,38 @@ def _stats(gpu_count: int) -> dict:
         "top_gpu_processes": _gpu_processes() if gpu_count else [],
         "ollama_processes": {"models": _ollama_models()},
     }
+
+
+def _busy_stats(gpu_count: int) -> dict:
+    """A ``/stats`` payload from a host with more rows than any screen holds.
+
+    Eight loaded models and eight compute apps is what a saturated inference
+    box actually looks like, and it is the payload that used to push the
+    stacked left column past its half of the screen.
+    """
+    data = _stats(gpu_count)
+    models = _ollama_models()
+    data["ollama_processes"]["models"] = models + [
+        dict(model, name=f"{model['name']}-b") for model in models
+    ]
+    processes = _gpu_processes()
+    data["top_gpu_processes"] = processes + [
+        dict(proc, pid=proc["pid"] + 1) for proc in processes
+    ]
+    return data
+
+
+def _expected_panel_count(data: dict) -> int:
+    """Number of panels the assembled dashboard must draw for a payload.
+
+    Ollama, GPU Processes, Top CPU, Top Memory and the summary are always
+    there; the GPU Detail panel only exists once there is more than one card
+    to detail. A render holding fewer boxes than this has lost a panel
+    outright, which is what vertical clipping does before it ever gets around
+    to cutting a border in half.
+    """
+    gpus = data.get("gpu") or []
+    return 6 if data.get("has_gpu") and len(gpus) > 1 else 5
 
 
 def _render(renderable, width: int = 200, height: int = 50) -> str:
@@ -316,11 +360,17 @@ def _rendered_column(text: str, header: str) -> list:
     raise AssertionError(f"no rendered table carries a {header!r} column")
 
 
-def _render_layout(data: dict, width: int) -> str:
-    """Assemble the whole dashboard and render it at a given terminal width."""
-    layout = create_layout()
-    build_layout_content(layout, data, 5)
-    return _render(layout, width=width)
+def _render_layout(data: dict, width: int, height: int = 50) -> str:
+    """Assemble the whole dashboard and render it at a given terminal size.
+
+    Goes through :func:`~sys_stats.cli.layout_shape` rather than picking a
+    mode by hand, so what is rendered here is what ``main`` would put on the
+    screen for that payload at that width.
+    """
+    mode, multi_gpu = cli.layout_shape(data, width)
+    layout = create_layout(mode, multi_gpu)
+    build_layout_content(layout, data, 5, mode)
+    return _render(layout, width=width, height=height)
 
 
 # Every adaptive table of the dashboard, keyed by the panel it belongs to and
@@ -382,6 +432,13 @@ class TestAssembledLayoutFitsTheTerminal:
     def test_columns_only_ever_appear_as_the_terminal_widens(self, gpu_count):
         """A wider terminal must never show fewer columns than a narrower one.
 
+        Swept inside each layout mode rather than straight across both. At the
+        wide threshold the dashboard re-splits the screen into a different
+        number of columns, so a panel that had two thirds of the width can
+        come out of it with a quarter and legitimately drop a column. Within a
+        mode the panels only ever get wider, so their column sets only ever
+        grow.
+
         Three GPUs are left out: that is the one payload where the GPU Detail
         panel swaps its row-per-GPU table for side-by-side vertical ones as
         the terminal widens, and those have no headers at all, so the column
@@ -389,14 +446,19 @@ class TestAssembledLayoutFitsTheTerminal:
         cards cover every table without that mode switch.
         """
         data = _stats(gpu_count)
+        modes = (
+            range(SWEEP_WIDTHS.start, cli.WIDE_LAYOUT_MIN_WIDTH),
+            range(cli.WIDE_LAYOUT_MIN_WIDTH, SWEEP_WIDTHS.stop),
+        )
 
-        previous = set()
-        for width in SWEEP_WIDTHS:
-            headers = _header_cells(_render_layout(data, width))
-            assert previous <= headers, (
-                f"{gpu_count} GPU: {sorted(previous - headers)} disappeared at width {width}"
-            )
-            previous = headers
+        for widths in modes:
+            previous = set()
+            for width in widths:
+                headers = _header_cells(_render_layout(data, width))
+                assert previous <= headers, (
+                    f"{gpu_count} GPU: {sorted(previous - headers)} disappeared at width {width}"
+                )
+                previous = headers
 
     @pytest.mark.parametrize("gpu_count", [0, 1, 3, 5])
     def test_nothing_is_drawn_past_the_terminals_last_column(self, gpu_count):
@@ -406,6 +468,83 @@ class TestAssembledLayoutFitsTheTerminal:
         for width in SWEEP_WIDTHS:
             rendered = _render_layout(data, width)
             assert all(len(line) <= width for line in rendered.splitlines())
+
+
+SWEEP_PAYLOADS = {
+    "0-gpu": lambda: _stats(0),
+    "1-gpu": lambda: _stats(1),
+    "3-gpu": lambda: _stats(3),
+    "5-gpu": lambda: _stats(5),
+    "busy-3-gpu": lambda: _busy_stats(3),
+}
+
+
+@functools.cache
+def _sweep_payload(payload_id: str) -> dict:
+    """Build a sweep payload once and share it across the tests."""
+    return SWEEP_PAYLOADS[payload_id]()
+
+
+@functools.cache
+def _sweep_render(payload_id: str, width: int, height: int) -> str:
+    """Render one sweep cell, remembering the result.
+
+    The sweep is a couple of thousand full dashboard renders and every test
+    below walks the same grid, so rendering each cell once instead of once per
+    test is the difference between a suite that is run and one that is not.
+    Nothing mutates the payloads, so the cached text stays true.
+    """
+    return _render_layout(_sweep_payload(payload_id), width, height)
+
+
+class TestAssembledLayoutFitsEveryTerminalSize:
+    """The dashboard is swept over both axes, not just the horizontal one.
+
+    Width alone was never the whole story: the layout used to split into two
+    rows of equal height whatever each row held, so a stacked column simply
+    ran past its half and Rich cropped it. Nothing raised, nothing was
+    logged, the panel just lost its bottom border and everything below it
+    disappeared. These sweep the assembled dashboard over the sampled sizes
+    of :data:`SWEEP_LAYOUT_WIDTHS` x :data:`SWEEP_LAYOUT_HEIGHTS`.
+    """
+
+    @pytest.mark.parametrize("payload_id", SWEEP_PAYLOADS)
+    def test_every_panel_is_drawn_whole_at_every_terminal_size(self, payload_id):
+        """Regression: a stacked region overflowed its row and got cropped.
+
+        On the fixed 1:1 split, three GPUs at 240 columns lost a panel's
+        bottom border at heights 24, 30 and 36, and the busy payload lost one
+        at every height up to 50. Two things are asserted, because a crop can
+        take either shape: an opened box with no closing one (the panel was
+        cut through the middle) and a box count below the number of panels
+        the payload calls for (the panel was cut away entirely).
+        """
+        expected = _expected_panel_count(_sweep_payload(payload_id))
+
+        offenders = []
+        for width in SWEEP_LAYOUT_WIDTHS:
+            for height in SWEEP_LAYOUT_HEIGHTS:
+                text = _sweep_render(payload_id, width, height)
+                opened, closed = text.count("╭"), text.count("╰")
+                if opened != closed or opened != expected:
+                    offenders.append(
+                        f"{width}x{height}: {opened} opened, {closed} closed, "
+                        f"{expected} panels expected"
+                    )
+                elif _clipped_lines(text):
+                    offenders.append(f"{width}x{height}: {_clipped_lines(text)[0]!r}")
+
+        assert not offenders, "\n".join(offenders[:20])
+
+    @pytest.mark.parametrize("payload_id", SWEEP_PAYLOADS)
+    def test_nothing_is_drawn_past_the_last_row_or_column(self, payload_id):
+        """Rich pads to the console size; anything beyond it is a broken render."""
+        for width in SWEEP_LAYOUT_WIDTHS:
+            for height in SWEEP_LAYOUT_HEIGHTS:
+                lines = _sweep_render(payload_id, width, height).splitlines()
+
+                assert len(lines) <= height, f"{width}x{height}: {len(lines)} lines"
+                assert all(len(line) <= width for line in lines), f"{width}x{height}"
 
 
 class TestAdaptiveColumnFitting:
@@ -943,29 +1082,43 @@ class TestGpuProcessesPanelColumns:
         assert all(len(line) <= 36 for line in text.splitlines())
 
 
+def _plain_title(title) -> str:
+    """Strip the cyan/bold markup wrapping a plain panel's title."""
+    text = str(title)
+    return text.removeprefix("[bold cyan]").removesuffix("[/bold cyan]")
+
+
+def _titles(region) -> list:
+    """Return the title of every panel stacked in a layout region."""
+    titles = []
+    for panel in region.renderable.panels:
+        if hasattr(panel, "panels"):
+            titles.extend(_plain_title(inner.title) for inner in panel.panels)
+        else:
+            titles.append(_plain_title(panel.title))
+    return titles
+
+
 class TestBuildLayoutContent:
-    def test_mono_gpu_keeps_the_summary_bottom_right(self):
-        """One card: Ollama top left, GPU processes bottom left, summary bottom right."""
+    def test_mono_gpu_keeps_the_summary_in_the_right_column(self):
+        """One card: the VRAM panels on the left, rankings and summary right."""
         layout = create_layout()
 
         build_layout_content(layout, _stats(1), 5)
 
-        assert "Ollama" in str(layout["top_left"].renderable.title)
-        assert "GPU Processes" in str(layout["bottom_left"].renderable.title)
-        assert "Refresh rate" in str(layout["bottom_right"].renderable.subtitle)
+        assert _titles(layout["narrow_left"]) == ["Ollama Statistics", "GPU Processes"]
+        assert _titles(layout["narrow_right"])[:2] == ["Top CPU", "Top Memory"]
+        assert "Refresh rate" in str(layout["narrow_right"].renderable.panels[-1].subtitle)
 
     def test_multi_gpu_stacks_ollama_with_the_gpu_processes(self):
-        """Two cards: the left column carries both VRAM panels, detail goes bottom right."""
+        """Two cards: the left column carries both VRAM panels and the totals."""
         layout = create_layout()
 
         build_layout_content(layout, _stats(2), 5)
 
-        top_left = layout["top_left"].renderable
-        assert isinstance(top_left, Group)
-        assert "Ollama" in str(top_left.renderables[0].title)
-        assert "GPU Processes" in str(top_left.renderables[1].title)
-        assert "Refresh rate" in str(layout["bottom_left"].renderable.subtitle)
-        assert "GPU Detail" in str(layout["bottom_right"].renderable.title)
+        assert _titles(layout["narrow_left"])[:2] == ["Ollama Statistics", "GPU Processes"]
+        assert "Refresh rate" in str(layout["narrow_left"].renderable.panels[-1].subtitle)
+        assert _titles(layout["narrow_right"])[-1] == "GPU Detail"
 
     def test_multi_gpu_summary_is_the_cumulated_one(self):
         """Regression: the multi-GPU layout must ask for totals, not for the
@@ -973,24 +1126,24 @@ class TestBuildLayoutContent:
         layout = create_layout()
 
         build_layout_content(layout, _stats(2), 5)
-        text = _render(layout["bottom_left"].renderable)
+        text = _render(layout["narrow_left"].renderable.panels[-1])
 
         assert "GPU Totals" in text
         assert "(mean)" in text
         assert "RTX 3090" not in text
 
     def test_the_ratios_flip_between_modes(self):
-        """Multi-GPU widens the left column and the detail region."""
+        """Multi-GPU widens the left column, which then carries three panels."""
         layout = create_layout()
 
         build_layout_content(layout, _stats(1), 5)
-        mono = [layout[name].ratio for name in ("top_left", "top_right", "bottom_right")]
+        mono = [layout[name].ratio for name in ("narrow_left", "narrow_right")]
 
         build_layout_content(layout, _stats(2), 5)
-        multi = [layout[name].ratio for name in ("top_left", "top_right", "bottom_right")]
+        multi = [layout[name].ratio for name in ("narrow_left", "narrow_right")]
 
-        assert mono == [1, 2, 1]
-        assert multi == [2, 3, 2]
+        assert mono == [1, 2]
+        assert multi == [2, 3]
 
     def test_a_gpu_less_host_uses_the_mono_routing(self):
         """No GPU must never trigger the multi-GPU layout."""
@@ -998,8 +1151,51 @@ class TestBuildLayoutContent:
 
         build_layout_content(layout, _stats(0), 5)
 
-        assert "Ollama" in str(layout["top_left"].renderable.title)
-        assert layout["top_left"].ratio == 1
+        assert _titles(layout["narrow_left"]) == ["Ollama Statistics", "GPU Processes"]
+        assert layout["narrow_left"].ratio == 1
+
+
+class TestLayoutModes:
+    """Which structure the dashboard picks, and that neither leaves a gap."""
+
+    @pytest.mark.parametrize("width", [60, 120, 199])
+    def test_a_narrow_terminal_gets_the_two_column_grid(self, width):
+        """Below the threshold four columns would starve every table."""
+        assert cli.layout_mode_for_width(width) == cli.LAYOUT_MODE_NARROW
+        assert cli.layout_shape(_stats(3), width)[0] == cli.LAYOUT_MODE_NARROW
+
+    @pytest.mark.parametrize("width", [200, 240, 260])
+    def test_a_wide_terminal_gets_the_single_row_of_columns(self, width):
+        """The threshold is inclusive: 200 columns is already wide."""
+        assert cli.layout_mode_for_width(width) == cli.LAYOUT_MODE_WIDE
+        assert cli.layout_shape(_stats(3), width)[0] == cli.LAYOUT_MODE_WIDE
+
+    def test_the_wide_layout_drops_to_three_columns_without_a_second_card(self):
+        """Regression risk: a fourth column with nothing to put in it.
+
+        With one card the per-GPU table lives inside the summary, so there is
+        no GPU Detail panel to fill a fourth column with.
+        """
+        mono = create_layout(cli.LAYOUT_MODE_WIDE, multi_gpu=False)
+        multi = create_layout(cli.LAYOUT_MODE_WIDE, multi_gpu=True)
+
+        assert len(mono.children) == 3
+        assert len(multi.children) == 4
+
+    @pytest.mark.parametrize("gpu_count", [0, 1, 3])
+    @pytest.mark.parametrize("width", [120, 240])
+    def test_no_region_is_ever_left_empty(self, gpu_count, width):
+        """Every region of both layouts is filled, in every GPU configuration."""
+        data = _stats(gpu_count)
+        mode, multi_gpu = cli.layout_shape(data, width)
+        layout = create_layout(mode, multi_gpu)
+
+        build_layout_content(layout, data, 5, mode)
+
+        for region in layout.children:
+            assert isinstance(region.renderable, cli.StackedPanels)
+            assert region.renderable.panels
+            assert _render(region.renderable, width=width // len(layout.children)).strip()
 
 
 class TestGpuColumnReachesTheScreen:
@@ -1041,19 +1237,21 @@ class TestGpuColumnReachesTheScreen:
     def test_a_multi_gpu_dashboard_draws_the_index_of_every_process(self):
         """Regression: the column has to survive the trip through the layout.
 
-        Three cards at 200 columns keep the GPU Detail panel on its
-        headerless side-by-side rendering, and no Ollama process means no
-        ``GPU`` column in the Ollama table, so the only one left on screen is
-        the one under test.
+        Three cards at 190 columns keep the dashboard in its narrow mode,
+        where the GPU Detail panel is wide enough for its headerless
+        side-by-side rendering, and no Ollama process means no ``GPU`` column
+        in the Ollama table, so the only one left on screen is the one under
+        test. A wider terminal would give the detail panel a column of its own
+        and a ``GPU`` header to go with it.
         """
-        text = _render_layout(self._data(3), 200)
+        text = _render_layout(self._data(3), 190)
 
         assert "GPU" in _header_cells(text)
         assert _rendered_column(text, "GPU") == ["0", "2", "1", "?"]
 
     def test_a_mono_gpu_dashboard_draws_no_index_at_all(self):
         """One card means the column would only repeat ``0`` on every row."""
-        text = _render_layout(self._data(1), 200)
+        text = _render_layout(self._data(1), 190)
 
         assert "GPU" not in _header_cells(text)
         # The placeholder for an unresolved index exists nowhere else.
@@ -1102,16 +1300,25 @@ class _MainHarness:
         "ollama_processes": {"models": []},
     }
 
-    def __init__(self, monkeypatch, on_sleep, on_fetch=None):
+    def __init__(self, monkeypatch, on_sleep, on_fetch=None, width=100):
         self.live_instances = []
         self.monkeypatch = monkeypatch
         self.on_sleep = on_sleep
         self.on_fetch = on_fetch
+        self.width = width
 
     def _fetch(self, _url):
         if self.on_fetch is not None:
             self.on_fetch()
         return self.STATS
+
+    def _terminal_width(self):
+        """Stand in for the real console, which pytest does not give us.
+
+        Accepts a callable so a test can resize the terminal between two
+        iterations of the loop.
+        """
+        return self.width() if callable(self.width) else self.width
 
     def run(self):
         """Reset the module globals, run ``main``, and return the fake ``Live``."""
@@ -1123,6 +1330,7 @@ class _MainHarness:
         self.monkeypatch.setattr(cli, "Live", live_factory)
         self.monkeypatch.setattr(cli, "keyboard_listener", lambda: None)
         self.monkeypatch.setattr(cli, "fetch_stats", self._fetch)
+        self.monkeypatch.setattr(cli, "terminal_width", self._terminal_width)
         self.monkeypatch.setattr(cli.time, "sleep", self.on_sleep)
         self.monkeypatch.setattr(
             sys, "argv", ["sys-stats", "--url", "http://example.invalid/stats", "--interval", "1"]
@@ -1205,6 +1413,43 @@ class TestMainLoop:
 
         assert live.updates, "the help screen was not shown on the iteration that fetched"
         assert live.updates[0] is not live.initial_renderable
+
+    def test_a_stable_terminal_never_rebuilds_the_layout(self, monkeypatch):
+        """The ``Layout`` object is expensive to re-split and never has to be.
+
+        Everything that varies with the data is decided inside the regions, so
+        as long as the shape holds the very same object keeps being rendered.
+        """
+        def on_sleep(_seconds):
+            cli.exit_event.set()
+
+        live = _MainHarness(monkeypatch, on_sleep).run()
+
+        assert live.updates == []
+        assert len(live.initial_renderable.children) == 2
+
+    def test_a_terminal_resized_past_the_threshold_gets_the_wide_layout(self, monkeypatch):
+        """Regression risk: a rebuilt layout that never reaches the screen.
+
+        ``Live`` renders the object it was handed, so a new ``Layout`` is
+        invisible until it is pushed through ``live.update``, exactly as the
+        help screen is.
+        """
+        width = [100]
+
+        def on_sleep(_seconds):
+            if width[0] == 100:
+                width[0] = 240
+                cli.rebuild_layout_event.set()
+            else:
+                cli.exit_event.set()
+
+        live = _MainHarness(monkeypatch, on_sleep, width=lambda: width[0]).run()
+
+        assert live.updates, "the wide layout was never pushed through Live"
+        assert live.updates[-1] is not live.initial_renderable
+        # Three columns: one card means no separate GPU detail panel.
+        assert len(live.updates[-1].children) == 3
 
     def test_pausing_during_the_fetch_stops_the_next_request(self, monkeypatch):
         """The same staleness used to keep a paused dashboard fetching once more."""

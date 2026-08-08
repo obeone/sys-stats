@@ -15,6 +15,7 @@ from rich.layout import Layout
 from rich.live import Live
 from rich.measure import Measurement
 from rich.panel import Panel
+from rich.segment import Segment
 from rich.table import Table
 
 # Default API URL
@@ -101,16 +102,38 @@ PROCESS_TABLE_COLUMN_PRIORITIES = {
 # VRAM stands out among the other compute apps.
 OLLAMA_ROW_STYLE = "bold magenta"
 
-# Width handed to the measurement console below. It only has to be larger
-# than any table this dashboard can produce: Rich clamps a measurement to the
-# width it is measured against, and a clamped measurement would report every
-# table as fitting.
+# Shortest a panel is squeezed to before it is dropped from its column: two
+# borders, a header, its rule and one row. Below this a panel would either be
+# unreadable or cut through the middle, so :func:`distribute_heights` drops it
+# outright instead.
+MIN_PLAIN_PANEL_HEIGHT = 3
+
+# Terminal width from which the dashboard lays its panels out in a single row
+# of columns rather than in a 2x2 grid. Below it, four columns would leave
+# every table too narrow to keep more than a couple of its own.
+WIDE_LAYOUT_MIN_WIDTH = 200
+LAYOUT_MODE_WIDE = "wide"
+LAYOUT_MODE_NARROW = "narrow"
+
+# Width and height handed to the measurement console below. They only have to
+# be larger than anything this dashboard can produce: Rich clamps a measurement
+# to the size it is measured against, and a clamped measurement would report
+# every table as fitting.
 MEASUREMENT_WIDTH = 10_000
+MEASUREMENT_HEIGHT = 10_000
 
 # Console used solely to measure candidate tables before rendering them. It
 # writes into a buffer nobody reads: what is wanted is Rich's own column
 # arithmetic, which needs a console to resolve styles and character widths.
-_measurement_console = Console(file=io.StringIO(), width=MEASUREMENT_WIDTH, legacy_windows=False)
+# The height matters as much as the width: ``ConsoleOptions.update`` leaves
+# ``max_height`` alone when the height is cleared, so a console sized to a real
+# terminal would silently cap every height measurement at 25 lines.
+_measurement_console = Console(
+    file=io.StringIO(),
+    width=MEASUREMENT_WIDTH,
+    height=MEASUREMENT_HEIGHT,
+    legacy_windows=False,
+)
 
 
 def fetch_stats(api_url):
@@ -280,6 +303,33 @@ def measure_table_width(table):
     return Measurement.get(_measurement_console, options, table).maximum
 
 
+def measure_render_height(renderable, width):
+    """Return the number of lines a renderable draws at a given width.
+
+    The vertical counterpart of :func:`measure_table_width`, and the reason
+    the layout can size a row to its content instead of splitting the screen
+    down the middle. :class:`~rich.measure.Measurement` only ever speaks about
+    widths, so the honest way to learn a height is to render the thing and
+    count the lines it produced. Clearing the height keeps Rich from padding
+    or cropping the result to a screen it is not going to.
+
+    Parameters
+    ----------
+    renderable : rich.console.RenderableType
+        Anything Rich can draw.
+    width : int
+        Width in columns the renderable is measured against. Heights depend on
+        widths, so this has to be the width the caller will really give it.
+
+    Returns
+    -------
+    int
+        Number of lines the renderable occupies.
+    """
+    options = _measurement_console.options.update(width=max(1, width), height=None)
+    return len(_measurement_console.render_lines(renderable, options, pad=False))
+
+
 def assemble_table(columns, widths, row_styles=None, total_width=None):
     """Build a table whose columns all have a fixed width.
 
@@ -389,41 +439,302 @@ def build_adaptive_table(columns, available_width, priorities, row_styles=None):
     return assemble_table(kept, widths, row_styles, total_width=available_width)
 
 
-def create_layout():
-    """Create the static 2x2 grid backing the dashboard.
+class FixedHeight:
+    """Renders a renderable into an exact number of lines.
 
-    The four regions are named by position rather than by content: which panel
-    lands where depends on the number of GPUs, and is decided at render time by
-    :func:`build_layout_content`. The structure itself never changes, so the
-    ``Live`` loop keeps rendering the very same ``Layout`` object and never has
-    to re-split it.
+    The vertical half of the contract :class:`StackedPanels` relies on: Rich
+    pads or crops the wrapped renderable to :attr:`height`, so whatever it
+    does with the room it is handed, the stack still occupies the number of
+    lines it was allocated and the panel underneath starts where it should.
+    Panels honour ``options.height`` themselves, drawing both borders and
+    fitting their content in between, so nothing here ever cuts a box in half.
+
+    Parameters
+    ----------
+    renderable : rich.console.RenderableType
+        What to draw.
+    height : int
+        Exact number of lines to occupy.
+    """
+
+    def __init__(self, renderable, height):
+        self.renderable = renderable
+        self.height = height
+
+    def __rich_console__(self, console, options):
+        """Yield exactly :attr:`height` lines of the wrapped renderable."""
+        lines = console.render_lines(
+            self.renderable, options.update_height(self.height), pad=True
+        )
+        for line in lines:
+            yield from line
+            yield Segment.line()
+
+
+def panel_natural_height(renderable, width):
+    """Height a stacked panel takes when nothing constrains it.
+
+    Panels that size themselves answer for themselves; anything else is
+    measured by rendering it (see :func:`measure_render_height`).
+    """
+    if hasattr(renderable, "natural_height"):
+        return renderable.natural_height(width)
+    return measure_render_height(renderable, width)
+
+
+def panel_minimum_height(renderable):
+    """Shortest a stacked panel may be squeezed to before it is dropped."""
+    if hasattr(renderable, "minimum_height"):
+        return renderable.minimum_height()
+    return MIN_PLAIN_PANEL_HEIGHT
+
+
+def distribute_heights(naturals, minimums, available):
+    """Share the lines of a column between the panels stacked in it.
+
+    Parameters
+    ----------
+    naturals : list of int
+        Height each panel would take unconstrained.
+    minimums : list of int
+        Height below which each panel is not worth drawing.
+    available : int
+        Lines the column has.
+
+    Returns
+    -------
+    list of int
+        One height per panel, summing to ``available`` whenever the panels fit
+        and never exceeding it. Shorter than ``naturals`` when the column is
+        too short to hold every panel, the trailing ones being dropped.
+    """
+    if not naturals:
+        return []
+
+    sizes = list(naturals)
+    total = sum(sizes)
+    if total <= available:
+        # The slack goes to the last panel, so the column ends flush with the
+        # bottom of the screen instead of trailing off into a gap.
+        sizes[-1] += available - total
+        return sizes
+
+    # Over-subscribed. Lines are taken back from whichever panel has the most
+    # room above its own minimum, so the crowded panels give way before the
+    # ones already down to a header and a row.
+    while total > available:
+        index = max(range(len(sizes)), key=lambda position: sizes[position] - minimums[position])
+        if sizes[index] <= minimums[index]:
+            break
+        sizes[index] -= 1
+        total -= 1
+
+    # Not even the minimums fit: a terminal this short drops the trailing
+    # panels rather than draw a column of half-boxes.
+    while total > available and len(sizes) > 1:
+        total -= sizes.pop()
+    if total > available:
+        sizes[0] = max(0, available)
+    return sizes
+
+
+class StackedPanels:
+    """Stacks panels in one layout region, each at the height it needs.
+
+    This is what replaced the fixed 1:1 row split. A region used to be handed
+    a :class:`~rich.console.Group` of panels, and Rich passed the region's
+    full height to every one of them: two panels each drew a region's worth of
+    lines, the second half of the result fell off the bottom, and the panel it
+    was cut through lost its closing border with nothing raised and nothing
+    logged. Here every panel is measured first and then pinned to the height
+    it was allocated, so the stack always occupies exactly its region.
+
+    Parameters
+    ----------
+    *panels : rich.console.RenderableType
+        The panels to stack, top to bottom.
+    """
+
+    def __init__(self, *panels):
+        self.panels = tuple(panels)
+
+    def natural_height(self, width):
+        """Combined height of the stacked panels, unconstrained."""
+        return sum(panel_natural_height(panel, width) for panel in self.panels)
+
+    def minimum_height(self):
+        """Combined height below which panels start being dropped."""
+        return sum(panel_minimum_height(panel) for panel in self.panels)
+
+    def __rich_console__(self, console, options):
+        """Allocate the region's lines and render each panel into its share."""
+        width = options.max_width
+        height = options.height if options.height is not None else options.max_height
+        naturals = [panel_natural_height(panel, width) for panel in self.panels]
+        # A minimum above the natural height would inflate a panel that has
+        # nothing to show, so it is capped by what the panel actually needs.
+        minimums = [
+            min(panel_minimum_height(panel), natural)
+            for panel, natural in zip(self.panels, naturals, strict=True)
+        ]
+        sizes = distribute_heights(naturals, minimums, height)
+        yield Group(*[
+            FixedHeight(panel, size)
+            for panel, size in zip(self.panels, sizes, strict=False)
+            if size > 0
+        ])
+
+
+class SideBySidePanels:
+    """Renders panels next to each other, all at the height of the row.
+
+    A :class:`~rich.table.Table` grid would do the horizontal split just as
+    well, but it renders each cell at that cell's own natural height and then
+    pads the row to the tallest, which puts the shorter panel's border in the
+    wrong place and lets the taller one be cropped by whatever sits above.
+    Here both panels are handed the same height, and they honour it.
+
+    Parameters
+    ----------
+    *panels : rich.console.RenderableType
+        The panels to lay out, left to right.
+    """
+
+    def __init__(self, *panels):
+        self.panels = tuple(panels)
+
+    def _widths(self, width):
+        """Split a width into equal shares, the remainder going leftwards."""
+        count = len(self.panels)
+        base, extra = divmod(max(width, count), count)
+        return [base + (1 if index < extra else 0) for index in range(count)]
+
+    def natural_height(self, width):
+        """Height of the tallest panel, which is what the row needs."""
+        return max(
+            panel_natural_height(panel, share)
+            for panel, share in zip(self.panels, self._widths(width), strict=True)
+        )
+
+    def minimum_height(self):
+        """Height of the most demanding panel of the row."""
+        return max(panel_minimum_height(panel) for panel in self.panels)
+
+    def __rich_console__(self, console, options):
+        """Render every panel at the row's height and stitch the lines."""
+        widths = self._widths(options.max_width)
+        columns = [
+            console.render_lines(
+                panel, options.update(width=share, height=options.height), pad=True
+            )
+            for panel, share in zip(self.panels, widths, strict=True)
+        ]
+        # Only equal when Rich constrained the height; unconstrained, the
+        # shorter panels are padded with blanks so the row stays rectangular.
+        line_count = max(len(column) for column in columns)
+        for index in range(line_count):
+            for column, share in zip(columns, widths, strict=True):
+                yield from column[index] if index < len(column) else [Segment(" " * share)]
+            yield Segment.line()
+
+
+def layout_mode_for_width(width):
+    """Pick the layout mode a terminal of a given width calls for.
+
+    Parameters
+    ----------
+    width : int
+        Terminal width in columns.
+
+    Returns
+    -------
+    str
+        :data:`LAYOUT_MODE_WIDE` from :data:`WIDE_LAYOUT_MIN_WIDTH` columns on,
+        :data:`LAYOUT_MODE_NARROW` below it.
+    """
+    return LAYOUT_MODE_WIDE if width >= WIDE_LAYOUT_MIN_WIDTH else LAYOUT_MODE_NARROW
+
+
+def layout_shape(data, width):
+    """Return the structure the dashboard needs for a payload and a width.
+
+    The two things the ``Layout`` object itself depends on, and the only two
+    the main loop has to compare before deciding to rebuild it. Everything
+    else, including which panel goes where and how wide each column is, is
+    settled at render time.
+
+    Parameters
+    ----------
+    data : dict or None
+        The ``/stats`` payload, or ``None`` before the first successful fetch.
+    width : int
+        Terminal width in columns.
+
+    Returns
+    -------
+    tuple of (str, bool)
+        The layout mode and whether there is more than one GPU to detail.
+    """
+    payload = data or {}
+    gpus = payload.get("gpu") or []
+    return layout_mode_for_width(width), bool(payload.get("has_gpu")) and len(gpus) > 1
+
+
+def terminal_width():
+    """Return the width of the terminal the dashboard draws into.
+
+    Split out so the main loop reads the real console instead of guessing, and
+    so the layout mode can be driven from a test without a terminal. This is
+    the one width the dashboard is allowed to look up rather than measure: it
+    selects the *structure*, which has to exist before Rich can measure
+    anything inside it. Every panel still sizes itself from the room it is
+    actually given.
+    """
+    return console.size.width
+
+
+def create_layout(mode=LAYOUT_MODE_NARROW, multi_gpu=False):
+    """Create the region tree backing the dashboard, for one layout shape.
+
+    Two shapes exist. The narrow one is the 2x2 grid the dashboard has always
+    had, split into columns rather than rows so that each column can size its
+    own panels to their content; the wide one lays every panel out in a single
+    row of columns, which is what an ultrawide terminal has the room for.
+
+    In both cases the regions only carry the horizontal split. The vertical
+    one lives inside :class:`StackedPanels`, which is the only place that
+    knows how tall each panel's content actually is.
+
+    Parameters
+    ----------
+    mode : str, optional
+        :data:`LAYOUT_MODE_NARROW` or :data:`LAYOUT_MODE_WIDE`.
+    multi_gpu : bool, optional
+        Whether there is more than one GPU. Only the wide layout cares: with a
+        single card there is no separate GPU detail panel, since the per-GPU
+        table lives inside the summary, so the fourth column would be empty
+        and the layout drops to three.
 
     Returns
     -------
     rich.layout.Layout
-        Root layout holding ``top_left``, ``top_right``, ``bottom_left`` and
-        ``bottom_right`` regions.
+        Root layout. Region names are unique across the whole tree, because
+        Rich resolves ``layout["name"]`` by searching it.
     """
     layout = Layout()
 
-    # Two rows of equal height.
-    layout.split(
-        Layout(name="upper", ratio=1),
-        Layout(name="lower", ratio=1)
-    )
+    if mode == LAYOUT_MODE_WIDE:
+        names = ["wide_vram", "wide_processes", "wide_summary"]
+        if multi_gpu:
+            names.append("wide_gpu_detail")
+        layout.split_row(*[Layout(name=name, ratio=1) for name in names])
+        return layout
 
-    # Upper row: a narrow left column and a wider right one.
-    layout["upper"].split_row(
-        Layout(name="top_left", ratio=1),
-        Layout(name="top_right", ratio=2)
+    # Narrow: two columns, their ratio set per mode at render time.
+    layout.split_row(
+        Layout(name="narrow_left", ratio=1),
+        Layout(name="narrow_right", ratio=2),
     )
-
-    # Lower row: even split by default, adjusted per mode at render time.
-    layout["lower"].split_row(
-        Layout(name="bottom_left", ratio=1),
-        Layout(name="bottom_right", ratio=1)
-    )
-
     return layout
 
 
@@ -820,7 +1131,7 @@ def build_process_panel(processes, key, title):
 
 
 def build_processes_panel(data):
-    """Build the panel holding the Top CPU and Top Memory rankings.
+    """Build the pair of Top CPU and Top Memory rankings, side by side.
 
     Parameters
     ----------
@@ -829,21 +1140,16 @@ def build_processes_panel(data):
 
     Returns
     -------
-    rich.table.Table
-        A two-column grid with one panel per ranking. Each panel sizes its
-        own table from the half of the region Rich gives it, so neither has
-        to guess how the grid was split.
+    SideBySidePanels
+        The two ranking panels sharing a row. Each sizes its own table from
+        the half of the region Rich gives it, so neither has to guess how the
+        row was split, and both are rendered at the row's full height so
+        neither can be cut by the other.
     """
-    processes_table = Table.grid(expand=True)
-    processes_table.add_column()
-    processes_table.add_column()
-
-    processes_table.add_row(
+    return SideBySidePanels(
         build_process_panel(data.get('top_cpu', []), 'top_cpu', 'Top CPU'),
         build_process_panel(data.get('top_memory', []), 'top_memory', 'Top Memory'),
     )
-
-    return processes_table
 
 
 def build_gpu_processes_table(processes, multi_gpu, available_width):
@@ -1114,27 +1420,31 @@ def build_ollama_panel(data, gpu_processes=None):
     )
 
 
-def build_layout_content(layout, data, interval):
-    """Fill the four layout regions with the fetched data.
+def build_layout_content(layout, data, interval, mode=LAYOUT_MODE_NARROW):
+    """Fill the layout regions with the fetched data.
 
     The routing depends on the number of GPUs. With zero or one card the
-    per-GPU detail fits inside the summary panel, so the layout stays as it
-    always was. From two cards on, the detail moves to its own region, the GPU
-    processes join Ollama on the left (they describe the same VRAM), and the
-    summary keeps only cumulated figures.
+    per-GPU detail fits inside the summary panel, so there is no separate
+    detail panel at all. From two cards on, the detail gets its own region,
+    the GPU processes join Ollama in the same column (they describe the same
+    VRAM), and the summary keeps only cumulated figures.
 
-    No width is threaded through: every panel sizes itself from the room Rich
+    No size is threaded through: every panel sizes itself from the room Rich
     hands it at render time (see :class:`AdaptiveRenderable`), which is the
     only figure that accounts for the layout ratios *and* the panel chrome.
 
     Parameters
     ----------
     layout : rich.layout.Layout
-        The layout built by :func:`create_layout`; updated in place.
+        The layout built by :func:`create_layout`; updated in place. Its mode
+        must match ``mode``, which is what the main loop compares before
+        deciding to rebuild it.
     data : dict
         The ``/stats`` payload.
     interval : int
         Current refresh interval in seconds.
+    mode : str, optional
+        :data:`LAYOUT_MODE_NARROW` or :data:`LAYOUT_MODE_WIDE`.
 
     Returns
     -------
@@ -1146,27 +1456,33 @@ def build_layout_content(layout, data, interval):
     gpu_processes = data.get("top_gpu_processes") or []
     ollama_panel = build_ollama_panel(data, gpu_processes=gpu_processes)
     gpu_processes_panel = build_gpu_processes_panel(data, multi_gpu=multi_gpu)
+    # Built as a pair even in wide mode, where the two rankings are stacked
+    # rather than laid side by side: the panels themselves are the same
+    # objects either way, only the arrangement differs.
+    rankings = build_processes_panel(data)
+    summary_panel = build_summary(data, interval, multi_gpu=multi_gpu)
 
-    # Both modes keep the process rankings top right, they need the width.
-    layout["top_right"].update(build_processes_panel(data))
-
-    if multi_gpu:
-        # The left column carries two stacked panels, hence a bit more room.
-        layout["top_left"].ratio = 2
-        layout["top_right"].ratio = 3
-        layout["bottom_left"].ratio = 1
-        layout["bottom_right"].ratio = 2
-        layout["top_left"].update(Group(ollama_panel, gpu_processes_panel))
-        layout["bottom_left"].update(build_summary(data, interval, multi_gpu=True))
-        layout["bottom_right"].update(build_gpu_detail_panel(data))
+    if mode == LAYOUT_MODE_WIDE:
+        layout["wide_vram"].update(StackedPanels(ollama_panel, gpu_processes_panel))
+        layout["wide_processes"].update(StackedPanels(*rankings.panels))
+        layout["wide_summary"].update(StackedPanels(summary_panel))
+        if multi_gpu:
+            gpu_detail_panel = build_gpu_detail_panel(data)
+            layout["wide_gpu_detail"].update(StackedPanels(gpu_detail_panel))
+    elif multi_gpu:
+        # The left column carries three stacked panels, hence a bit more room.
+        layout["narrow_left"].ratio = 2
+        layout["narrow_right"].ratio = 3
+        gpu_detail_panel = build_gpu_detail_panel(data)
+        layout["narrow_left"].update(
+            StackedPanels(ollama_panel, gpu_processes_panel, summary_panel)
+        )
+        layout["narrow_right"].update(StackedPanels(rankings, gpu_detail_panel))
     else:
-        layout["top_left"].ratio = 1
-        layout["top_right"].ratio = 2
-        layout["bottom_left"].ratio = 1
-        layout["bottom_right"].ratio = 1
-        layout["top_left"].update(ollama_panel)
-        layout["bottom_left"].update(gpu_processes_panel)
-        layout["bottom_right"].update(build_summary(data, interval))
+        layout["narrow_left"].ratio = 1
+        layout["narrow_right"].ratio = 2
+        layout["narrow_left"].update(StackedPanels(ollama_panel, gpu_processes_panel))
+        layout["narrow_right"].update(StackedPanels(rankings, summary_panel))
 
 
 def build_full_screen_help():
@@ -1250,7 +1566,10 @@ def main():
     with state_lock:
         refresh_interval = args.interval
 
-    layout = create_layout()
+    # The structure the very first frame needs. It is re-derived on every
+    # iteration and the layout is only rebuilt when it actually changes.
+    shape = layout_shape(None, terminal_width())
+    layout = create_layout(*shape)
 
     # Start keyboard listener thread
     listener_thread = threading.Thread(target=keyboard_listener, daemon=True)
@@ -1290,14 +1609,29 @@ def main():
                 if not previous_help_flag:
                     live.update(build_full_screen_help())
             else:
-                if previous_help_flag:
-                    # Coming back from the help screen: restore the live
-                    # layout so refreshes resume underneath it.
-                    live.update(layout)
                 with stats_lock:
                     stats_snapshot = latest_stats
+
+                # A terminal that was resized past the wide threshold, or a
+                # card that appeared or went away, needs a different region
+                # tree. Everything else is handled by the panels themselves,
+                # so the ``Layout`` is only rebuilt on an actual change of
+                # shape rather than on every iteration.
+                new_shape = layout_shape(stats_snapshot, terminal_width())
+                reshaped = new_shape != shape
+                if reshaped:
+                    shape = new_shape
+                    layout = create_layout(*shape)
+
+                if previous_help_flag or reshaped:
+                    # Coming back from the help screen, or onto a layout that
+                    # did not exist a moment ago: either way the ``Live``
+                    # instance is the thing that decides what gets drawn, so
+                    # the new object has to be pushed through it.
+                    live.update(layout)
+
                 if stats_snapshot:
-                    build_layout_content(layout, stats_snapshot, current_interval)
+                    build_layout_content(layout, stats_snapshot, current_interval, shape[0])
 
             previous_help_flag = help_flag
 
