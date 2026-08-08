@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import readchar  # To capture key presses
 import requests
+from readchar import key as readchar_key
 from rich.cells import cell_len
 from rich.console import Console, Group
 from rich.layout import Layout
@@ -17,6 +18,7 @@ from rich.measure import Measurement
 from rich.panel import Panel
 from rich.segment import Segment
 from rich.table import Table
+from rich.text import Text
 
 # Default API URL
 SYS_STATS_API_URL = os.getenv('SYS_STATS_API_URL', 'http://localhost:5000/stats')
@@ -27,6 +29,20 @@ console = Console()
 is_paused = False
 show_help_flag = False
 refresh_interval = 5  # Default refresh interval in seconds
+
+# Scrolling state, owned by the keyboard thread and read back by the panels
+# while they render. ``scroll_offsets`` maps a panel key to the index of its
+# first visible row; ``panel_row_counts`` and ``panel_page_sizes`` are written
+# by the render pass so the keyboard thread knows how far ``End`` and
+# ``Page Down`` should go without having to measure anything itself.
+scroll_offsets = {}
+panel_row_counts = {}
+panel_page_sizes = {}
+# Keys of the scrollable panels currently on screen, in Tab order, and the one
+# the scroll keys drive. Both are refreshed by :func:`build_layout_content`,
+# because which panels exist depends on the payload and on the layout mode.
+scrollable_panel_keys = []
+focused_panel = None
 
 # Locks for thread-safe operations
 state_lock = threading.Lock()
@@ -102,10 +118,48 @@ PROCESS_TABLE_COLUMN_PRIORITIES = {
 # VRAM stands out among the other compute apps.
 OLLAMA_ROW_STYLE = "bold magenta"
 
-# Shortest a panel is squeezed to before it is dropped from its column: two
-# borders, a header, its rule and one row. Below this a panel would either be
-# unreadable or cut through the middle, so :func:`distribute_heights` drops it
-# outright instead.
+# Border styles telling the scroll keys' target apart from the rest.
+PANEL_BORDER_STYLE = "cyan"
+FOCUSED_PANEL_BORDER_STYLE = "bold yellow"
+
+# Identity of every scrollable panel. These double as the keys of
+# :data:`scroll_offsets` and as the Tab order once
+# :func:`build_layout_content` has listed the ones actually on screen.
+PANEL_OLLAMA = "ollama"
+PANEL_GPU_PROCESSES = "gpu_processes"
+PANEL_TOP_CPU = "top_cpu"
+PANEL_TOP_MEMORY = "top_memory"
+PANEL_GPU_DETAIL = "gpu_detail"
+
+# What each scrolling key can arrive as. Terminals do not agree on the escape
+# sequences, and :mod:`readchar` only knows one spelling of each: it answers
+# ``\x1b[F`` for End, while tmux, screen and the Linux console send ``\x1b[4~``
+# and xterm in application mode sends ``\x1bOF``. Worse, readchar's escape
+# parser does not expect a ``4`` in that position and stops one byte short,
+# handing back ``\x1b[4`` and then a stray ``~`` on the next read. Every
+# spelling is accepted, and the leftover ``~`` matches nothing and is ignored.
+SCROLL_UP_KEYS = frozenset({readchar_key.UP, "\x1bOA"})
+SCROLL_DOWN_KEYS = frozenset({readchar_key.DOWN, "\x1bOB"})
+SCROLL_PAGE_UP_KEYS = frozenset({readchar_key.PAGE_UP, "\x1b[5~", "\x1bOy"})
+SCROLL_PAGE_DOWN_KEYS = frozenset({readchar_key.PAGE_DOWN, "\x1b[6~", "\x1bOs"})
+SCROLL_HOME_KEYS = frozenset({readchar_key.HOME, "\x1bOH", "\x1b[1~", "\x1b[7~"})
+SCROLL_END_KEYS = frozenset({readchar_key.END, "\x1bOF", "\x1b[4~", "\x1b[4", "\x1b[8~"})
+
+# Chrome a panel adds around its content: one border column on each side plus
+# the ``(0, 1)`` padding horizontally, one border line above and below
+# vertically. Rich hands the real width to the renderable inside the panel, but
+# the *height* has to be worked out before the panel exists, because it is what
+# decides how many rows the panel is built with in the first place.
+PANEL_CHROME_WIDTH = 4
+PANEL_CHROME_HEIGHT = 2
+
+# Smallest panel worth drawing: two borders, a header, its rule and one row.
+# A scrollable panel squeezed to this still says what it is and shows one line
+# of data with an indicator of how much it is hiding.
+MIN_SCROLLABLE_PANEL_HEIGHT = 5
+# Panels with no rows to window (the summary) cannot shrink gracefully, so they
+# are only ever taken down to their borders plus a line of content, and only
+# once every scrollable panel is already at its own minimum.
 MIN_PLAIN_PANEL_HEIGHT = 3
 
 # Terminal width from which the dashboard lays its panels out in a single row
@@ -469,6 +523,267 @@ class FixedHeight:
         for line in lines:
             yield from line
             yield Segment.line()
+
+
+class ScrollablePanel:
+    """A panel showing whichever window of its rows fits the room it gets.
+
+    The vertical counterpart of :class:`AdaptiveRenderable`. That class reads
+    ``options.max_width`` to choose the columns it can afford; this one also
+    reads ``options.height`` to choose how many rows it can afford, because on
+    a busy host there are simply more processes and models than there are
+    lines on the screen and no layout fixes that. Rows the panel cannot show
+    are counted in an indicator above and below the table, and the window
+    slides over them through :data:`scroll_offsets`.
+
+    The offset is clamped on every single render rather than when a key is
+    pressed: the row count changes with every fetch, so an offset that was
+    valid a second ago can point past the end of a list that has since shrunk,
+    which would render an empty panel with no way back.
+
+    Parameters
+    ----------
+    key : str
+        Identity of the panel, used as its :data:`scroll_offsets` key and as
+        its place in the Tab order.
+    title : str
+        Panel title, without markup.
+    rows : list
+        The items to list, one per table row.
+    table_builder : callable
+        Takes ``(rows, available_width)`` and returns the renderable listing
+        exactly those rows. Called once per measurement, so it must be free of
+        side effects.
+    empty_message : str
+        Shown instead of a table when there is nothing to list.
+    """
+
+    def __init__(self, key, title, rows, table_builder, empty_message):
+        self.key = key
+        self.title = title
+        self.rows = list(rows)
+        self.empty_message = empty_message
+        self._table_builder = table_builder
+
+    def build_table(self, available_width, rows=None):
+        """Build the table listing a window of rows, all of them by default.
+
+        Parameters
+        ----------
+        available_width : int
+            Room the table has, in columns.
+        rows : list, optional
+            The window to list. Defaults to every row.
+
+        Returns
+        -------
+        rich.console.RenderableType
+            Whatever the table builder produced.
+        """
+        return self._table_builder(self.rows if rows is None else rows, available_width)
+
+    def _rows_height(self, available_width, offset, count):
+        """Height in lines of the table listing ``count`` rows from ``offset``."""
+        window = self.rows[offset:offset + count]
+        return measure_render_height(self.build_table(available_width, window), available_width)
+
+    def _fit_count(self, available_width, offset, budget, anchor_at_end=False):
+        """Most rows that fit ``budget`` lines, from ``offset`` or from the end.
+
+        A binary search, which assumes the table never gets shorter as rows
+        are added to it. Every rendering this dashboard uses satisfies that:
+        the row-per-item tables grow by exactly one line per row, and the
+        side-by-side GPU tables keep a constant height.
+
+        Parameters
+        ----------
+        available_width : int
+            Room the table has, in columns.
+        offset : int
+            Index of the first row of the window, ignored when anchoring at
+            the end.
+        budget : int
+            Lines the table may occupy.
+        anchor_at_end : bool, optional
+            When ``True`` the window ends on the last row instead of starting
+            at ``offset``, which is what "show me the end of the list" means.
+
+        Returns
+        -------
+        int
+            Number of rows, possibly zero when not even one of them fits.
+        """
+        total = len(self.rows)
+        low, high, best = 1, total if anchor_at_end else total - offset, 0
+        while low <= high:
+            middle = (low + high) // 2
+            start = total - middle if anchor_at_end else offset
+            if self._rows_height(available_width, start, middle) <= budget:
+                best, low = middle, middle + 1
+            else:
+                high = middle - 1
+        return best
+
+    def _max_offset(self, available_width, available_height):
+        """Furthest the window may be scrolled before it stops being full.
+
+        Past this offset the panel would show a handful of rows over an
+        expanse of nothing, so ``End`` and an overshooting ``Page Down`` both
+        land here rather than on the last row.
+        """
+        total = len(self.rows)
+        # Anchored at the end nothing is hidden below, so the only indicator
+        # left to make room for is the one above.
+        return max(0, total - self._fit_count(
+            available_width, 0, available_height - 1, anchor_at_end=True
+        ))
+
+    def _count_at(self, available_width, available_height, offset):
+        """Rows visible from ``offset``, once the indicators are paid for.
+
+        Whether a line has to be reserved for the "more below" indicator
+        depends on how many rows fit, which is what the reservation decides:
+        both readings are computed and the one showing the most rows without
+        contradicting itself wins.
+        """
+        total = len(self.rows)
+        reserve_above = 1 if offset > 0 else 0
+        best, consistent_best = 0, 0
+        for reserve_below in (1, 0):
+            count = self._fit_count(
+                available_width, offset, available_height - reserve_above - reserve_below
+            )
+            best = max(best, count)
+            if count and (offset + count < total) == bool(reserve_below):
+                consistent_best = max(consistent_best, count)
+        return consistent_best or best
+
+    def _window(self, available_width, available_height, offset):
+        """Resolve the window of rows to draw.
+
+        Parameters
+        ----------
+        available_width : int
+            Room the table has, in columns.
+        available_height : int or None
+            Lines the panel's content may occupy, or ``None`` when Rich has
+            not constrained the height at all.
+        offset : int
+            Requested index of the first visible row.
+
+        Returns
+        -------
+        tuple of (int, int, int, int)
+            The clamped offset, how many rows are shown, how many are hidden
+            above and how many below.
+        """
+        total = len(self.rows)
+        if available_height is None or not total:
+            return 0, total, 0, 0
+        if self._rows_height(available_width, 0, total) <= available_height:
+            # Everything fits: there is nothing to scroll and no offset worth
+            # keeping, so the panel always shows the top of the list.
+            return 0, total, 0, 0
+
+        offset = min(max(offset, 0), self._max_offset(available_width, available_height))
+        count = self._count_at(available_width, available_height, offset)
+        return offset, count, offset, max(0, total - offset - count)
+
+    def render_panel(self, width, height, publish=False):
+        """Build the panel for an exactly known width and height.
+
+        Parameters
+        ----------
+        width : int
+            Total width of the panel, borders included.
+        height : int or None
+            Total height of the panel, borders included, or ``None`` to let it
+            be as tall as its content.
+        publish : bool, optional
+            Whether to write the resolved geometry back into the shared state
+            the keyboard thread reads. Only the real render pass does. The
+            measurement passes must not: :meth:`natural_height` builds the
+            panel unconstrained, where nothing is ever hidden, so publishing
+            from there would reset every offset to zero on each frame.
+
+        Returns
+        -------
+        rich.panel.Panel
+            The panel, whole, at exactly the requested height.
+        """
+        with state_lock:
+            offset = scroll_offsets.get(self.key, 0)
+            focused = focused_panel == self.key
+
+        border_style = FOCUSED_PANEL_BORDER_STYLE if focused else PANEL_BORDER_STYLE
+        panel_options = {
+            "title": f"[bold cyan]{self.title}[/bold cyan]",
+            "border_style": border_style,
+            "padding": (0, 1),
+            "height": height,
+        }
+
+        if not self.rows:
+            return Panel(self.empty_message, **panel_options)
+
+        content_width = max(1, width - PANEL_CHROME_WIDTH)
+        content_height = None if height is None else max(1, height - PANEL_CHROME_HEIGHT)
+        offset, count, hidden_above, hidden_below = self._window(
+            content_width, content_height, offset
+        )
+
+        if publish:
+            with state_lock:
+                scroll_offsets[self.key] = offset
+                panel_row_counts[self.key] = len(self.rows)
+                # A page is the window as it is at the top of the list, where
+                # no indicator above eats a line. Publishing the window as
+                # rendered instead would make it one row shorter as soon as
+                # anything is hidden above, and Page Up would then land one
+                # row below wherever Page Down came from.
+                panel_page_sizes[self.key] = count + (1 if hidden_above else 0)
+
+        if not count:
+            # Too short for even one row and its indicators. Saying how much
+            # is there beats drawing a table the panel would have to cut.
+            return Panel(_overflow_indicator("↕", len(self.rows), "hidden"), **panel_options)
+
+        parts = []
+        if hidden_above:
+            parts.append(_overflow_indicator("↑", hidden_above, "above"))
+        # The table itself still sizes its columns from the width Rich hands
+        # it, exactly as it did before there was a vertical axis to worry
+        # about; only which rows reach it is decided here.
+        window = self.rows[offset:offset + count]
+        parts.append(AdaptiveRenderable(lambda w: self.build_table(w, window)))
+        if hidden_below:
+            parts.append(_overflow_indicator("↓", hidden_below, "below"))
+
+        return Panel(Group(*parts), **panel_options)
+
+    def natural_height(self, width):
+        """Height the panel would take if nothing constrained it."""
+        return measure_render_height(self.render_panel(width, None), width)
+
+    def minimum_height(self):
+        """Shortest this panel is still worth drawing."""
+        return MIN_SCROLLABLE_PANEL_HEIGHT
+
+    def __rich_console__(self, console, options):
+        """Render the panel into the room Rich has just revealed."""
+        yield self.render_panel(options.max_width, options.height, publish=True)
+
+
+def _overflow_indicator(arrow, count, where):
+    """Build the one-line notice naming rows the panel could not show."""
+    plural = "" if count == 1 else "s"
+    return Text(
+        f"{arrow} {count} more row{plural} {where}",
+        style="dim italic",
+        justify="center",
+        no_wrap=True,
+        overflow="ellipsis",
+    )
 
 
 def panel_natural_height(renderable, width):
@@ -1033,24 +1348,21 @@ def build_gpu_detail_panel(data):
 
     Returns
     -------
-    rich.panel.Panel
+    ScrollablePanel
         The GPU detail panel, whose content is chosen from the width Rich
-        hands it (see :func:`build_gpu_detail_content`).
+        hands it (see :func:`build_gpu_detail_content`) and whose cards are
+        windowed to the height it is given.
     """
-    gpus = data.get('gpu') or []
-    if not data.get('has_gpu') or not gpus:
-        return Panel(
-            "No GPU detected.",
-            title="[bold cyan]GPU Detail[/bold cyan]",
-            border_style="cyan",
-            padding=(0, 1)
-        )
+    # A host reporting no GPU at all gets the empty state, whatever leftover
+    # the payload happens to carry in its ``gpu`` key.
+    gpus = (data.get('gpu') or []) if data.get('has_gpu') else []
 
-    return Panel(
-        AdaptiveRenderable(lambda width: build_gpu_detail_content(gpus, width)),
-        title="[bold cyan]GPU Detail[/bold cyan]",
-        border_style="cyan",
-        padding=(0, 1)
+    return ScrollablePanel(
+        PANEL_GPU_DETAIL,
+        "GPU Detail",
+        gpus,
+        build_gpu_detail_content,
+        "No GPU detected.",
     )
 
 
@@ -1114,19 +1426,17 @@ def build_process_panel(processes, key, title):
 
     Returns
     -------
-    rich.panel.Panel
+    ScrollablePanel
         The ranking panel, showing an explanatory line when there is no data.
+        ``key`` doubles as the panel's scroll identity, since the two rankings
+        are exactly the two panels a user tells apart by the metric they rank.
     """
-    content = (
-        AdaptiveRenderable(lambda width: build_process_table(processes, key, width))
-        if processes
-        else f"No data for {title}."
-    )
-    return Panel(
-        content,
-        title=f"[bold cyan]{title}[/bold cyan]",
-        border_style="cyan",
-        padding=(0, 1),
+    return ScrollablePanel(
+        key,
+        title,
+        processes,
+        lambda rows, width: build_process_table(rows, key, width),
+        f"No data for {title}.",
     )
 
 
@@ -1147,8 +1457,8 @@ def build_processes_panel(data):
         neither can be cut by the other.
     """
     return SideBySidePanels(
-        build_process_panel(data.get('top_cpu', []), 'top_cpu', 'Top CPU'),
-        build_process_panel(data.get('top_memory', []), 'top_memory', 'Top Memory'),
+        build_process_panel(data.get('top_cpu', []), PANEL_TOP_CPU, 'Top CPU'),
+        build_process_panel(data.get('top_memory', []), PANEL_TOP_MEMORY, 'Top Memory'),
     )
 
 
@@ -1227,22 +1537,16 @@ def build_gpu_processes_panel(data, multi_gpu=False):
 
     Returns
     -------
-    rich.panel.Panel
-        The GPU processes panel, or an empty-state panel.
+    ScrollablePanel
+        The GPU processes panel, showing an explanatory line when there is
+        nothing holding VRAM.
     """
-    processes = data.get("top_gpu_processes", [])
-    content = (
-        AdaptiveRenderable(
-            lambda width: build_gpu_processes_table(processes, multi_gpu, width)
-        )
-        if processes
-        else "No GPU processes."
-    )
-    return Panel(
-        content,
-        title="[bold cyan]GPU Processes[/bold cyan]",
-        border_style="cyan",
-        padding=(0, 1)
+    return ScrollablePanel(
+        PANEL_GPU_PROCESSES,
+        "GPU Processes",
+        data.get("top_gpu_processes", []),
+        lambda rows, width: build_gpu_processes_table(rows, multi_gpu, width),
+        "No GPU processes.",
     )
 
 
@@ -1396,28 +1700,49 @@ def build_ollama_panel(data, gpu_processes=None):
 
     Returns
     -------
-    rich.panel.Panel
-        The Ollama panel, or an empty-state panel.
+    ScrollablePanel
+        The Ollama panel, showing an explanatory line when nothing is loaded.
     """
     models = data.get("ollama_processes", {}).get("models", [])
-    if not models:
-        return Panel(
-            "No Ollama models.",
-            title="[bold cyan]Ollama Statistics[/bold cyan]",
-            border_style="cyan",
-            padding=(0, 1)
-        )
-
     has_ollama_process, gpu_label = ollama_gpu_indices(gpu_processes)
 
-    return Panel(
-        AdaptiveRenderable(
-            lambda width: build_ollama_table(models, has_ollama_process, gpu_label, width)
-        ),
-        title="[bold cyan]Ollama Statistics[/bold cyan]",
-        border_style="cyan",
-        padding=(0, 1)
+    return ScrollablePanel(
+        PANEL_OLLAMA,
+        "Ollama Statistics",
+        models,
+        lambda rows, width: build_ollama_table(rows, has_ollama_process, gpu_label, width),
+        "No Ollama models.",
     )
+
+
+def register_scrollable_panels(panels):
+    """Publish the panels the scroll keys can drive, and keep focus valid.
+
+    Which panels exist depends on the payload and on the layout mode, and a
+    panel with nothing to list has no window to move, so the Tab order is
+    rebuilt on every render pass rather than fixed once. A focus left pointing
+    at a panel that has since gone away falls back to the first one, and the
+    offsets of vanished panels are dropped so a panel coming back starts at
+    the top rather than wherever it was left months of uptime ago.
+
+    Parameters
+    ----------
+    panels : list of ScrollablePanel
+        Every scrollable panel currently in the layout, in Tab order.
+
+    Returns
+    -------
+    None
+    """
+    global focused_panel
+
+    keys = [panel.key for panel in panels if panel.rows]
+    with state_lock:
+        scrollable_panel_keys[:] = keys
+        if focused_panel not in keys:
+            focused_panel = keys[0] if keys else None
+        for stale in [key for key in scroll_offsets if key not in keys]:
+            del scroll_offsets[stale]
 
 
 def build_layout_content(layout, data, interval, mode=LAYOUT_MODE_NARROW):
@@ -1430,8 +1755,9 @@ def build_layout_content(layout, data, interval, mode=LAYOUT_MODE_NARROW):
     VRAM), and the summary keeps only cumulated figures.
 
     No size is threaded through: every panel sizes itself from the room Rich
-    hands it at render time (see :class:`AdaptiveRenderable`), which is the
-    only figure that accounts for the layout ratios *and* the panel chrome.
+    hands it at render time (see :class:`AdaptiveRenderable` for the columns
+    and :class:`ScrollablePanel` for the rows), which is the only figure that
+    accounts for the layout ratios *and* the panel chrome.
 
     Parameters
     ----------
@@ -1462,18 +1788,24 @@ def build_layout_content(layout, data, interval, mode=LAYOUT_MODE_NARROW):
     rankings = build_processes_panel(data)
     summary_panel = build_summary(data, interval, multi_gpu=multi_gpu)
 
+    # Tab order: down the leftmost column first, then across. It follows the
+    # reading order of both layouts, which is the only order a user can guess.
+    scrollable = [ollama_panel, gpu_processes_panel, *rankings.panels]
+
     if mode == LAYOUT_MODE_WIDE:
         layout["wide_vram"].update(StackedPanels(ollama_panel, gpu_processes_panel))
         layout["wide_processes"].update(StackedPanels(*rankings.panels))
         layout["wide_summary"].update(StackedPanels(summary_panel))
         if multi_gpu:
             gpu_detail_panel = build_gpu_detail_panel(data)
+            scrollable.append(gpu_detail_panel)
             layout["wide_gpu_detail"].update(StackedPanels(gpu_detail_panel))
     elif multi_gpu:
         # The left column carries three stacked panels, hence a bit more room.
         layout["narrow_left"].ratio = 2
         layout["narrow_right"].ratio = 3
         gpu_detail_panel = build_gpu_detail_panel(data)
+        scrollable.append(gpu_detail_panel)
         layout["narrow_left"].update(
             StackedPanels(ollama_panel, gpu_processes_panel, summary_panel)
         )
@@ -1484,9 +1816,15 @@ def build_layout_content(layout, data, interval, mode=LAYOUT_MODE_NARROW):
         layout["narrow_left"].update(StackedPanels(ollama_panel, gpu_processes_panel))
         layout["narrow_right"].update(StackedPanels(rankings, summary_panel))
 
+    register_scrollable_panels(scrollable)
+
 
 def build_full_screen_help():
-    """Builds the full-screen help panel."""
+    """Builds the full-screen help panel.
+
+    The only place a user ever learns the keys, so every one of them is listed
+    here, including the ones that only do something once a panel is focused.
+    """
     help_text = """
 [bold yellow]Keyboard Shortcuts:[/bold yellow]
 
@@ -1496,6 +1834,15 @@ def build_full_screen_help():
 [bold green]p[/bold green] - Pause/Resume
 [bold green]-[/bold green] - Decrease interval
 [bold green]+[/bold green] - Increase interval
+
+[bold yellow]Scrolling:[/bold yellow]
+
+[bold green]Tab[/bold green]         - Focus the next panel (highlighted border)
+[bold green]Up/Down[/bold green]     - Scroll the focused panel by one row
+[bold green]PgUp/PgDn[/bold green]   - Scroll the focused panel by one screenful
+[bold green]Home/End[/bold green]    - Jump to the first or last row
+
+A panel hiding rows says so above and below its table.
 
 Press [bold green]h[/bold green] again to return.
 """
@@ -1509,8 +1856,79 @@ Press [bold green]h[/bold green] again to return.
     return help_panel
 
 
+def cycle_panel_focus(step=1):
+    """Move the focus to the next scrollable panel.
+
+    The caller must hold :data:`state_lock`.
+
+    Parameters
+    ----------
+    step : int, optional
+        How many panels to move by, negative to go backwards. Wraps around.
+
+    Returns
+    -------
+    None
+    """
+    global focused_panel
+
+    if not scrollable_panel_keys:
+        focused_panel = None
+    elif focused_panel in scrollable_panel_keys:
+        position = scrollable_panel_keys.index(focused_panel)
+        focused_panel = scrollable_panel_keys[(position + step) % len(scrollable_panel_keys)]
+    else:
+        focused_panel = scrollable_panel_keys[0]
+
+
+def scroll_focused_panel(rows=0, pages=0, to=None):
+    """Move the focused panel's window over its rows.
+
+    The caller must hold :data:`state_lock`. Only a coarse clamp is applied
+    here, to the last row: the exact one depends on how many rows the panel
+    can show, which is not known until it is rendered against a width and a
+    height. :class:`ScrollablePanel` clamps properly and writes the result
+    back, so a key that overshoots settles on the next frame.
+
+    Parameters
+    ----------
+    rows : int, optional
+        Rows to move by, negative to go up.
+    pages : int, optional
+        Screenfuls to move by. A screenful is however many rows the panel fits
+        when it is scrolled to the top, so paging back always lands where
+        paging forward came from.
+    to : int, optional
+        Absolute offset to jump to, overriding ``rows`` and ``pages``.
+
+    Returns
+    -------
+    None
+    """
+    if focused_panel is None:
+        return
+
+    total = panel_row_counts.get(focused_panel, 0)
+    if to is None:
+        # A panel that has never been rendered has no page size yet; one row
+        # at a time is the safe reading, and the next frame fixes it.
+        page = panel_page_sizes.get(focused_panel, 1) or 1
+        offset = scroll_offsets.get(focused_panel, 0) + rows + pages * page
+    else:
+        offset = to
+
+    scroll_offsets[focused_panel] = max(0, min(offset, max(0, total - 1)))
+
+
 def keyboard_listener():
-    """Listens for keyboard input and modifies state accordingly."""
+    """Listens for keyboard input and modifies state accordingly.
+
+    The scrolling keys deliberately do not set :data:`rebuild_layout_event`.
+    They change nothing about *what* is on screen, only which slice of it is
+    drawn, and the offsets are read back by the panels on every render, so the
+    ``Live`` instance's own refresh picks them up within its next frame. Waking
+    the main loop would fire an HTTP request per key press for nothing.
+    """
     global is_paused, show_help_flag, refresh_interval, latest_stats
     while not exit_event.is_set():
         key = readchar.readkey()
@@ -1534,6 +1952,22 @@ def keyboard_listener():
                 if refresh_interval < 60:
                     refresh_interval += 1
                     rebuild_layout_event.set()  # Rebuild layout to show new interval
+            elif key == readchar_key.TAB:
+                cycle_panel_focus()
+            elif key in SCROLL_UP_KEYS:
+                scroll_focused_panel(rows=-1)
+            elif key in SCROLL_DOWN_KEYS:
+                scroll_focused_panel(rows=1)
+            elif key in SCROLL_PAGE_UP_KEYS:
+                scroll_focused_panel(pages=-1)
+            elif key in SCROLL_PAGE_DOWN_KEYS:
+                scroll_focused_panel(pages=1)
+            elif key in SCROLL_HOME_KEYS:
+                scroll_focused_panel(to=0)
+            elif key in SCROLL_END_KEYS:
+                # Past the last row on purpose: the render clamps it down to
+                # the offset that fills the window with the final rows.
+                scroll_focused_panel(to=panel_row_counts.get(focused_panel, 0))
 
 
 def read_dashboard_state():
