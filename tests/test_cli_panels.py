@@ -290,6 +290,109 @@ def _clipped_lines(text: str) -> list:
     return clipped
 
 
+def _boxed_blank_lines(text: str) -> list:
+    """Return the rendered lines that are empty inside a box.
+
+    The measure of framed void, and the one the earlier probe got wrong: it
+    counted trailing whitespace after ``rstrip``, which strips nothing at all
+    when a panel border sits at the right edge of the screen, and so reported
+    a perfect score on the very dimension the dashboard was failing.
+
+    A line counts here when it carries at least one vertical border and no
+    other ink: the reader sees the sides of one or more boxes and nothing
+    between them. Lines of plain background are not counted, because an
+    unpainted remainder is the point rather than the problem.
+
+    Parameters
+    ----------
+    text : str
+        Plain text rendering of the assembled layout.
+
+    Returns
+    -------
+    list of str
+        The offending lines, in render order.
+    """
+    blanks = []
+    for line in text.splitlines():
+        ink = line.replace(" ", "")
+        if ink and set(ink) <= {"│", "┃", "║"}:
+            blanks.append(line)
+    return blanks
+
+
+def _panel_boxes(text: str) -> list:
+    """Locate every panel drawn in a rendered layout.
+
+    Panels are the only boxes Rich draws with rounded corners here, tables
+    using the square and heavy sets, so the corner characters are enough to
+    tell a panel from its content. A panel is found by pairing the ``╭`` and
+    ``╮`` of its top border and then walking down for the line closing the
+    same two columns.
+
+    Parameters
+    ----------
+    text : str
+        Plain text rendering of the assembled layout.
+
+    Returns
+    -------
+    list of tuple of (int, int, int, int)
+        One ``(top, bottom, left, right)`` per panel, in line and column
+        indices into the rendered text.
+    """
+    lines = text.splitlines()
+    boxes = []
+    for top, line in enumerate(lines):
+        start = line.find("╭")
+        while start != -1:
+            end = line.find("╮", start)
+            if end == -1:
+                break
+            for bottom in range(top + 1, len(lines)):
+                row = lines[bottom]
+                if len(row) > end and row[start] == "╰" and row[end] == "╯":
+                    boxes.append((top, bottom, start, end))
+                    break
+            start = line.find("╭", end)
+    return boxes
+
+
+def _blank_panel_interiors(text: str, titled_only: bool = True) -> list:
+    """Return the blank lines each panel draws between its own borders.
+
+    Sharper than :func:`_boxed_blank_lines`, which only sees a screen line
+    where *every* box happens to be empty at once: a panel stretched to four
+    times its content is invisible to that count as soon as a neighbouring
+    column still has rows to draw on the same lines. This one reads each
+    panel's own span, so it catches the stretch wherever it happens.
+
+    Parameters
+    ----------
+    text : str
+        Plain text rendering of the assembled layout.
+    titled_only : bool, optional
+        Whether to ignore the untitled panels. Only the summary is untitled,
+        and it deliberately draws a spacer row and a slot for the ``PAUSED``
+        marker, which are content rather than stretch.
+
+    Returns
+    -------
+    list of str
+        One ``"line,left-right"`` locator per blank interior line.
+    """
+    lines = text.splitlines()
+    blanks = []
+    for top, bottom, left, right in _panel_boxes(text):
+        titled = any(character.isalnum() for character in lines[top][left:right + 1])
+        if titled_only and not titled:
+            continue
+        for index in range(top + 1, bottom):
+            if not lines[index][left + 1:right].strip():
+                blanks.append(f"line {index + 1}, columns {left}-{right}")
+    return blanks
+
+
 def _header_cells(text: str) -> set:
     """Collect every table header cell of a rendered layout.
 
@@ -546,6 +649,93 @@ class TestAssembledLayoutFitsEveryTerminalSize:
 
                 assert len(lines) <= height, f"{width}x{height}: {len(lines)} lines"
                 assert all(len(line) <= width for line in lines), f"{width}x{height}"
+
+
+class TestNoPanelFramesEmptySpace:
+    """A border is a promise that something is inside it.
+
+    The layout used to hand every panel the full height of its region, so the
+    dashboard drew boxes around large blocks of nothing: at 240x37 with three
+    cards, the last eighteen lines of the screen were empty inside their
+    borders, the Ollama panel held four rows in a box nine lines tall and the
+    GPU Detail panel held three in a box thirty-seven lines tall. Panels now
+    stop at the height of their own content, and the lines a column does not
+    need are left as plain background.
+    """
+
+    # The sizes the complaint was made at, plus the two the earlier probe
+    # claimed were clean. 240x37 with three cards is the exact one captured.
+    REPORTED_SIZES = [(240, 37), (240, 50), (200, 30), (100, 30)]
+
+    @pytest.mark.parametrize("payload_id", SWEEP_PAYLOADS)
+    def test_no_panel_is_ever_drawn_taller_than_its_content(self, payload_id):
+        """Swept over both axes: the stretch used to depend on both.
+
+        Every panel that names itself is checked, at every sampled terminal
+        size. The summary is left out because the two blank lines it draws are
+        its own: a spacer under the clock, and the slot the ``PAUSED`` marker
+        appears in, which cannot be given up without the panel jumping by a
+        line every time refreshing is paused.
+        """
+        offenders = []
+        for width in SWEEP_LAYOUT_WIDTHS:
+            for height in SWEEP_LAYOUT_HEIGHTS:
+                blanks = _blank_panel_interiors(_sweep_render(payload_id, width, height))
+                if blanks:
+                    offenders.append(f"{width}x{height}: {len(blanks)} blank ({blanks[0]})")
+
+        assert not offenders, "\n".join(offenders[:20])
+
+    @pytest.mark.parametrize("payload_id", SWEEP_PAYLOADS)
+    @pytest.mark.parametrize(("width", "height"), REPORTED_SIZES)
+    def test_the_reported_sizes_frame_no_empty_line_at_all(self, payload_id, width, height):
+        """The metric from the complaint, at the sizes it was made about.
+
+        Before this, 240x37 drew 17 such lines out of 37 and 240x50 drew 30
+        out of 50, whatever the number of cards. What is left is the summary's
+        own two blank rows, and only when nothing else is drawn beside them.
+        """
+        text = _sweep_render(payload_id, width, height)
+
+        blanks = _boxed_blank_lines(text)
+        assert len(blanks) <= 2, f"{width}x{height}: {len(blanks)} blank lines\n" + "\n".join(blanks)
+        # Whatever those lines are, none of them may belong to a titled panel.
+        assert not _blank_panel_interiors(text)
+
+    def test_a_column_with_room_to_spare_leaves_it_unpainted(self):
+        """Regression: the leftover used to be given to the last panel.
+
+        That is what turned a nine-line Ollama panel into a thirty-seven-line
+        one on a screen with a single column of content.
+        """
+        sizes = cli.distribute_heights([9, 12], [5, 5], 40)
+
+        assert sizes == [9, 12]
+
+    def test_a_crowded_column_hands_its_lines_to_whoever_can_use_them(self):
+        """The counterpart: free space still reaches the panel that needs it.
+
+        A four-row table next to a fifty-row one keeps the short one whole and
+        gives the rest of the column to the long one, so growing it hides
+        fewer rows rather than leaving the lines blank.
+        """
+        sizes = cli.distribute_heights([9, 54], [5, 5], 40)
+
+        assert sizes == [9, 31]
+        assert sum(sizes) == 40
+
+    def test_the_shorter_of_two_side_by_side_panels_ends_at_its_last_row(self):
+        """Regression: both rankings were drawn at the taller one's height.
+
+        Top Memory lists two processes where Top CPU lists three, so it used
+        to close one line below its last row with a blank line in between.
+        """
+        row = build_processes_panel(_stats(1))
+
+        text = _render(cli.FixedHeight(row, row.natural_height(120)), width=120, height=20)
+
+        assert not _blank_panel_interiors(text)
+        assert text.count("╭") == text.count("╰") == 2
 
 
 class TestAdaptiveColumnFitting:
