@@ -57,6 +57,22 @@ Ensure you have the following installed on your system:
 
    The service will be running at `http://localhost:5000`.
 
+### ☸️ Running on Kubernetes
+
+[`chart/`](chart/) is a Helm chart built on the
+[bjw-s common library](https://github.com/bjw-s-labs/helm-charts):
+
+```bash
+helm dependency update chart/
+helm upgrade --install sys-stats ./chart --namespace monitoring --create-namespace
+```
+
+The dashboard reports on the node the pod lands on, so the chart defaults to the
+host PID namespace and a privileged container — the process tables are empty
+without them. Pin the pod to the machine you actually want to watch, claim a GPU
+if you want the NVIDIA panels, and point `OLLAMA_API_URL` somewhere for the
+Ollama one. [`chart/README.md`](chart/README.md) has the values for all three.
+
 ### 📦 Installing as a CLI
 
 Sys-Stats is a proper Python package, so any standard Python installer puts the

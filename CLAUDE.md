@@ -110,15 +110,17 @@ unprivileged hosts.
 ## Versioning
 
 **Any user-visible change bumps the version, and the bump touches every file that
-spells it out.** Two files do:
+spells it out.** Three files do:
 
-| File             | Reference                             |
-| ---------------- | ------------------------------------- |
-| `pyproject.toml` | `version = "X.Y.Z"` — source of truth |
-| `compose.yaml`   | `image: obeoneorg/sys-stats:X.Y.Z`    |
+| File               | Reference                             |
+| ------------------ | ------------------------------------- |
+| `pyproject.toml`   | `version = "X.Y.Z"` — source of truth |
+| `compose.yaml`     | `image: obeoneorg/sys-stats:X.Y.Z`    |
+| `chart/Chart.yaml` | `appVersion: "X.Y.Z"`                 |
 
-Nothing reconciles the two, and bumping `pyproject.toml` alone leaves `compose.yaml`
-pointing at a tag nobody published.
+Nothing reconciles the three, and bumping `pyproject.toml` alone leaves the other two
+pointing at a tag nobody published. `chart/Chart.yaml` also carries its own `version:`,
+which is the chart's semver and moves independently of the application's.
 
 Everything else derives the version instead of repeating it, and must stay that way:
 `src/sys_stats/__init__.py` reads it from the installed package metadata, and
@@ -126,8 +128,9 @@ Everything else derives the version instead of repeating it, and must stay that 
 produce both the `:X.Y.Z` image tag and the `org.opencontainers.image.version` label.
 The Dockerfile deliberately carries no version: `LABEL` can only expand `ARG`/`ENV`,
 never the output of a `RUN`, so it cannot read `pyproject.toml` and hardcoding the
-value there would only add a fourth place to forget. [compose/](compose/) is generated
-output and stays out of this.
+value there would only add a fourth place to forget. The chart's `image.tag` is
+`"{{ .Chart.AppVersion }}"`, rendered through `tpl`, so `values.yaml` is not a fourth
+place either.
 
 Semver applies to the package as a whole: the `/stats` payload is a public contract
 (see [Architecture](#architecture)), so renaming or removing a key there is a major
@@ -154,5 +157,12 @@ bump, not a patch.
 - [.github/workflows/build-and-publish.yaml](.github/workflows/build-and-publish.yaml)
   pushes and cosign-signs to both `ghcr.io/obeone/sys-stats` and
   `docker.io/obeoneorg/sys-stats` on `main` only; PRs build without pushing.
-- [compose/](compose/) is a Kompose-generated Helm chart (chart name `compose`), not
-  hand-written. Treat it as generated output.
+- [chart/](chart/) is the Helm chart, hand-written on top of the
+  [bjw-s common library](https://github.com/bjw-s-labs/helm-charts) — `templates/`
+  holds nothing but the library loader and `NOTES.txt`, so every deployment knob is a
+  values key, and the library's own values reference is the authority on what is
+  accepted. It replaced a Kompose dump that used to live in `compose/`, and it is
+  versioned on its own line, not with the package. The two host-level requirements above
+  reappear there as `defaultPodOptions.hostPID` and the container's
+  `securityContext.privileged`, both on by default; `chart/charts/` is a fetched
+  dependency and is gitignored, `Chart.lock` is committed.
