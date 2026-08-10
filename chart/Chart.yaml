@@ -1,0 +1,28 @@
+---
+apiVersion: v2
+name: sys-stats
+description: Real-time system, GPU and Ollama monitoring dashboard (terminal + web).
+type: application
+
+# Chart version, bumped on chart changes only. It is deliberately independent
+# from appVersion, which tracks the sys-stats release the chart deploys.
+version: 0.1.0
+appVersion: "1.3.0"
+
+home: https://github.com/obeone/sys-stats
+sources:
+  - https://github.com/obeone/sys-stats
+maintainers:
+  - name: obeone
+    email: obeone@obeone.org
+keywords:
+  - monitoring
+  - dashboard
+  - gpu
+  - nvidia
+  - ollama
+
+dependencies:
+  - name: common
+    repository: https://bjw-s-labs.github.io/helm-charts
+    version: 5.0.1

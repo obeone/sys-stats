@@ -7,3 +7,5 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .agent.lock
+# Fetched by `helm dependency update`; Chart.lock pins it and is committed.
+/chart/charts/
