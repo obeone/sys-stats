@@ -1,0 +1,28 @@
+{{ .Chart.Name }} {{ .Chart.AppVersion }} is deploying.
+
+Reach the dashboard:
+{{- if .Values.ingress.main.enabled }}
+{{- range .Values.ingress.main.hosts }}
+  http{{ if $.Values.ingress.main.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- else }}
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }} 5000:5000
+  open http://localhost:5000
+{{- end }}
+
+The same data feeds the terminal client:
+
+  sys-stats --url http://localhost:5000/stats
+
+If a panel comes up empty:
+
+  * Process tables need the host PID namespace (defaultPodOptions.hostPID,
+    on by default) and enough privilege to read /proc.
+
+  * GPU panels need a card claimed through the NVIDIA device plugin:
+
+      --set controllers.main.containers.main.resources.limits.'nvidia\.com/gpu'=1
+
+  * The Ollama panel stays empty until OLLAMA_API_URL points somewhere:
+
+      --set controllers.main.containers.main.env.OLLAMA_API_URL=http://ollama:11434
