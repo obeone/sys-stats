@@ -136,6 +136,11 @@ Semver applies to the package as a whole: the `/stats` payload is a public contr
 (see [Architecture](#architecture)), so renaming or removing a key there is a major
 bump, not a patch.
 
+The bump is only half a release. Publishing `:X.Y.Z` takes a matching git tag:
+`git tag v1.4.0 && git push origin v1.4.0`, once the bump commit is on `main`. The
+workflow refuses to build when the tag and `pyproject.toml` disagree, so `v1.4.0` on
+a `1.3.0` tree fails instead of publishing an image whose tag lies.
+
 ## Deployment constraints worth knowing
 
 - The container needs `pid: host` and `privileged: true` (see [compose.yaml](compose.yaml))
@@ -156,7 +161,10 @@ bump, not a patch.
   revisit before widening the platform list.
 - [.github/workflows/build-and-publish.yaml](.github/workflows/build-and-publish.yaml)
   pushes and cosign-signs to both `ghcr.io/obeone/sys-stats` and
-  `docker.io/obeoneorg/sys-stats` on `main` only; PRs build without pushing.
+  `docker.io/obeoneorg/sys-stats`, and what it tags depends on the ref: a `v*` tag
+  publishes `:X.Y.Z` and moves `:latest`, while a commit on `main` publishes `:edge`
+  plus an immutable `:sha-<short>`. Version tags therefore stay pinned to one build.
+  PRs and `workflow_dispatch` runs build without pushing or authenticating.
 - [chart/](chart/) is the Helm chart, hand-written on top of the
   [bjw-s common library](https://github.com/bjw-s-labs/helm-charts) — `templates/`
   holds nothing but the library loader and `NOTES.txt`, so every deployment knob is a

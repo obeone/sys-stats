@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
   workflow_dispatch:
   pull_request:
@@ -69,17 +71,51 @@ jobs:
         id: version
         run: echo "version=$(uv version --short)" >> "$GITHUB_OUTPUT"
 
+      # A release tag names a version, so it has to be the version the tree
+      # actually carries. Without this, tagging v1.4.0 on a 1.3.0 checkout would
+      # cheerfully publish an image whose tag lies about its contents.
+      - name: Check the tag matches the package version
+        if: github.ref_type == 'tag'
+        run: |
+          expected="v${{ steps.version.outputs.version }}"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match pyproject.toml ($expected)."
+            exit 1
+          fi
+
+      # Version tags are immutable by contract: only a release tag publishes
+      # :X.Y.Z, and :latest moves with it. Every other commit on main lands on
+      # :edge, alongside a :sha- tag that stays pinned to that single build.
+      - name: Resolve the image tags
+        id: tags
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            names="latest ${{ steps.version.outputs.version }}"
+          else
+            names="edge sha-${GITHUB_SHA:0:7}"
+          fi
+          {
+            echo 'list<<TAGS'
+            for name in $names; do
+              echo "ghcr.io/obeone/sys-stats:$name"
+              echo "docker.io/obeoneorg/sys-stats:$name"
+            done
+            echo TAGS
+          } >> "$GITHUB_OUTPUT"
+
       - name: Log in to GitHub Container Registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v2
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Gated exactly like the build step below: a workflow_dispatch run builds
+      # without publishing, so it has nothing to authenticate for.
       - name: Log in to Docker Hub
-        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v2
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
         with:
           registry: docker.io
           username: ${{ vars.DOCKERHUB_USERNAME }}
@@ -91,25 +127,21 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          push: ${{ github.event_name == 'push' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
-          tags: |
-            ghcr.io/obeone/sys-stats:latest
-            ghcr.io/obeone/sys-stats:${{ steps.version.outputs.version }}
-            docker.io/obeoneorg/sys-stats:latest
-            docker.io/obeoneorg/sys-stats:${{ steps.version.outputs.version }}
+          tags: ${{ steps.tags.outputs.list }}
           platforms: linux/amd64,linux/arm64
 
       - name: Set up cosign
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         uses: sigstore/cosign-installer@v3
 
       - name: Sign the container image with cosign
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         run: |
           cosign sign --yes ghcr.io/obeone/sys-stats@${DIGEST}
           cosign sign --yes docker.io/obeoneorg/sys-stats@${DIGEST}
@@ -117,7 +149,8 @@ jobs:
           COSIGN_EXPERIMENTAL: true
           DIGEST: ${{ steps.docker_build.outputs.digest }}
 
-      - name: Updage Docker Hub description
+      # The description mirrors the README, which lives on main.
+      - name: Update Docker Hub description
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: peter-evans/dockerhub-description@v4
         with:
