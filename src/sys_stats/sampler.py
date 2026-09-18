@@ -34,6 +34,14 @@ coloredlogs.install(level='INFO', logger=logger, fmt='%(asctime)s - %(levelname)
 #: is unset or invalid.
 DEFAULT_SAMPLE_INTERVAL = 2.0
 
+#: Fallback polling interval, in seconds, for the two ``ipmi/``-prefixed
+#: collectors (``get_ipmi_temperatures``, ``get_ipmi_fans``), used when
+#: ``SYS_STATS_IPMI_INTERVAL`` is unset or invalid. Deliberately much slower
+#: than :data:`DEFAULT_SAMPLE_INTERVAL`: fan speed and chassis temperature
+#: move on timescales of tens of seconds, not the 2s default sampling
+#: cadence, and each poll is an `ipmitool` round trip to the host's BMC.
+DEFAULT_IPMI_INTERVAL = 30.0
+
 #: Fallback cap on how many per-process entries the sampler collects, used
 #: when ``SYS_STATS_TOP_PROCESSES_MAX`` is unset or invalid. Requests for a
 #: larger ``?limit=`` than this cannot be satisfied without re-collecting.
@@ -46,6 +54,23 @@ _lock = threading.Lock()
 _cache: dict[str, Any] | None = None
 _wall_ts: float | None = None
 _monotonic_ts: float | None = None
+
+# Last IPMI poll's raw results, reused by ``_collect_panel_extras`` between
+# polls so ``temps``/``fans`` keep their IPMI half populated even on a
+# sampling pass that does not talk to the BMC (see
+# ``_ipmi_last_poll_monotonic`` below). Only ever touched by the sampler
+# thread's single-threaded loop (or a test calling ``_collect_panel_extras``
+# directly), the same way the rest of this module's collection state is --
+# no lock needed for the same reason ``_run``'s psutil-priming state needs
+# none.
+_ipmi_temps_cache: list[dict[str, Any]] = []
+_ipmi_fans_cache: list[dict[str, Any]] = []
+
+# time.monotonic() of the last IPMI poll, or None before the first one. None
+# is also how the very first pass is told apart from every later one: it is
+# the only case where ``_collect_panel_extras`` polls regardless of
+# ``SYS_STATS_IPMI_INTERVAL`` having elapsed.
+_ipmi_last_poll_monotonic: float | None = None
 
 # Extra collectors gathered in the same sampling pass as ``_cache`` but only
 # ever consumed by the ``/panel`` route (temperatures, fans, swap, per-core
@@ -99,6 +124,43 @@ def _get_sample_interval() -> float:
             f"using default {DEFAULT_SAMPLE_INTERVAL}s"
         )
         return DEFAULT_SAMPLE_INTERVAL
+
+    return interval
+
+
+def _get_ipmi_interval() -> float:
+    """Read the IPMI polling interval from ``SYS_STATS_IPMI_INTERVAL``.
+
+    Same validation shape as :func:`_get_sample_interval`: non-numeric and
+    non-positive values both fall back to the default with a logged
+    warning, rather than being silently coerced or left to raise later.
+
+    Returns
+    -------
+    float
+        The configured interval in seconds, or :data:`DEFAULT_IPMI_INTERVAL`
+        when the environment variable is unset, not a number, or not
+        strictly positive.
+    """
+    raw = os.getenv("SYS_STATS_IPMI_INTERVAL")
+    if raw is None:
+        return DEFAULT_IPMI_INTERVAL
+
+    try:
+        interval = float(raw)
+    except ValueError:
+        logger.warning(
+            f"Ignoring non-numeric SYS_STATS_IPMI_INTERVAL={raw!r}; "
+            f"using default {DEFAULT_IPMI_INTERVAL}s"
+        )
+        return DEFAULT_IPMI_INTERVAL
+
+    if interval <= 0:
+        logger.warning(
+            f"Ignoring non-positive SYS_STATS_IPMI_INTERVAL={raw!r}; "
+            f"using default {DEFAULT_IPMI_INTERVAL}s"
+        )
+        return DEFAULT_IPMI_INTERVAL
 
     return interval
 
@@ -211,6 +273,21 @@ def _collect_panel_extras() -> dict[str, Any]:
     guarded separately, so one source raising never costs its sibling its
     data.
 
+    The hwmon collectors run every pass, on the same
+    ``SYS_STATS_SAMPLE_INTERVAL`` cadence as everything else. The two
+    ``ipmi/``-prefixed collectors instead run on their own, slower
+    ``SYS_STATS_IPMI_INTERVAL`` cadence (see :func:`_get_ipmi_interval`,
+    default :data:`DEFAULT_IPMI_INTERVAL`): each is an ``ipmitool`` round
+    trip to the host's BMC, and fan speed / chassis temperature move on a
+    timescale of tens of seconds, not ``SYS_STATS_SAMPLE_INTERVAL``'s
+    default 2s. Between IPMI polls, this function reuses the last polled
+    result (``_ipmi_temps_cache`` / ``_ipmi_fans_cache``) instead of
+    dropping it, so ``temps``/``fans`` never lose their IPMI half on an
+    intermediate pass -- the wall display renders both lists positionally,
+    so entries disappearing and reappearing would shift every row below
+    them. The very first pass always polls immediately, rather than waiting
+    a full ``SYS_STATS_IPMI_INTERVAL`` before IPMI data appears at all.
+
     ``temps`` and ``fans`` are each the union of their two sources:
     concatenated, THEN sorted by ``"n"``. The two are disjoint in practice
     (hwmon names look like ``nct6775/fan1`` / ``k10temp/Tctl``, IPMI names
@@ -252,6 +329,8 @@ def _collect_panel_extras() -> dict[str, Any]:
     """
     err: list[str] = []
 
+    global _ipmi_temps_cache, _ipmi_fans_cache, _ipmi_last_poll_monotonic
+
     try:
         hwmon_temps = collectors.get_temperatures()
     except Exception:
@@ -259,12 +338,36 @@ def _collect_panel_extras() -> dict[str, Any]:
         hwmon_temps = []
         err.append("temps_hwmon")
 
-    try:
-        ipmi_temps = collectors.get_ipmi_temperatures()
-    except Exception:
-        logger.exception("Panel: failed to collect IPMI temperatures")
-        ipmi_temps = []
-        err.append("temps_ipmi")
+    # ipmi_due governs both IPMI collectors below (temps and fans), so the
+    # two are always polled together on the SYS_STATS_IPMI_INTERVAL cadence,
+    # separate from the hwmon collectors above and below, which run every
+    # pass at SYS_STATS_SAMPLE_INTERVAL like before this feature existed.
+    # None means "never polled yet"; that -- not a fresh but short-lived
+    # interval -- is what makes the very first pass poll immediately instead
+    # of waiting a full interval.
+    now = time.monotonic()
+    ipmi_interval = _get_ipmi_interval()
+    ipmi_due = (
+        _ipmi_last_poll_monotonic is None or (now - _ipmi_last_poll_monotonic) >= ipmi_interval
+    )
+
+    if ipmi_due:
+        try:
+            ipmi_temps = collectors.get_ipmi_temperatures()
+        except Exception:
+            logger.exception("Panel: failed to collect IPMI temperatures")
+            err.append("temps_ipmi")
+            # Keep serving the last good value rather than clearing the
+            # cache: a wall panel losing its IPMI temperature readings
+            # entirely is worse than showing readings up to
+            # SYS_STATS_IPMI_INTERVAL seconds old, and the "temps_ipmi" tag
+            # above is what signals the failure to a consumer, not an empty
+            # list. Design judgement, not a measured outcome.
+            ipmi_temps = _ipmi_temps_cache
+        else:
+            _ipmi_temps_cache = ipmi_temps
+    else:
+        ipmi_temps = _ipmi_temps_cache
 
     # Concatenate first, sort second -- never the reverse. Positional
     # stability on the wall display is part of the frozen /panel contract
@@ -280,12 +383,27 @@ def _collect_panel_extras() -> dict[str, Any]:
         hwmon_fans = []
         err.append("fans_hwmon")
 
-    try:
-        ipmi_fans = collectors.get_ipmi_fans()
-    except Exception:
-        logger.exception("Panel: failed to collect IPMI fan speeds")
-        ipmi_fans = []
-        err.append("fans_ipmi")
+    if ipmi_due:
+        try:
+            ipmi_fans = collectors.get_ipmi_fans()
+        except Exception:
+            logger.exception("Panel: failed to collect IPMI fan speeds")
+            err.append("fans_ipmi")
+            # Same cache-preserving choice as the IPMI temperatures branch
+            # above: keep the last good reading, let "fans_ipmi" carry the
+            # failure signal.
+            ipmi_fans = _ipmi_fans_cache
+        else:
+            _ipmi_fans_cache = ipmi_fans
+        # Advanced on both success and failure, once per pass that actually
+        # polled. A BMC that is failing or timing out is, if anything, the
+        # case to back off from hardest -- retrying it every sampling pass
+        # instead of waiting a full interval would defeat the point of
+        # throttling these two collectors. Design judgement, not a measured
+        # outcome.
+        _ipmi_last_poll_monotonic = now
+    else:
+        ipmi_fans = _ipmi_fans_cache
 
     fans = sorted(hwmon_fans + ipmi_fans, key=lambda e: e["n"])
 
@@ -550,8 +668,16 @@ def _reset_for_tests() -> None:
     corrupting the next test's cache with unrelated data. Tests call this
     before and after using the sampler to start from, and leave, a clean
     slate.
+
+    Also clears the IPMI poll cache and its timestamp (see
+    :func:`_collect_panel_extras`): leaving ``_ipmi_last_poll_monotonic``
+    set between tests would make the next test's first call to
+    ``_collect_panel_extras`` see the interval as already having elapsed
+    (or not), instead of the "never polled yet" state each test expects to
+    start from.
     """
     global _thread, _cache, _panel_extras, _wall_ts, _monotonic_ts
+    global _ipmi_temps_cache, _ipmi_fans_cache, _ipmi_last_poll_monotonic
     _stop_event.set()
     with _thread_lock:
         if _thread is not None:
@@ -563,4 +689,7 @@ def _reset_for_tests() -> None:
         _panel_extras = None
         _wall_ts = None
         _monotonic_ts = None
+    _ipmi_temps_cache = []
+    _ipmi_fans_cache = []
+    _ipmi_last_poll_monotonic = None
     _first_snapshot_event.clear()

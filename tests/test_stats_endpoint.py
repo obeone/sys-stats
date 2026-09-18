@@ -186,6 +186,38 @@ def test_stats_never_carries_the_panel_only_host_key(client):
     assert "host" not in payload
 
 
+def test_stats_key_set_is_unchanged_with_ipmi_interval_configured(client, monkeypatch):
+    """SYS_STATS_IPMI_INTERVAL is a /panel-only concern; /stats must never see it.
+
+    The IPMI polling cadence lives entirely inside
+    sampler._collect_panel_extras, which fills the separate _panel_extras
+    cache slot get_snapshot() (the accessor /stats reads) never touches.
+    Same proof-at-the-payload-level pattern as
+    test_stats_key_set_is_unchanged_when_dcgm_is_configured above.
+    """
+    monkeypatch.setenv("SYS_STATS_IPMI_INTERVAL", "60")
+    monkeypatch.setattr(
+        collectors, "get_ipmi_temperatures", lambda: [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
+    )
+    monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [{"n": "ipmi/FAN1", "rpm": 7100}])
+    _seed_cache()
+
+    payload = client.get("/stats").get_json()
+
+    assert set(payload) == {
+        "current_time",
+        "has_gpu",
+        "summary",
+        "cpu",
+        "ram",
+        "gpu",
+        "top_cpu",
+        "top_memory",
+        "top_gpu_processes",
+        "ollama_processes",
+    }
+
+
 def test_stats_converts_gpu_memory_to_bytes(client, monkeypatch):
     """GPUtil reports MiB; the payload must carry bytes and a percentage."""
     monkeypatch.setattr(collectors.GPUtil, "getGPUs", lambda: [_FakeGPU()])

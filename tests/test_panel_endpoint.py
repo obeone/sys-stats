@@ -36,7 +36,19 @@ class _FakeGPU:
 
 
 def _seed_cache() -> None:
-    """Collect one sample synchronously under whatever stubs are active."""
+    """Collect one sample synchronously under whatever stubs are active.
+
+    Resets the sampler's IPMI poll timestamp first, so this always performs
+    a fresh IPMI poll reflecting whatever ``get_ipmi_temperatures``/
+    ``get_ipmi_fans`` stub is active at call time. Without this, two calls
+    to ``_seed_cache()`` within the same test (common: warm up via the
+    ``client`` fixture, then again after monkeypatching a different IPMI
+    stub) land close enough together in wall-clock time to fall inside
+    ``SYS_STATS_IPMI_INTERVAL`` (see ``sampler._collect_panel_extras``),
+    which would reuse the first call's IPMI result instead of collecting
+    under the stub the test just installed.
+    """
+    sampler._ipmi_last_poll_monotonic = None
     sampler._sample_once(limit=sampler._get_top_processes_cap())
 
 

@@ -407,6 +407,28 @@ def test_get_sample_interval_honours_a_valid_override(monkeypatch):
     assert sampler._get_sample_interval() == 7.5
 
 
+@pytest.mark.parametrize("raw", [None, "0", "-1", "not-a-number"])
+def test_get_ipmi_interval_falls_back_to_the_default_on_bad_input(monkeypatch, raw):
+    """Unset, non-numeric or non-positive input all fall back to the default.
+
+    Same validation shape as SYS_STATS_SAMPLE_INTERVAL (see
+    test_get_sample_interval_falls_back_to_the_default_on_bad_input above).
+    """
+    if raw is None:
+        monkeypatch.delenv("SYS_STATS_IPMI_INTERVAL", raising=False)
+    else:
+        monkeypatch.setenv("SYS_STATS_IPMI_INTERVAL", raw)
+
+    assert sampler._get_ipmi_interval() == sampler.DEFAULT_IPMI_INTERVAL
+
+
+def test_get_ipmi_interval_honours_a_valid_override(monkeypatch):
+    """A well-formed positive float is used as-is."""
+    monkeypatch.setenv("SYS_STATS_IPMI_INTERVAL", "60")
+
+    assert sampler._get_ipmi_interval() == 60.0
+
+
 @pytest.mark.parametrize("raw", [None, "0", "-5", "banana"])
 def test_get_top_processes_cap_falls_back_to_the_default_on_bad_input(monkeypatch, raw):
     """Unset, non-numeric or non-positive input all fall back to the default."""
@@ -727,6 +749,171 @@ class TestCollectPanelExtras:
 
         assert extras["dcgm_gpu"] == []
         assert extras["err"] == ["gpu"]
+
+
+class TestIpmiPollingCadence:
+    """Tests for the throttled IPMI cadence inside ``_collect_panel_extras``.
+
+    ``get_ipmi_temperatures``/``get_ipmi_fans`` poll the host's BMC over
+    ``ipmitool`` and run on their own ``SYS_STATS_IPMI_INTERVAL`` cadence,
+    separate from ``get_temperatures``/``get_fans``, which stay on the
+    normal per-pass cadence. Every test here drives the clock with a fake
+    ``time.monotonic`` so the cadence is deterministic instead of
+    depending on wall-clock timing.
+    """
+
+    def test_ipmi_collected_on_the_first_pass(self, monkeypatch):
+        """The very first call polls IPMI immediately, with no prior state."""
+        monkeypatch.setattr(
+            collectors, "get_ipmi_temperatures", lambda: [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
+        )
+        monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [{"n": "ipmi/FAN1", "rpm": 7100}])
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["temps"] == [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
+        assert extras["fans"] == [{"n": "ipmi/FAN1", "rpm": 7100}]
+
+    def test_ipmi_not_re_collected_on_a_pass_inside_the_interval(self, monkeypatch):
+        """A second pass before SYS_STATS_IPMI_INTERVAL elapses must not call IPMI again."""
+        fake_now = [1000.0]
+        monkeypatch.setattr(sampler.time, "monotonic", lambda: fake_now[0])
+
+        temps_calls = []
+        fans_calls = []
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_temperatures",
+            lambda: temps_calls.append(1) or [{"n": "ipmi/CPU1 Temp", "c": 38.0}],
+        )
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_fans",
+            lambda: fans_calls.append(1) or [{"n": "ipmi/FAN1", "rpm": 7100}],
+        )
+
+        sampler._collect_panel_extras()  # first pass: polls, primes the cache
+
+        # Advance the clock, but stay well inside the default 30s interval.
+        fake_now[0] += 5.0
+        extras = sampler._collect_panel_extras()
+
+        assert len(temps_calls) == 1
+        assert len(fans_calls) == 1
+        # The cached value from the first pass must still be present.
+        assert extras["temps"] == [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
+        assert extras["fans"] == [{"n": "ipmi/FAN1", "rpm": 7100}]
+
+    def test_ipmi_re_collected_once_the_interval_has_elapsed(self, monkeypatch):
+        """Once SYS_STATS_IPMI_INTERVAL has elapsed, the next pass polls again."""
+        fake_now = [1000.0]
+        monkeypatch.setattr(sampler.time, "monotonic", lambda: fake_now[0])
+
+        temps_calls = []
+        results = iter(
+            [
+                [{"n": "ipmi/CPU1 Temp", "c": 38.0}],
+                [{"n": "ipmi/CPU1 Temp", "c": 41.0}],
+            ]
+        )
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_temperatures",
+            lambda: temps_calls.append(1) or next(results),
+        )
+        monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
+
+        sampler._collect_panel_extras()  # first pass: polls, primes the cache
+
+        fake_now[0] += sampler.DEFAULT_IPMI_INTERVAL  # exactly the interval
+        extras = sampler._collect_panel_extras()
+
+        assert len(temps_calls) == 2
+        assert extras["temps"] == [{"n": "ipmi/CPU1 Temp", "c": 41.0}]
+
+    def test_hwmon_is_still_collected_every_pass(self, monkeypatch):
+        """hwmon collectors are unaffected: they run every pass, regardless of the IPMI cadence."""
+        fake_now = [1000.0]
+        monkeypatch.setattr(sampler.time, "monotonic", lambda: fake_now[0])
+
+        hwmon_temp_calls = []
+        monkeypatch.setattr(
+            collectors,
+            "get_temperatures",
+            lambda: hwmon_temp_calls.append(1) or [{"n": "k10temp/Tctl", "c": 45.0}],
+        )
+
+        sampler._collect_panel_extras()
+        fake_now[0] += 1.0  # well inside the IPMI interval
+        sampler._collect_panel_extras()
+        fake_now[0] += 1.0
+        sampler._collect_panel_extras()
+
+        assert len(hwmon_temp_calls) == 3
+
+    def test_env_var_controls_the_cadence(self, monkeypatch):
+        """SYS_STATS_IPMI_INTERVAL, not the hardcoded default, gates the re-poll."""
+        monkeypatch.setenv("SYS_STATS_IPMI_INTERVAL", "10")
+        fake_now = [1000.0]
+        monkeypatch.setattr(sampler.time, "monotonic", lambda: fake_now[0])
+
+        temps_calls = []
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_temperatures",
+            lambda: temps_calls.append(1) or [],
+        )
+
+        sampler._collect_panel_extras()  # first pass
+
+        fake_now[0] += 9.0  # inside the configured 10s interval
+        sampler._collect_panel_extras()
+        assert len(temps_calls) == 1
+
+        fake_now[0] += 1.0  # now exactly 10s since the first poll
+        sampler._collect_panel_extras()
+        assert len(temps_calls) == 2
+
+    def test_a_failed_ipmi_poll_keeps_serving_the_last_good_value(self, monkeypatch):
+        """A raising IPMI collector must not poison the cache.
+
+        Instead of clearing the cached readings, a failed poll keeps
+        serving the last good value and tags the failure into ``err`` --
+        the design choice documented in sampler._collect_panel_extras: a
+        wall panel losing its fan/temperature readings entirely is worse
+        than showing readings up to SYS_STATS_IPMI_INTERVAL old.
+        """
+        fake_now = [1000.0]
+        monkeypatch.setattr(sampler.time, "monotonic", lambda: fake_now[0])
+
+        monkeypatch.setattr(
+            collectors, "get_ipmi_temperatures", lambda: [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
+        )
+        monkeypatch.setattr(
+            collectors, "get_ipmi_fans", lambda: [{"n": "ipmi/FAN1", "rpm": 7100}]
+        )
+        sampler._collect_panel_extras()  # first pass: primes the cache with good data
+
+        # Now the BMC starts failing, once the interval has elapsed again.
+        fake_now[0] += sampler.DEFAULT_IPMI_INTERVAL
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_temperatures",
+            lambda: (_ for _ in ()).throw(RuntimeError("ipmitool timed out")),
+        )
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_fans",
+            lambda: (_ for _ in ()).throw(RuntimeError("ipmitool timed out")),
+        )
+
+        extras = sampler._collect_panel_extras()
+
+        # The stale-but-last-known-good reading is still served...
+        assert extras["temps"] == [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
+        assert extras["fans"] == [{"n": "ipmi/FAN1", "rpm": 7100}]
+        # ...and the failure is signalled, not silently swallowed.
+        assert extras["err"] == ["temps_ipmi", "fans_ipmi"]
 
 
 class TestGetPanelSnapshot:
