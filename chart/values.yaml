@@ -48,6 +48,67 @@ controllers:
           # error, and the panel simply stays empty.
           # OLLAMA_API_URL: http://ollama.ollama.svc.cluster.local:11434
 
+          # Seconds the background sampler waits between samples. Defaults
+          # to 2.0; raising it lowers CPU/nvidia-smi overhead at the cost of
+          # staler panels.
+          # SYS_STATS_SAMPLE_INTERVAL: "2.0"
+
+          # Cap on how many entries the sampler collects per per-process
+          # ranking (top CPU, top memory, top GPU). Defaults to 50; a
+          # dashboard ?limit= above this only returns what was sampled.
+          # SYS_STATS_TOP_PROCESSES_MAX: "50"
+
+          # Skips the module-scope sampler autostart when set to "0",
+          # "false" or "no". Defaults to on; a normal deployment never
+          # needs this.
+          # SYS_STATS_AUTOSTART: "0"
+
+          # Caps on the /panel route's temps/fans/gpu lists, for a small
+          # embedded display with limited room (an ESP32-S3 wall panel, in
+          # particular). Each unset by default, meaning no cap.
+          # SYS_STATS_PANEL_MAX_TEMPS: "4"
+          # SYS_STATS_PANEL_MAX_FANS: "4"
+          # SYS_STATS_PANEL_MAX_GPUS: "2"
+
+          # Security-relevant: "1"/"true"/"yes" registers ONLY /panel --
+          # /, /stats and /favicon.png are never registered at all, not just
+          # guarded, so /stats' unauthenticated full process table (complete
+          # command lines included) can never be reached on a host whose
+          # network is not fully trusted. Default is off (every route
+          # registered). Enabling this ALSO breaks the liveness/readiness/
+          # startup probes below, which hit "/" by default -- repoint them
+          # at "/panel" if you turn this on.
+          # SYS_STATS_PANEL_ONLY: "1"
+
+          # Overrides the /panel payload's "host" identity field, which is
+          # socket.gethostname() by default (the pod's own hostname, not the
+          # node it landed on). Set this where that value is meaningless to
+          # a consumer comparing it against a known machine name. Unrelated
+          # to SYS_STATS_INSTANCE_LABEL (README.md): that one is a
+          # human-facing display label, this one is a machine identity, and
+          # the two are never derived from one another.
+          # SYS_STATS_HOSTNAME: "bart.virt.obeone.org"
+
+          # Points /panel's gpu[] at a dcgm-exporter Prometheus /metrics
+          # endpoint instead of GPUtil/nvidia-smi -- for a host with no
+          # NVIDIA driver of its own (GPUs passed through to a VM running
+          # dcgm-exporter elsewhere in the cluster). Expected to carry a
+          # literal IP, not a hostname (requests' timeout does not bound DNS
+          # resolution). /stats always stays on the GPUtil/nvidia-smi path;
+          # unset (default) leaves /panel on it too.
+          # SYS_STATS_DCGM_URL: "http://10.50.0.106:30940/metrics"
+
+          # Seconds between polls of the two ipmi/-prefixed /panel
+          # collectors (temps, fans), each an ipmitool round trip to the
+          # host's BMC -- independent of SYS_STATS_SAMPLE_INTERVAL above.
+          # Defaults to 30.0: fan speed and chassis temperature move on a
+          # timescale of tens of seconds, so polling them every sample
+          # interval buys nothing but BMC round trips. Between polls,
+          # temps/fans keep serving the last IPMI reading instead of
+          # dropping it; hwmon sensors are unaffected and keep the normal
+          # per-pass cadence.
+          # SYS_STATS_IPMI_INTERVAL: "30.0"
+
         securityContext:
           # nvidia-smi and the host's /proc both need more than the image's
           # unprivileged user gets by default. Dropping this is worth trying

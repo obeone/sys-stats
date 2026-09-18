@@ -25,9 +25,10 @@ two console scripts:
 
 Everything hinges on one contract: the JSON payload returned by `GET /stats`.
 
-- **Server side** ([server.py](src/sys_stats/server.py)) is the only place that touches the
-  machine. It gathers metrics from three unrelated sources and merges them into one
-  response:
+- **Collector side** ([collectors.py](src/sys_stats/collectors.py)) is the only place that
+  touches the machine; `server.py` is a thin Flask layer with no direct calls into
+  `psutil`, `GPUtil` or `nvidia-smi`. It gathers metrics from three unrelated sources
+  and merges them into one response:
   - `psutil` for CPU / RAM / top processes,
   - `GPUtil` for GPU enumeration, plus **direct `nvidia-smi` subprocess calls**
     (`get_gpu_fan_and_power`, `get_gpu_processes`) for fan speed, power draw and
@@ -86,7 +87,7 @@ when smoke-testing locally.
 ### Testing conventions
 
 No test touches the real machine: `psutil`, `GPUtil`, `subprocess.run` and
-`requests.get` are all monkeypatched at the `sys_stats.server` module boundary.
+`requests.get` are all monkeypatched at the `sys_stats.collectors` module boundary.
 [tests/test_stats_endpoint.py](tests/test_stats_endpoint.py) is the contract test for
 the `/stats` payload — if you add or rename a key there, that file is the one that
 must change first. Two classes of failure matter most and are already covered:
@@ -100,12 +101,23 @@ unprivileged hosts.
 
 ## Environment variables
 
-| Variable             | Consumed by | Effect                                          |
-| -------------------- | ----------- | ----------------------------------------------- |
-| `OLLAMA_API_URL`     | server      | Enables the Ollama panel; unset ⇒ panel empty   |
-| `HOST` / `PORT`      | server      | Bind address, default `0.0.0.0:5000`            |
-| `FLASK_DEBUG`        | server      | `true` enables Flask debug mode                 |
-| `SYS_STATS_API_URL`  | CLI         | Default `--url`, default `http://localhost:5000/stats` |
+| Variable                      | Consumed by | Effect                                          |
+| ----------------------------- | ----------- | ------------------------------------------------ |
+| `OLLAMA_API_URL`              | server      | Enables the Ollama panel; unset ⇒ panel empty   |
+| `HOST` / `PORT`               | server      | Bind address, default `0.0.0.0:5000`            |
+| `FLASK_DEBUG`                 | server      | `true` enables Flask debug mode                 |
+| `SYS_STATS_AUTOSTART`         | server      | Set to `0`/`false`/`no` to skip the module-scope sampler autostart, default on |
+| `SYS_STATS_SAMPLE_INTERVAL`   | sampler     | Seconds between background samples, default `2.0` |
+| `SYS_STATS_TOP_PROCESSES_MAX` | sampler     | Per-process ranking cap the sampler collects, default `50`; a `?limit=` above this returns only what was sampled |
+| `SYS_STATS_PANEL_MAX_TEMPS`   | server      | Caps the `/panel` `temps` list; unset (default) means no cap |
+| `SYS_STATS_PANEL_MAX_FANS`    | server      | Caps the `/panel` `fans` list; unset (default) means no cap |
+| `SYS_STATS_PANEL_MAX_GPUS`    | server      | Caps the `/panel` `gpu` list; unset (default) means no cap |
+| `SYS_STATS_PANEL_ONLY`        | server      | `1`/`true`/`yes` registers ONLY `/panel`: `/`, `/stats` and `/favicon.png` are never registered, not just guarded; unset (default) registers every route |
+| `SYS_STATS_INSTANCE_LABEL`    | server      | Optional label shown in the web UI's title and body, telling apart two co-located instances reporting on different views of the same box (e.g. a Kubernetes pod vs. the underlying hypervisor); unset (default) leaves the page exactly as before this variable existed |
+| `SYS_STATS_HOSTNAME`          | server      | Overrides `/panel`'s `host` field, otherwise `socket.gethostname()` read fresh per request; unset (default) reports the real hostname. `/panel` only, never `/stats`, and never merged with `SYS_STATS_INSTANCE_LABEL` (that one is a rewritable display label, this one is a machine identity a consumer string-compares) |
+| `SYS_STATS_DCGM_URL`          | sampler     | A dcgm-exporter `/metrics` URL; when set, `/panel`'s `gpu[]` is scraped from it instead of GPUtil/`nvidia-smi`, for hosts with no NVIDIA driver of their own (GPUs passed through to a VM). `/stats` never reads this variable and stays on the GPUtil/`nvidia-smi` path either way. Unset (default) leaves `/panel` on that same path too |
+| `SYS_STATS_IPMI_INTERVAL`     | sampler     | Seconds between polls of the two `ipmi/`-prefixed `/panel` collectors (`temps`, `fans`), independent of `SYS_STATS_SAMPLE_INTERVAL`; default `30.0`. Between polls, `temps`/`fans` keep serving the last IPMI reading instead of dropping it; the first pass after startup always polls immediately. hwmon sensors keep the normal per-pass cadence |
+| `SYS_STATS_API_URL`           | CLI         | Default `--url`, default `http://localhost:5000/stats` |
 
 ## Versioning
 

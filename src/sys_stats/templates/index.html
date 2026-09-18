@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <link rel="shortcut icon" href="/favicon.png" type="image/png">
-  <title>Server Dashboard</title>
+  <title>{% if instance_label %}Server Dashboard: {{ instance_label }}{% else %}Server Dashboard{% endif %}</title>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -200,7 +200,15 @@
       margin-top: -10px;
       margin-bottom: 20px;
       font-weight: bold;
-    }    
+    }
+
+    .instance-label {
+      text-align: center;
+      font-size: 1em;
+      color: #999;
+      margin-top: -15px;
+      margin-bottom: 10px;
+    }
   </style>
 </head>
 <body>
@@ -229,6 +237,9 @@
 
   <div class="container">
     <h1>Server Dashboard</h1>
+    {% if instance_label %}
+    <p id="instance-label" class="instance-label">{{ instance_label }}</p>
+    {% endif %}
     <p id="current-time" class="current-time">Loading time...</p>
     <div id="error-message" class="error" style="display:none;"></div>
 

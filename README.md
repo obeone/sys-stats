@@ -83,7 +83,7 @@ Whichever method you choose, you get two console scripts:
 | Command            | Purpose                                            |
 | ------------------ | -------------------------------------------------- |
 | `sys-stats`        | The Rich terminal dashboard (client).              |
-| `sys-stats-server` | The Flask metrics API + web UI (serves `/stats`).  |
+| `sys-stats-server` | The Flask metrics API + web UI (serves `/stats` and `/panel`). |
 
 #### With uv (recommended)
 
@@ -127,6 +127,12 @@ pipx install ./sys-stats
 Upgrade with `pipx upgrade sys-stats`, remove with `pipx uninstall sys-stats`.
 
 #### With pip
+
+> **Do not run `pip install sys-stats`.** That name belongs to a different,
+> unrelated project on PyPI, and it happens to describe itself as serving
+> system stats over a web interface too — so installing it by mistake looks
+> like success. This project is not published on PyPI under any name; install
+> it from git or from a checkout, as below.
 
 Plain `pip` works too — ideally inside a virtual environment so it doesn't
 pollute your system packages:
@@ -190,6 +196,85 @@ whenever the virtual environment is activated.
 
    The application starts on `http://localhost:5000`. It honours the `HOST`,
    `PORT` and `FLASK_DEBUG` environment variables.
+
+   A background sampler thread, not each request, collects the metrics; it
+   starts as soon as the server module is imported, so any WSGI entry point
+   works, not just `sys-stats-server`. Set `SYS_STATS_AUTOSTART` to `0`,
+   `false` or `no` to skip that autostart (default on — this is for
+   embedding the module without a live sampler, not something a normal
+   deployment needs to touch).
+   `SYS_STATS_SAMPLE_INTERVAL` sets how many seconds it waits between
+   samples (default `2.0`), and `SYS_STATS_TOP_PROCESSES_MAX` caps how many
+   entries it collects per per-process ranking (default `50`) — a `?limit=`
+   above that cap only returns what was already sampled.
+
+4. **`/panel` (optional):** a compact, frozen-schema endpoint built for a
+   small embedded display (an ESP32-S3 wall panel, in particular) polling
+   every few seconds — no process lists, no Ollama data, just CPU/RAM/swap/
+   GPU/sensor numbers plus an `age` in seconds telling the display how stale
+   the sample is. It shares the same background sampling pass as `/stats`,
+   so enabling it costs nothing extra in `nvidia-smi` calls. Three optional
+   caps truncate its lists for a display with limited room:
+   `SYS_STATS_PANEL_MAX_TEMPS`, `SYS_STATS_PANEL_MAX_FANS` and
+   `SYS_STATS_PANEL_MAX_GPUS` — each unset by default, meaning no cap.
+
+5. **`SYS_STATS_PANEL_ONLY` (optional, security-relevant):** set to `1`,
+   `true` or `yes` to register only the `/panel` route: `/`, `/stats` and
+   `/favicon.png` are never registered at all, so a request to them gets
+   Flask's own 404 rather than a guarded rejection. `/stats` exposes the
+   full host process table, complete command lines included, with no
+   authentication; on a host you do not fully trust the network of (a
+   hypervisor on a LAN whose guest WiFi shares a VLAN with the main
+   network, say), and where the wall-display consumer only ever needs
+   `/panel`, removing the route beats guarding it. Default is off: unset
+   registers every route exactly as before this flag existed. Note that the
+   Helm chart's default liveness/readiness/startup probes hit `/`, so
+   enabling this in the chart means repointing them at `/panel` too (see
+   `chart/values.yaml`).
+
+6. **`SYS_STATS_INSTANCE_LABEL` (optional):** a free-text label shown in the
+   web UI's page title and body, for telling apart two instances that would
+   otherwise look identical, such as a Kubernetes pod seeing the Talos VM
+   next to a second instance running on the Proxmox hypervisor underneath
+   it, both named "sys-stats" and both describing the same physical box.
+   Unset (default) renders the page exactly as before this variable
+   existed.
+
+7. **`SYS_STATS_HOSTNAME` (optional):** overrides the `host` field of the
+   `/panel` payload, which otherwise carries `socket.gethostname()`, read
+   fresh on every request so a runtime rename (`hostnamectl set-hostname`)
+   takes effect without a restart. Useful where the process's own hostname
+   is not the identity a consumer cares about, such as a container
+   reporting its pod name. This key is `/panel`-only — `/stats` never
+   carries it — and it is never merged with `SYS_STATS_INSTANCE_LABEL`:
+   that one is display prose meant to be rewritten for readability, this
+   one is a machine identity a consumer compares byte-for-byte against a
+   known value, and relabeling one must never change the other.
+
+8. **`SYS_STATS_DCGM_URL` (optional):** points `/panel`'s `gpu[]` at a
+   [dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) Prometheus
+   `/metrics` endpoint instead of GPUtil/`nvidia-smi`, for a host with no
+   NVIDIA driver of its own — a Proxmox hypervisor whose GPUs are
+   PCI-passed-through to a Kubernetes VM, say, where `dcgm-exporter` runs
+   inside that VM instead. Scraped in the same background sampling pass as
+   everything else, gated by a circuit breaker so a dead or firewalled
+   endpoint degrades to an empty `gpu[]` (plus a `"gpu"` tag in `err`)
+   instead of stalling the sampler. `/stats` never reads this variable and
+   always stays on the GPUtil/`nvidia-smi` path. Unset (default) leaves
+   `/panel` on that same path too.
+
+9. **`SYS_STATS_IPMI_INTERVAL` (optional):** seconds between polls of the
+   two `ipmi/`-prefixed `/panel` collectors (`temps`, `fans`), each an
+   `ipmitool` round trip to the host's BMC, decoupled from
+   `SYS_STATS_SAMPLE_INTERVAL`. Default `30.0` — chassis fan speed and
+   temperature move on a timescale of tens of seconds, not the 2-second
+   default sampling cadence, so polling them that often buys nothing while
+   costing a BMC round trip every pass. Between polls, `temps`/`fans` keep
+   serving the last IPMI reading rather than dropping it, so the lists
+   never lose their IPMI entries on an intermediate pass; the first pass
+   after startup always polls immediately rather than waiting a full
+   interval. hwmon sensors (`get_temperatures`, `get_fans`) are unaffected
+   and keep the normal per-pass cadence.
 
 ## 📺 Using the CLI
 
