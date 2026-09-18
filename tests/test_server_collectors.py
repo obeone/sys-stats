@@ -1,4 +1,4 @@
-"""Tests for the metric collectors of :mod:`sys_stats.server`.
+"""Tests for the metric collectors of :mod:`sys_stats.collectors`.
 
 The collectors shell out to ``nvidia-smi`` and talk to the Ollama API, so every
 test here replaces those boundaries with fakes. What matters is the parsing and
@@ -12,7 +12,7 @@ import psutil
 import pytest
 import requests
 
-from sys_stats import server
+from sys_stats import collectors
 
 
 class _FakeCompletedProcess:
@@ -59,10 +59,10 @@ class TestGetGpuFanAndPower:
     def test_parses_one_entry_per_gpu_index(self, monkeypatch):
         """The CSV output of nvidia-smi is keyed by GPU index."""
         monkeypatch.setattr(
-            server.subprocess, "run", _fake_run("0, 25, 30.5\n1, 40, 120.0\n")
+            collectors.subprocess, "run", _fake_run("0, 25, 30.5\n1, 40, 120.0\n")
         )
 
-        assert server.get_gpu_fan_and_power() == {
+        assert collectors.get_gpu_fan_and_power() == {
             0: {"fan_speed": 25.0, "power_draw": 30.5},
             1: {"fan_speed": 40.0, "power_draw": 120.0},
         }
@@ -70,16 +70,16 @@ class TestGetGpuFanAndPower:
     def test_skips_malformed_lines(self, monkeypatch):
         """Cards reporting ``N/A`` (laptop dGPUs, passive cards) are dropped, not fatal."""
         monkeypatch.setattr(
-            server.subprocess, "run", _fake_run("0, N/A, 30.5\n1, 40, 120.0\n")
+            collectors.subprocess, "run", _fake_run("0, N/A, 30.5\n1, 40, 120.0\n")
         )
 
-        assert list(server.get_gpu_fan_and_power()) == [1]
+        assert list(collectors.get_gpu_fan_and_power()) == [1]
 
     def test_returns_empty_mapping_when_nvidia_smi_fails(self, monkeypatch):
         """A failing nvidia-smi degrades to no fan/power data at all."""
-        monkeypatch.setattr(server.subprocess, "run", _failing_run())
+        monkeypatch.setattr(collectors.subprocess, "run", _failing_run())
 
-        assert server.get_gpu_fan_and_power() == {}
+        assert collectors.get_gpu_fan_and_power() == {}
 
     def test_returns_empty_mapping_when_nvidia_smi_is_absent(self, monkeypatch):
         """A missing ``nvidia-smi`` binary must degrade like a failing one.
@@ -89,9 +89,9 @@ class TestGetGpuFanAndPower:
         than ``CalledProcessError``. The collector's contract (CLAUDE.md) is
         to degrade to ``{}``, not to propagate the exception.
         """
-        monkeypatch.setattr(server.subprocess, "run", _missing_binary_run())
+        monkeypatch.setattr(collectors.subprocess, "run", _missing_binary_run())
 
-        assert server.get_gpu_fan_and_power() == {}
+        assert collectors.get_gpu_fan_and_power() == {}
 
 
 class TestGetGpuProcesses:
@@ -106,12 +106,12 @@ class TestGetGpuProcesses:
             def cmdline(self):
                 return ["python", "train.py"]
 
-        monkeypatch.setattr(server.psutil, "Process", _FakeProcess)
+        monkeypatch.setattr(collectors.psutil, "Process", _FakeProcess)
 
     def test_converts_mib_to_bytes_and_sorts_by_usage(self, monkeypatch):
         """nvidia-smi reports MiB; ``/stats`` must expose bytes, biggest first."""
         monkeypatch.setattr(
-            server.subprocess,
+            collectors.subprocess,
             "run",
             _fake_run(
                 "GPU-aaa, 100, /usr/bin/python3, 512\n"
@@ -119,7 +119,7 @@ class TestGetGpuProcesses:
             ),
         )
 
-        processes = server.get_gpu_processes()
+        processes = collectors.get_gpu_processes()
 
         assert [p["pid"] for p in processes] == [200, 100]
         assert processes[0]["memory_used"] == 2048 * 1024 * 1024
@@ -129,12 +129,12 @@ class TestGetGpuProcesses:
     def test_honours_the_limit(self, monkeypatch):
         """Only the ``limit`` heaviest processes are returned."""
         monkeypatch.setattr(
-            server.subprocess,
+            collectors.subprocess,
             "run",
             _fake_run("GPU-aaa, 1, a, 10\nGPU-aaa, 2, b, 20\nGPU-aaa, 3, c, 30\n"),
         )
 
-        assert len(server.get_gpu_processes(limit=2)) == 2
+        assert len(collectors.get_gpu_processes(limit=2)) == 2
 
     def test_falls_back_to_na_for_vanished_processes(self, monkeypatch):
         """A PID that died between nvidia-smi and psutil yields ``N/A``, not a crash."""
@@ -142,12 +142,12 @@ class TestGetGpuProcesses:
         def _raise(pid):
             raise psutil.NoSuchProcess(pid)
 
-        monkeypatch.setattr(server.psutil, "Process", _raise)
+        monkeypatch.setattr(collectors.psutil, "Process", _raise)
         monkeypatch.setattr(
-            server.subprocess, "run", _fake_run("GPU-aaa, 100, python3, 512\n")
+            collectors.subprocess, "run", _fake_run("GPU-aaa, 100, python3, 512\n")
         )
 
-        assert server.get_gpu_processes()[0]["cmdline"] == "N/A"
+        assert collectors.get_gpu_processes()[0]["cmdline"] == "N/A"
 
     def test_returns_empty_list_when_nvidia_smi_fails(self, monkeypatch):
         """No GPU compute apps and a broken nvidia-smi look the same to callers.
@@ -155,9 +155,9 @@ class TestGetGpuProcesses:
         Both the UUID-aware query and the legacy one fail here, which is the
         only case where the whole list is given up.
         """
-        monkeypatch.setattr(server.subprocess, "run", _failing_run())
+        monkeypatch.setattr(collectors.subprocess, "run", _failing_run())
 
-        assert server.get_gpu_processes() == []
+        assert collectors.get_gpu_processes() == []
 
     def test_returns_empty_list_when_nvidia_smi_is_absent(self, monkeypatch):
         """A missing ``nvidia-smi`` binary must degrade like a failing one.
@@ -167,26 +167,26 @@ class TestGetGpuProcesses:
         different exception than ``CalledProcessError``. The collector's
         contract (CLAUDE.md) is to degrade to ``[]``, not to propagate it.
         """
-        monkeypatch.setattr(server.subprocess, "run", _missing_binary_run())
+        monkeypatch.setattr(collectors.subprocess, "run", _missing_binary_run())
 
-        assert server.get_gpu_processes() == []
+        assert collectors.get_gpu_processes() == []
 
     def test_skips_malformed_lines_without_dropping_the_batch(self, monkeypatch):
         """A truncated row costs its own line, not the other processes."""
         monkeypatch.setattr(
-            server.subprocess,
+            collectors.subprocess,
             "run",
             _fake_run("GPU-aaa, 100\nGPU-aaa, 200, /usr/bin/python3, 512\n"),
         )
 
-        processes = server.get_gpu_processes()
+        processes = collectors.get_gpu_processes()
 
         assert [p["pid"] for p in processes] == [200]
 
     def test_resolves_the_gpu_index_through_the_uuid_mapping(self, monkeypatch):
         """The card of a compute app is only knowable through its UUID."""
         monkeypatch.setattr(
-            server.subprocess,
+            collectors.subprocess,
             "run",
             _fake_run(
                 "GPU-bbb, 200, /opt/ollama/ollama, 2048\n"
@@ -194,7 +194,7 @@ class TestGetGpuProcesses:
             ),
         )
 
-        processes = server.get_gpu_processes(
+        processes = collectors.get_gpu_processes(
             uuid_to_index={"GPU-aaa": 0, "GPU-bbb": 1}
         )
 
@@ -206,12 +206,12 @@ class TestGetGpuProcesses:
     def test_leaves_the_gpu_index_unresolved_without_a_mapping(self, monkeypatch):
         """Called on its own, the collector still reports the raw UUID."""
         monkeypatch.setattr(
-            server.subprocess,
+            collectors.subprocess,
             "run",
             _fake_run("GPU-aaa, 100, /usr/bin/python3, 512\n"),
         )
 
-        process = server.get_gpu_processes()[0]
+        process = collectors.get_gpu_processes()[0]
 
         assert process["gpu_uuid"] == "GPU-aaa"
         assert process["gpu_index"] is None
@@ -219,17 +219,17 @@ class TestGetGpuProcesses:
     def test_leaves_the_gpu_index_unresolved_for_an_unknown_uuid(self, monkeypatch):
         """A UUID absent from the mapping is not an error, just an unknown card."""
         monkeypatch.setattr(
-            server.subprocess,
+            collectors.subprocess,
             "run",
             _fake_run("GPU-zzz, 100, /usr/bin/python3, 512\n"),
         )
 
-        assert server.get_gpu_processes(uuid_to_index={"GPU-aaa": 0})[0]["gpu_index"] is None
+        assert collectors.get_gpu_processes(uuid_to_index={"GPU-aaa": 0})[0]["gpu_index"] is None
 
     def test_sorts_by_gpu_index_then_by_descending_memory(self, monkeypatch):
         """Processes of one card stay contiguous, heaviest first within the card."""
         monkeypatch.setattr(
-            server.subprocess,
+            collectors.subprocess,
             "run",
             _fake_run(
                 "GPU-bbb, 1, a, 4096\n"
@@ -239,7 +239,7 @@ class TestGetGpuProcesses:
             ),
         )
 
-        processes = server.get_gpu_processes(uuid_to_index={"GPU-aaa": 0, "GPU-bbb": 1})
+        processes = collectors.get_gpu_processes(uuid_to_index={"GPU-aaa": 0, "GPU-bbb": 1})
 
         assert [p["pid"] for p in processes] == [4, 2, 3, 1]
 
@@ -250,7 +250,7 @@ class TestGetGpuProcesses:
         TypeError as soon as one row is unattributed.
         """
         monkeypatch.setattr(
-            server.subprocess,
+            collectors.subprocess,
             "run",
             _fake_run(
                 "GPU-zzz, 1, a, 8192\n"
@@ -259,7 +259,7 @@ class TestGetGpuProcesses:
             ),
         )
 
-        processes = server.get_gpu_processes(uuid_to_index={"GPU-aaa": 0})
+        processes = collectors.get_gpu_processes(uuid_to_index={"GPU-aaa": 0})
 
         assert [p["pid"] for p in processes] == [2, 3, 1]
 
@@ -276,7 +276,7 @@ class TestGetGpuProcesses:
         display.
         """
         monkeypatch.setattr(
-            server.subprocess,
+            collectors.subprocess,
             "run",
             _fake_run(
                 "GPU-aaa, 1, small1, 100\n"
@@ -288,7 +288,7 @@ class TestGetGpuProcesses:
             ),
         )
 
-        processes = server.get_gpu_processes(
+        processes = collectors.get_gpu_processes(
             limit=5, uuid_to_index={"GPU-aaa": 0, "GPU-bbb": 1}
         )
 
@@ -311,9 +311,9 @@ class TestGetGpuProcesses:
                 )
             return _FakeCompletedProcess("100, /usr/bin/python3, 512\n")
 
-        monkeypatch.setattr(server.subprocess, "run", _run)
+        monkeypatch.setattr(collectors.subprocess, "run", _run)
 
-        processes = server.get_gpu_processes(uuid_to_index={"GPU-aaa": 0})
+        processes = collectors.get_gpu_processes(uuid_to_index={"GPU-aaa": 0})
 
         assert queries == [
             "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
@@ -329,18 +329,18 @@ class TestGetGpuProcesses:
 class TestGetOllamaProcess:
     def test_returns_no_models_when_url_is_unset(self, monkeypatch):
         """Without ``OLLAMA_API_URL`` the panel stays empty and no request is made."""
-        monkeypatch.setattr(server, "OLLAMA_API_URL", None)
+        monkeypatch.setattr(collectors, "OLLAMA_API_URL", None)
 
         def _explode(*args, **kwargs):
             raise AssertionError("no HTTP call expected when OLLAMA_API_URL is unset")
 
-        monkeypatch.setattr(server.requests, "get", _explode)
+        monkeypatch.setattr(collectors.requests, "get", _explode)
 
-        assert server.get_ollama_process() == {"models": []}
+        assert collectors.get_ollama_process() == {"models": []}
 
     def test_queries_the_ps_endpoint_and_returns_the_payload(self, monkeypatch):
         """The collector hits ``/api/ps`` and passes the JSON straight through."""
-        monkeypatch.setattr(server, "OLLAMA_API_URL", "http://ollama.example:11434")
+        monkeypatch.setattr(collectors, "OLLAMA_API_URL", "http://ollama.example:11434")
         payload = {"models": [{"name": "llama3", "size": 42}]}
         called = {}
 
@@ -355,28 +355,28 @@ class TestGetOllamaProcess:
             called["url"] = url
             return _FakeResponse()
 
-        monkeypatch.setattr(server.requests, "get", _get)
+        monkeypatch.setattr(collectors.requests, "get", _get)
 
-        assert server.get_ollama_process() == payload
+        assert collectors.get_ollama_process() == payload
         assert called["url"] == "http://ollama.example:11434/api/ps"
 
     def test_degrades_to_no_models_when_ollama_is_unreachable(self, monkeypatch):
         """A dead Ollama must not break the whole ``/stats`` response."""
-        monkeypatch.setattr(server, "OLLAMA_API_URL", "http://ollama.example:11434")
+        monkeypatch.setattr(collectors, "OLLAMA_API_URL", "http://ollama.example:11434")
 
         def _get(*args, **kwargs):
             raise requests.RequestException("connection refused")
 
-        monkeypatch.setattr(server.requests, "get", _get)
+        monkeypatch.setattr(collectors.requests, "get", _get)
 
-        assert server.get_ollama_process() == {"models": []}
+        assert collectors.get_ollama_process() == {"models": []}
 
 
 class TestTopProcesses:
     def test_cpu_ranking_is_sorted_and_limited(self, monkeypatch):
         """Processes come back sorted by CPU usage, truncated to ``limit``."""
         monkeypatch.setattr(
-            server.psutil,
+            collectors.psutil,
             "process_iter",
             lambda attrs: iter(
                 [
@@ -388,7 +388,7 @@ class TestTopProcesses:
             ),
         )
 
-        top = server.get_top_processes_by_cpu(limit=1)
+        top = collectors.get_top_processes_by_cpu(limit=1)
 
         assert len(top) == 1
         assert top[0]["name"] == "busy"
@@ -397,14 +397,14 @@ class TestTopProcesses:
     def test_cpu_ranking_reports_na_for_empty_cmdline(self, monkeypatch):
         """Kernel threads have no command line and must not render as an empty cell."""
         monkeypatch.setattr(
-            server.psutil,
+            collectors.psutil,
             "process_iter",
             lambda attrs: iter(
                 [_FakeProcInfo({"pid": 1, "name": "kthreadd", "cpu_percent": 1.0, "cmdline": []})]
             ),
         )
 
-        assert server.get_top_processes_by_cpu()[0]["cmdline"] == "N/A"
+        assert collectors.get_top_processes_by_cpu()[0]["cmdline"] == "N/A"
 
     def test_cpu_ranking_survives_unreadable_attributes(self, monkeypatch):
         """Regression: ``process_iter`` yields None for denied attributes.
@@ -414,7 +414,7 @@ class TestTopProcesses:
         container started without ``pid: host`` and ``privileged``).
         """
         monkeypatch.setattr(
-            server.psutil,
+            collectors.psutil,
             "process_iter",
             lambda attrs: iter(
                 [
@@ -424,7 +424,7 @@ class TestTopProcesses:
             ),
         )
 
-        top = server.get_top_processes_by_cpu()
+        top = collectors.get_top_processes_by_cpu()
 
         assert [p["name"] for p in top] == ["mine", "root-owned"]
         assert top[1]["cpu_percent"] == 0.0
@@ -433,7 +433,7 @@ class TestTopProcesses:
     def test_memory_ranking_survives_unreadable_attributes(self, monkeypatch):
         """Regression: a None ``memory_info`` must not raise AttributeError."""
         monkeypatch.setattr(
-            server.psutil,
+            collectors.psutil,
             "process_iter",
             lambda attrs: iter(
                 [
@@ -450,7 +450,7 @@ class TestTopProcesses:
             ),
         )
 
-        top = server.get_top_processes_by_memory()
+        top = collectors.get_top_processes_by_memory()
 
         assert top[0]["memory_usage"] == 0
         assert top[0]["memory_percent"] == 0.0
@@ -458,7 +458,7 @@ class TestTopProcesses:
     def test_memory_ranking_exposes_rss_in_bytes(self, monkeypatch):
         """``memory_usage`` is the RSS in bytes, ranked by percentage."""
         monkeypatch.setattr(
-            server.psutil,
+            collectors.psutil,
             "process_iter",
             lambda attrs: iter(
                 [
@@ -484,7 +484,7 @@ class TestTopProcesses:
             ),
         )
 
-        top = server.get_top_processes_by_memory()
+        top = collectors.get_top_processes_by_memory()
 
         assert [p["name"] for p in top] == ["large", "small"]
         assert top[0]["memory_usage"] == 4096
