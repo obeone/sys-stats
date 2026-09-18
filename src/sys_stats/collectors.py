@@ -10,7 +10,9 @@ them into the exact dict the ``/stats`` endpoint has always returned.
 import datetime
 import logging
 import os
+import re
 import subprocess
+import time
 from typing import Any
 from urllib.parse import urljoin
 
@@ -332,6 +334,363 @@ def get_ollama_process():
         print(f"Error fetching Ollama data: {e}")
 
     return ollama_data
+
+# --- DCGM (NVIDIA Data Center GPU Manager) exporter scraping ---------------
+#
+# Some deployments run this server on a host with no NVIDIA driver of its
+# own -- e.g. a Proxmox hypervisor whose GPUs are PCI-passed-through to a
+# Kubernetes VM, leaving the host with neither /dev/nvidia* nor nvidia-smi.
+# On that host, GPU metrics instead come from dcgm-exporter running inside
+# the cluster on the VM the GPUs were passed into, scraped as a Prometheus
+# ``/metrics`` endpoint (curled directly against one such endpoint during
+# development: http://10.50.0.106:30940/metrics, 200 OK in ~21ms for ~10KB
+# of body).
+#
+# Only the metric families below are read, all confirmed present on that
+# endpoint's own ``# HELP`` lines: GPU utilization (%), framebuffer used/free
+# (MiB), GPU temperature (C), power draw (W) and fan speed (%).
+
+#: Metric families read from the DCGM exporter body; anything else in the
+#: response is ignored.
+_DCGM_METRIC_FIELDS = frozenset({
+    "DCGM_FI_DEV_GPU_UTIL",
+    "DCGM_FI_DEV_FB_USED",
+    "DCGM_FI_DEV_FB_FREE",
+    "DCGM_FI_DEV_GPU_TEMP",
+    "DCGM_FI_DEV_POWER_USAGE",
+    "DCGM_FI_DEV_FAN_SPEED",
+})
+
+# Prometheus text exposition format, one sample per line:
+#   METRIC_NAME{label="value",label2="value2"} 123.45
+# Blank lines and comment lines (# HELP / # TYPE) are skipped by the caller
+# before either of these ever runs against a line.
+_DCGM_METRIC_LINE_RE = re.compile(
+    r'^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)\{(?P<labels>[^}]*)\}\s+(?P<value>\S+)\s*$'
+)
+_DCGM_LABEL_RE = re.compile(r'(?P<key>[A-Za-z_][A-Za-z0-9_]*)="(?P<value>(?:[^"\\]|\\.)*)"')
+
+# requests' `timeout=` bounds each individual socket send/recv, not the call
+# as a whole: a server that returns one byte every 2.9 seconds never trips a
+# 3-second read timeout and can hold the connection open indefinitely. The
+# tuple form applies the first value to the connect phase and the second to
+# each read phase, individually and repeatedly.
+_DCGM_CONNECT_TIMEOUT = 2.0
+_DCGM_READ_TIMEOUT = 3.0
+
+# Hard wall-clock budget for one whole scrape attempt, enforced independently
+# of the per-socket timeouts above -- see _fetch_dcgm_text -- so a connection
+# that keeps dribbling bytes without ever going idle long enough to trip
+# _DCGM_READ_TIMEOUT still gets abandoned. The measured healthy case (curl
+# above) answers in ~21ms for the whole body, so this leaves ample headroom
+# while still bounding how long this collector can hold up the sampler pass
+# it runs inside (see sys_stats.sampler._collect_panel_extras).
+_DCGM_HARD_DEADLINE = 5.0
+
+# requests' timeout does not cover DNS resolution: socket.getaddrinfo runs
+# before either half of the timeout tuple above starts counting, so an
+# unreachable or slow resolver can stall this call regardless of
+# _DCGM_CONNECT_TIMEOUT / _DCGM_READ_TIMEOUT. This is documented upstream in
+# requests' own timeout reference, not something measured on this network.
+# The mitigation is deployment-side: SYS_STATS_DCGM_URL is expected to carry
+# a literal IP (as in the deployment this collector targets), and nothing
+# here resolves or pre-resolves a hostname on the caller's behalf.
+
+# Circuit breaker tuning. Measured on the target network: a NodePort with no
+# backing Service silently drops packets on some nodes rather than refusing
+# the connection, and the host runs pve-firewall with a DROP policy on
+# unauthorised ports -- both hang instead of failing fast, and a wedged
+# scrape retried on every sampling pass (default SYS_STATS_SAMPLE_INTERVAL is
+# 2s) would make the sampler miss its own cadence, letting /panel's ``age``
+# climb while the underlying cause is a missing firewall rule, not the
+# server. 3 consecutive failures is chosen to tolerate a transient blip or
+# two before backing off; backoff then starts at 5s and doubles up to a 60s
+# cap, so a dead endpoint is retried occasionally rather than hammered, and a
+# fixed endpoint recovers within a bounded window rather than staying open
+# forever.
+_DCGM_BREAKER_THRESHOLD = 3
+_DCGM_BREAKER_BASE_BACKOFF = 5.0
+_DCGM_BREAKER_MAX_BACKOFF = 60.0
+
+
+class _DcgmCircuitBreaker:
+    """Gates DCGM scrape attempts after repeated consecutive failures.
+
+    Holds no more than a failure count and a "next attempt allowed at"
+    monotonic timestamp. One instance is shared module-wide (see
+    ``_dcgm_breaker`` below): this process talks to at most one configured
+    ``SYS_STATS_DCGM_URL``, so there is exactly one endpoint's health to
+    track, not one per call.
+    """
+
+    def __init__(self, threshold: int, base_backoff: float, max_backoff: float) -> None:
+        """
+        Parameters
+        ----------
+        threshold : int
+            Consecutive failures required before the breaker starts
+            skipping attempts.
+        base_backoff : float
+            Seconds to wait before the first retry once the breaker opens.
+        max_backoff : float
+            Cap on the backoff delay, however many failures accumulate past
+            ``threshold``.
+        """
+        self._threshold = threshold
+        self._base_backoff = base_backoff
+        self._max_backoff = max_backoff
+        self.consecutive_failures = 0
+        self._next_attempt_at = 0.0
+
+    def allow_attempt(self) -> bool:
+        """Whether a scrape attempt may be made right now.
+
+        Returns
+        -------
+        bool
+            ``True`` when the breaker is closed, or open but past its
+            backoff window; ``False`` while a backoff window is active.
+        """
+        return time.monotonic() >= self._next_attempt_at
+
+    def record_success(self) -> None:
+        """Close the breaker: a successful scrape resets the failure count."""
+        self.consecutive_failures = 0
+        self._next_attempt_at = 0.0
+
+    def record_failure(self) -> None:
+        """Record one failed attempt, opening the breaker past the threshold.
+
+        Backoff is computed from how far past ``threshold`` the failure
+        streak has gone, doubling each additional failure and capped at
+        ``max_backoff``, so the delay before the *next* allowed attempt
+        keeps growing the longer the endpoint stays down.
+        """
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self._threshold:
+            backoff_steps = self.consecutive_failures - self._threshold
+            backoff = min(self._base_backoff * (2 ** backoff_steps), self._max_backoff)
+            self._next_attempt_at = time.monotonic() + backoff
+
+    def reset(self) -> None:
+        """Return to a fresh, closed state. Test-only."""
+        self.consecutive_failures = 0
+        self._next_attempt_at = 0.0
+
+
+# Single module-level breaker instance; see _DcgmCircuitBreaker's docstring
+# for why one instance is enough.
+_dcgm_breaker = _DcgmCircuitBreaker(
+    _DCGM_BREAKER_THRESHOLD, _DCGM_BREAKER_BASE_BACKOFF, _DCGM_BREAKER_MAX_BACKOFF
+)
+
+
+def _reset_dcgm_breaker_for_tests() -> None:
+    """Reset the module-level DCGM circuit breaker to a closed state.
+
+    Not part of the public API. Without this, one test's induced failures
+    would leave the breaker open for whichever test runs next, exactly like
+    :func:`sys_stats.sampler._reset_for_tests` exists to stop a leftover
+    background thread from corrupting later tests.
+    """
+    _dcgm_breaker.reset()
+
+
+def _fetch_dcgm_text(url: str) -> str:
+    """Fetch the raw dcgm-exporter Prometheus text body, bounded by a hard deadline.
+
+    Streams the response instead of using ``requests``' buffered ``.text``,
+    checking elapsed wall-clock time after every chunk against
+    ``_DCGM_HARD_DEADLINE``. This is what catches a connection that dribbles
+    bytes slowly enough to never trip ``_DCGM_READ_TIMEOUT`` on any single
+    read -- see the trap documented above ``_DCGM_CONNECT_TIMEOUT``.
+
+    Parameters
+    ----------
+    url : str
+        The dcgm-exporter ``/metrics`` URL.
+
+    Returns
+    -------
+    str
+        The decoded response body.
+
+    Raises
+    ------
+    requests.RequestException
+        On a connection failure, an HTTP error status, or a per-socket
+        timeout (see ``_DCGM_CONNECT_TIMEOUT`` / ``_DCGM_READ_TIMEOUT``).
+    TimeoutError
+        When the transfer as a whole exceeds ``_DCGM_HARD_DEADLINE`` even
+        though no single socket operation individually timed out.
+    """
+    deadline = time.monotonic() + _DCGM_HARD_DEADLINE
+    response = requests.get(
+        url,
+        timeout=(_DCGM_CONNECT_TIMEOUT, _DCGM_READ_TIMEOUT),
+        stream=True,
+    )
+    try:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                chunks.append(chunk)
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"DCGM scrape of {url} exceeded the {_DCGM_HARD_DEADLINE}s hard deadline"
+                )
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    finally:
+        close = getattr(response, "close", None)
+        if close is not None:
+            close()
+
+
+def _parse_dcgm_metrics(text: str) -> list[dict[str, Any]]:
+    """Parse a dcgm-exporter Prometheus text body into per-GPU ``/panel`` entries.
+
+    Keys ONLY on the ``gpu`` label of each sample line; every other label
+    (``namespace``, ``pod``, ``container``, ``hostname``, ``UUID``,
+    ``pci_bus_id``, ...) is ignored. Measured on the target endpoint: the
+    same GPU index was seen carrying a different pod's labels an hour apart,
+    and later carrying the labels of a pod that also held the other GPU,
+    with nothing redeployed in between -- those labels describe whichever
+    workload currently holds the device and move on their own, so grouping
+    on them would silently stop matching.
+
+    Parameters
+    ----------
+    text : str
+        The raw ``/metrics`` response body.
+
+    Returns
+    -------
+    list of dict
+        One entry per distinct ``gpu`` label, in the exact ``/panel`` GPU
+        shape (``i``, ``n``, ``load``, ``mem_used``, ``mem_total``,
+        ``mem_pct``, ``temp``, ``fan``, ``power``), sorted by ``i`` for a
+        stable display order (see get_temperatures for why this codebase
+        always sorts positionally-rendered lists). A line that does not
+        match the expected exposition-format shape, carries a metric family
+        outside ``_DCGM_METRIC_FIELDS``, has no ``gpu`` label, or has a
+        non-numeric value, is skipped rather than aborting the whole parse.
+    """
+    per_gpu: dict[str, dict[str, Any]] = {}
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        match = _DCGM_METRIC_LINE_RE.match(line)
+        if not match:
+            continue
+
+        name = match.group('name')
+        if name not in _DCGM_METRIC_FIELDS:
+            continue
+
+        try:
+            value = float(match.group('value'))
+        except ValueError:
+            continue
+
+        labels = dict(_DCGM_LABEL_RE.findall(match.group('labels')))
+        gpu_label = labels.get('gpu')
+        if gpu_label is None:
+            continue
+
+        entry = per_gpu.setdefault(gpu_label, {})
+        entry[name] = value
+        model_name = labels.get('modelName')
+        if model_name:
+            entry['modelName'] = model_name
+
+    results: list[dict[str, Any]] = []
+    for gpu_label, metrics in per_gpu.items():
+        # MiB -> bytes: /panel reports every memory figure in bytes (see
+        # _build_panel_gpu_entry in server.py); FB_USED/FB_FREE are the
+        # exporter's own "Framebuffer memory used/free (in MiB)" families.
+        mem_used = int(metrics.get('DCGM_FI_DEV_FB_USED', 0.0) * 1024 * 1024)
+        mem_free = int(metrics.get('DCGM_FI_DEV_FB_FREE', 0.0) * 1024 * 1024)
+
+        # DCGM exposes no total-memory metric, so it is derived as used +
+        # free. Measured on an idle card: used=0 MiB, free=24125 MiB, giving
+        # a derived total of 24125 MiB rather than the card's nominal 24576
+        # -- the gap is framebuffer the driver reserves for itself. That is
+        # the correct total for this endpoint and is deliberately not
+        # rounded up to the nominal figure.
+        mem_total = mem_used + mem_free
+        mem_pct = (mem_used / mem_total * 100) if mem_total > 0 else 0.0
+
+        results.append({
+            "i": int(gpu_label),
+            "n": metrics.get("modelName") or f"GPU {gpu_label}",
+            "load": round(metrics.get("DCGM_FI_DEV_GPU_UTIL", 0.0), 1),
+            "mem_used": mem_used,
+            "mem_total": mem_total,
+            "mem_pct": round(mem_pct, 1),
+            "temp": round(metrics.get("DCGM_FI_DEV_GPU_TEMP", 0.0), 1),
+            # Fan speed is the exporter's own "Fan speed (in %)" family, not
+            # RPM. Measured on healthy idle 3090s: 0 -- genuine zero-RPM
+            # mode, not a missing field, so it is not treated as absent.
+            "fan": int(round(metrics.get("DCGM_FI_DEV_FAN_SPEED", 0.0))),
+            "power": round(metrics.get("DCGM_FI_DEV_POWER_USAGE", 0.0), 1),
+        })
+
+    results.sort(key=lambda e: e["i"])
+    return results
+
+
+def get_dcgm_gpus(url: str) -> list[dict[str, Any]]:
+    """Retrieve per-GPU metrics from a dcgm-exporter Prometheus endpoint.
+
+    Used in place of the GPUtil/nvidia-smi path (see :func:`collect_stats`)
+    on hosts with no NVIDIA driver of their own -- e.g. a Proxmox hypervisor
+    whose GPUs are PCI-passed-through to a Kubernetes VM, where dcgm-exporter
+    runs inside that VM instead. Returns entries already in the exact shape
+    ``/panel``'s ``gpu[]`` uses, so the caller (see
+    :func:`sys_stats.sampler._collect_panel_extras`) can use them as a
+    drop-in replacement with no further reshaping.
+
+    Same graceful-degradation contract as this module's nvidia-smi
+    collectors (:func:`get_gpu_fan_and_power`, :func:`get_gpu_processes`):
+    never raises, degrades to an empty list on any failure -- a dead
+    connection, an HTTP error, a timeout, a body that does not parse -- so a
+    scrape failure can never take down the sampler's pass. Gated by a
+    circuit breaker (see ``_dcgm_breaker`` / ``_DcgmCircuitBreaker``): after
+    ``_DCGM_BREAKER_THRESHOLD`` consecutive failures, further attempts are
+    skipped and spaced out with capped backoff instead of being retried on
+    every sampling pass; the breaker closes again on the first success.
+
+    Parameters
+    ----------
+    url : str
+        The dcgm-exporter ``/metrics`` URL, expected to carry a literal IP
+        rather than a hostname (see the DNS-resolution note above
+        ``_DCGM_BREAKER_THRESHOLD``).
+
+    Returns
+    -------
+    list of dict
+        One entry per GPU reported. Empty when the breaker is open, the
+        scrape failed, or the body carried no recognised metric lines.
+    """
+    if not _dcgm_breaker.allow_attempt():
+        logger.debug(f"DCGM breaker open; skipping scrape of {url}")
+        return []
+
+    try:
+        text = _fetch_dcgm_text(url)
+    except Exception as e:
+        logger.warning(f"Error fetching DCGM GPU metrics from {url}: {e}")
+        _dcgm_breaker.record_failure()
+        return []
+
+    _dcgm_breaker.record_success()
+    return _parse_dcgm_metrics(text)
+
 
 def get_temperatures() -> list[dict[str, Any]]:
     """Retrieve hardware temperature sensors, sorted for stable display order.
