@@ -537,9 +537,27 @@ def _build_panel_payload(
     # frozen at whatever it was when the sample landed.
     age = max(0, int(time.monotonic() - monotonic_ts))
 
-    all_gpus = stats["gpu"]
     all_temps = extras["temps"]
     all_fans = extras["fans"]
+
+    # extras only carries "dcgm_gpu" when SYS_STATS_DCGM_URL is configured
+    # (see sampler._get_dcgm_url / sampler._collect_panel_extras). Its
+    # absence is exactly "build gpu[] from stats["gpu"] the way this always
+    # has", not "collected and empty" -- current behaviour stays byte-for-
+    # byte unchanged when the variable is unset. get_dcgm_gpus already
+    # returns entries in this exact /panel shape (see
+    # sys_stats.collectors.get_dcgm_gpus), so no further reshaping through
+    # _build_panel_gpu_entry is needed on that path.
+    dcgm_gpus = extras.get("dcgm_gpu")
+    if dcgm_gpus is not None:
+        gpu_source: list[dict[str, Any]] = dcgm_gpus
+        gpu_entries = _cap_list(gpu_source, _get_panel_cap(_PANEL_MAX_GPUS_ENV))
+    else:
+        gpu_source = stats["gpu"]
+        gpu_entries = [
+            _build_panel_gpu_entry(g)
+            for g in _cap_list(gpu_source, _get_panel_cap(_PANEL_MAX_GPUS_ENV))
+        ]
 
     return {
         "v": 1,
@@ -568,11 +586,8 @@ def _build_panel_payload(
             "pct": _round1(stats["ram"]["percent"]),
         },
         "swap": extras["swap"],
-        "gpu": [
-            _build_panel_gpu_entry(g)
-            for g in _cap_list(all_gpus, _get_panel_cap(_PANEL_MAX_GPUS_ENV))
-        ],
-        "gpu_n": len(all_gpus),
+        "gpu": gpu_entries,
+        "gpu_n": len(gpu_source),
         "temps": _cap_list(all_temps, _get_panel_cap(_PANEL_MAX_TEMPS_ENV)),
         "temps_n": len(all_temps),
         "fans": _cap_list(all_fans, _get_panel_cap(_PANEL_MAX_FANS_ENV)),

@@ -136,6 +136,35 @@ def _get_top_processes_cap() -> int:
     return cap
 
 
+def _get_dcgm_url() -> str | None:
+    """Read the configured dcgm-exporter endpoint from ``SYS_STATS_DCGM_URL``.
+
+    Unset (default): ``/panel``'s ``gpu[]`` keeps being built from the same
+    GPUtil/nvidia-smi path ``/stats`` uses (see
+    :func:`sys_stats.collectors.collect_stats`) -- current behaviour,
+    unchanged. Set: ``/panel``'s ``gpu[]`` is built from
+    :func:`sys_stats.collectors.get_dcgm_gpus` instead (see
+    :func:`_collect_panel_extras`). ``/stats`` itself never reads this
+    variable and is unaffected either way.
+
+    Read fresh on every call rather than cached at import time, like
+    :func:`sys_stats.server._instance_label`, so pointing this at a
+    different endpoint takes effect on the next sampling pass without a
+    restart.
+
+    Returns
+    -------
+    str or None
+        The configured URL with surrounding whitespace stripped, or
+        ``None`` when the variable is unset or blank.
+    """
+    raw = os.getenv("SYS_STATS_DCGM_URL")
+    if raw is None:
+        return None
+    url = raw.strip()
+    return url or None
+
+
 def _store_snapshot(stats: dict[str, Any], panel_extras: dict[str, Any] | None = None) -> None:
     """Store a freshly collected sample as the current cache entry.
 
@@ -195,12 +224,31 @@ def _collect_panel_extras() -> dict[str, Any]:
     folded into ``gpu[]``, where a temperature-only entry would read as an
     idle card instead of missing data.
 
+    When ``SYS_STATS_DCGM_URL`` is configured (see :func:`_get_dcgm_url`),
+    also scrapes a dcgm-exporter Prometheus endpoint in this same pass via
+    :func:`sys_stats.collectors.get_dcgm_gpus` -- no second thread, no
+    second pass -- and stores the result under the ``dcgm_gpu`` key, for
+    ``/panel``'s route to use in place of the ``stats["gpu"]``/nvidia-smi
+    path (see :func:`sys_stats.server._build_panel_payload`). Unlike every
+    other field here, this key is only present in the returned dict at all
+    when the URL is configured: its absence is exactly "unchanged from
+    before this feature existed", not "collected and empty". Unlike this
+    function's other collectors, :func:`sys_stats.collectors.get_dcgm_gpus`
+    is documented to never raise -- it degrades to ``[]`` internally, the
+    same contract as the nvidia-smi collectors -- so an empty result while
+    configured is treated as the failure signal itself (this deployment's
+    dcgm-exporter always monitors its host's passed-through GPUs, so a
+    successful scrape reporting zero of them is not a case this code
+    distinguishes from a failed one) and tags ``"gpu"`` into ``err``.
+
     Returns
     -------
     dict
-        Keys ``temps``, ``fans``, ``swap``, ``per_core``, ``load``, ``mhz``
-        and ``err``. ``err`` lists the short tags of whichever collectors
-        raised, in call order; empty when every collector succeeded.
+        Keys ``temps``, ``fans``, ``swap``, ``per_core``, ``load``, ``mhz``,
+        ``err`` and, only when ``SYS_STATS_DCGM_URL`` is configured,
+        ``dcgm_gpu``. ``err`` lists the short tags of whichever collectors
+        raised (or, for ``"gpu"``, failed to scrape), in call order; empty
+        when every collector succeeded.
     """
     err: list[str] = []
 
@@ -269,7 +317,7 @@ def _collect_panel_extras() -> dict[str, Any]:
         mhz = 0
         err.append("cpu_freq")
 
-    return {
+    extras: dict[str, Any] = {
         "temps": temps,
         "fans": fans,
         "swap": swap,
@@ -278,6 +326,23 @@ def _collect_panel_extras() -> dict[str, Any]:
         "mhz": mhz,
         "err": err,
     }
+
+    dcgm_url = _get_dcgm_url()
+    if dcgm_url:
+        try:
+            dcgm_gpus = collectors.get_dcgm_gpus(dcgm_url)
+        except Exception:
+            # collectors.get_dcgm_gpus is documented to never raise (same
+            # contract as the nvidia-smi collectors); this is a defensive
+            # backstop only, matching every other collector call above.
+            logger.exception("Panel: failed to collect DCGM GPU metrics")
+            dcgm_gpus = []
+
+        if not dcgm_gpus:
+            err.append("gpu")
+        extras["dcgm_gpu"] = dcgm_gpus
+
+    return extras
 
 
 def _sample_once(limit: int) -> None:
