@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import copy
 import logging
 import os
 from typing import Any
@@ -114,9 +115,10 @@ def _slice_to_limit(stats: dict[str, Any], limit: int) -> dict[str, Any]:
 
     The sampler always collects each ranking up to its own cap
     (``SYS_STATS_TOP_PROCESSES_MAX``), independent of what any individual
-    request asks for. This slices a *copy* down to what the caller actually
-    requested, so mutating the returned dict (as Flask's JSON encoder does
-    not, but a future caller might) can never corrupt the shared cache.
+    request asks for. This deep-copies the payload before slicing it down to
+    what the caller actually requested, so mutating the returned dict, down
+    to a value nested inside a ranking entry or inside another top-level key
+    such as ``ram``, can never corrupt the shared cache.
 
     Parameters
     ----------
@@ -129,17 +131,17 @@ def _slice_to_limit(stats: dict[str, Any], limit: int) -> dict[str, Any]:
     Returns
     -------
     dict
-        A shallow copy of ``stats`` with ``top_cpu``, ``top_memory`` and
+        A deep copy of ``stats`` with ``top_cpu``, ``top_memory`` and
         ``top_gpu_processes`` replaced by rankings capped at ``limit``, same
         key order. ``top_gpu_processes`` is re-selected by descending VRAM
         usage before truncation, then redisplayed in the collector's order;
         the other two rankings are already sorted by their metric, so a
         plain slice keeps the heaviest entries.
     """
-    response = dict(stats)
+    response = copy.deepcopy(stats)
     warned = False
     for key in _RANKING_KEYS:
-        sampled = stats[key]
+        sampled = response[key]
         if limit > len(sampled) and not warned:
             # The sampler already returned everything it collected; asking
             # for more than that cannot be satisfied without re-collecting

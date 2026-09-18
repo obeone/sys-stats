@@ -284,20 +284,30 @@ def test_stats_served_from_cache_matches_the_sampled_payload(client):
 
 
 def test_slice_to_limit_returns_independent_list_copies():
-    """Mutating a per-request response must never corrupt the shared cache."""
+    """Mutating a per-request response must never corrupt the shared cache.
+
+    Isolation has to go deeper than the top level: a caller mutating a value
+    nested inside a ranking entry, or inside another top-level key like
+    ``ram``, must not poison what the next request reads from the sampler's
+    cache either.
+    """
     cached = {
         "top_cpu": [{"pid": 1}],
         "top_memory": [{"pid": 2}],
         "top_gpu_processes": [{"pid": 3, "gpu_index": 0, "memory_used": 100}],
+        "ram": {"total": 100, "used": 50},
         "other_key": "unchanged",
     }
 
     sliced = server._slice_to_limit(cached, limit=5)
     sliced["top_cpu"].append({"pid": 999, "name": "intruder"})
+    sliced["top_cpu"][0]["pid"] = -1
     sliced["top_memory"] = "replaced"
+    sliced["ram"]["used"] = 999999
 
     assert cached["top_cpu"] == [{"pid": 1}]
     assert cached["top_memory"] == [{"pid": 2}]
+    assert cached["ram"] == {"total": 100, "used": 50}
     assert cached["other_key"] == "unchanged"
 
 
