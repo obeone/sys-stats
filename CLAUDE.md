@@ -112,6 +112,7 @@ unprivileged hosts.
 | `SYS_STATS_PANEL_MAX_TEMPS`   | server      | Caps the `/panel` `temps` list; unset (default) means no cap |
 | `SYS_STATS_PANEL_MAX_FANS`    | server      | Caps the `/panel` `fans` list; unset (default) means no cap |
 | `SYS_STATS_PANEL_MAX_GPUS`    | server      | Caps the `/panel` `gpu` list; unset (default) means no cap |
+| `SYS_STATS_PANEL_ONLY`        | server      | `1`/`true`/`yes` registers ONLY `/panel` — `/`, `/stats` and `/favicon.png` are never registered, not just guarded; unset (default) registers every route |
 | `SYS_STATS_API_URL`           | CLI         | Default `--url`, default `http://localhost:5000/stats` |
 
 ## Versioning

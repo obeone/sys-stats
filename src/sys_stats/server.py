@@ -9,6 +9,7 @@ from typing import Any
 import coloredlogs
 from flask import Flask, jsonify, render_template, request, send_from_directory
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 
 from . import sampler
 
@@ -46,19 +47,65 @@ _autostart_disabled = os.getenv('SYS_STATS_AUTOSTART', '1').strip().lower() in (
 if not _in_debug_reloader_monitor and not _autostart_disabled:
     sampler.start()
 
+#: Env var gating whether the app registers the general-purpose routes
+#: (``/``, ``/stats``, ``/favicon.png``) at all, versus only ``/panel``.
+_PANEL_ONLY_ENV = "SYS_STATS_PANEL_ONLY"
+
+
+def _panel_only_enabled() -> bool:
+    """Read whether only the ``/panel`` route should be registered.
+
+    This is a security control, not a convenience toggle. ``/stats`` exposes
+    the full host process table -- complete command lines -- unauthenticated,
+    and a token passed as a CLI argument is readable to anyone on the same
+    host or LAN segment. A route that was never registered cannot be reached
+    by a path-traversal trick, a proxy quirk, or a future middleware bug the
+    way a route guarded by a ``before_request`` check still could -- hence
+    this gates route *registration* itself, not a request-time check.
+
+    Returns
+    -------
+    bool
+        ``True`` when :data:`_PANEL_ONLY_ENV` is set to ``"1"``, ``"true"``
+        or ``"yes"`` (case-insensitive). ``False`` otherwise, including when
+        it is unset -- the default registers every route exactly as before
+        this flag existed.
+    """
+    return os.getenv(_PANEL_ONLY_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+# Read once at import time: routes are registered exactly once, when this
+# module is imported, so there is nothing to gain from re-reading the env
+# var per request the way the sampler's own env readers do.
+_panel_only = _panel_only_enabled()
+
+
 @app.errorhandler(Exception)
 def handle_exception(e):
+    """Turn an uncaught exception into a JSON 500, without masking routing errors.
+
+    ``Exception`` also matches Werkzeug's ``HTTPException`` (404, 405, ...),
+    since it is a subclass. Without the check below, a request to a route
+    that was never registered -- exactly what ``SYS_STATS_PANEL_ONLY`` relies
+    on for `/`, `/stats` and `/favicon.png` -- would be coerced into a 500
+    "Unhandled exception" instead of Flask's own 404, which defeats the
+    whole point of not registering the route: the response would look like a
+    crash rather than like the endpoint never existed.
+    """
+    if isinstance(e, HTTPException):
+        return e
     logger.error(f"Unhandled exception: {e}")
     return jsonify({"error": str(e)}), 500
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+if not _panel_only:
+    @app.route('/')
+    def index():
+        return render_template('index.html')
 
 
-@app.route('/favicon.png')
-def favicon():
-    return send_from_directory(os.path.join(app.root_path, 'templates'), 'favicon.png', mimetype='image/png')
+    @app.route('/favicon.png')
+    def favicon():
+        return send_from_directory(os.path.join(app.root_path, 'templates'), 'favicon.png', mimetype='image/png')
 
 
 #: Floor on how long ``/stats`` waits for the sampler's first snapshot on a
@@ -193,66 +240,67 @@ def _slice_to_limit(stats: dict[str, Any], limit: int) -> dict[str, Any]:
     return response
 
 
-@app.route('/stats', methods=['GET'])
-def get_stats():
-    """Serve the ``/stats`` payload consumed by the web UI and the Rich CLI.
+if not _panel_only:
+    @app.route('/stats', methods=['GET'])
+    def get_stats():
+        """Serve the ``/stats`` payload consumed by the web UI and the Rich CLI.
 
-    Reads the latest snapshot the background sampler (:mod:`sys_stats.sampler`)
-    has already collected instead of collecting inline, then slices the
-    per-process rankings down to the requested ``limit``. On a cold start,
-    with no snapshot yet, it waits briefly for the sampler's first sample
-    rather than returning an error.
+        Reads the latest snapshot the background sampler (:mod:`sys_stats.sampler`)
+        has already collected instead of collecting inline, then slices the
+        per-process rankings down to the requested ``limit``. On a cold start,
+        with no snapshot yet, it waits briefly for the sampler's first sample
+        rather than returning an error.
 
-    Returns
-    -------
-    flask.Response
-        200 with the JSON payload whose top-level keys are the public
-        contract of the project (adding keys is a minor bump, renaming one
-        is a major bump), or 503 with ``{}`` when no snapshot landed within
-        the cold-start wait, or when the one that did is not a complete
-        payload.
-    """
-    limit_str = request.args.get("limit", "5")
-    try:
-        limit = int(limit_str)
-    except ValueError:
-        limit = 5
+        Returns
+        -------
+        flask.Response
+            200 with the JSON payload whose top-level keys are the public
+            contract of the project (adding keys is a minor bump, renaming one
+            is a major bump), or 503 with ``{}`` when no snapshot landed within
+            the cold-start wait, or when the one that did is not a complete
+            payload.
+        """
+        limit_str = request.args.get("limit", "5")
+        try:
+            limit = int(limit_str)
+        except ValueError:
+            limit = 5
 
-    stats, _wall_ts, _monotonic_ts = sampler.get_snapshot()
-    if stats is None:
-        stats, _wall_ts, _monotonic_ts = sampler.wait_for_first_snapshot(
-            timeout=_first_snapshot_timeout()
-        )
+        stats, _wall_ts, _monotonic_ts = sampler.get_snapshot()
+        if stats is None:
+            stats, _wall_ts, _monotonic_ts = sampler.wait_for_first_snapshot(
+                timeout=_first_snapshot_timeout()
+            )
 
-    if stats is None:
-        # Every sampler iteration failed within the wait window (the sampler
-        # itself is crash-proof and logs each failure), or the sampler never
-        # started at all. A 200 + {} here would be a lie: both consumers (the
-        # inline JS dashboard and the Rich CLI) expect every key in the
-        # contract to be present and would fail on a missing key instead of
-        # seeing the real error. 503 tells the caller to retry rather than
-        # silently rendering nothing. With the sampler now started at module
-        # import time, this path is only reachable as a genuine failure, not
-        # during normal startup.
-        logger.error("No sampler snapshot available after waiting; returning 503")
-        return jsonify({}), 503
+        if stats is None:
+            # Every sampler iteration failed within the wait window (the sampler
+            # itself is crash-proof and logs each failure), or the sampler never
+            # started at all. A 200 + {} here would be a lie: both consumers (the
+            # inline JS dashboard and the Rich CLI) expect every key in the
+            # contract to be present and would fail on a missing key instead of
+            # seeing the real error. 503 tells the caller to retry rather than
+            # silently rendering nothing. With the sampler now started at module
+            # import time, this path is only reachable as a genuine failure, not
+            # during normal startup.
+            logger.error("No sampler snapshot available after waiting; returning 503")
+            return jsonify({}), 503
 
-    # "A snapshot exists" and "the snapshot is usable" are two different
-    # questions, and only the first one was ever asked here. A non-None but
-    # incomplete cache entry -- an empty dict, or anything not produced by
-    # collect_stats -- used to reach _slice_to_limit and surface as a 500
-    # KeyError naming a contract key, which tells a caller nothing about
-    # what to do next. Absence of usable data is a 503 and a retry, exactly
-    # like the branch above and like /panel's own contract.
-    missing = [key for key in _RANKING_KEYS if key not in stats]
-    if missing:
-        logger.error(
-            f"Sampler snapshot is missing {', '.join(missing)}; it is not a "
-            f"complete /stats payload, returning 503"
-        )
-        return jsonify({}), 503
+        # "A snapshot exists" and "the snapshot is usable" are two different
+        # questions, and only the first one was ever asked here. A non-None but
+        # incomplete cache entry -- an empty dict, or anything not produced by
+        # collect_stats -- used to reach _slice_to_limit and surface as a 500
+        # KeyError naming a contract key, which tells a caller nothing about
+        # what to do next. Absence of usable data is a 503 and a retry, exactly
+        # like the branch above and like /panel's own contract.
+        missing = [key for key in _RANKING_KEYS if key not in stats]
+        if missing:
+            logger.error(
+                f"Sampler snapshot is missing {', '.join(missing)}; it is not a "
+                f"complete /stats payload, returning 503"
+            )
+            return jsonify({}), 503
 
-    return jsonify(_slice_to_limit(stats, limit))
+        return jsonify(_slice_to_limit(stats, limit))
 
 
 # Env vars capping each /panel list, each unset by default meaning no cap.

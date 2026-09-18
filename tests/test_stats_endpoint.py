@@ -6,6 +6,7 @@ pin them down.
 """
 
 import importlib
+import os
 
 import pytest
 
@@ -522,3 +523,85 @@ def test_first_snapshot_timeout_floors_at_five_seconds(monkeypatch):
     monkeypatch.setenv("SYS_STATS_SAMPLE_INTERVAL", "1")
 
     assert server._first_snapshot_timeout() == 5.0
+
+
+class TestPanelOnlyRouteRegistration:
+    """``SYS_STATS_PANEL_ONLY`` removes ``/``, ``/stats`` and ``/favicon.png`` entirely.
+
+    Routes are registered once, at module import time, so exercising this
+    means reloading ``sys_stats.server`` under a different env. That mutates
+    the module's ``app`` object for the rest of the session, hence the
+    autouse fixture below that always reloads back to the unset default
+    afterwards, so tests in this file and others never see a stale
+    panel-only app.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reload_server_afterwards(self):
+        yield
+        os.environ.pop("SYS_STATS_PANEL_ONLY", None)
+        importlib.reload(server)
+
+    def _reload_with(self, monkeypatch, value):
+        """Reload ``sys_stats.server`` with ``SYS_STATS_PANEL_ONLY`` set to ``value``.
+
+        Parameters
+        ----------
+        value : str or None
+            The raw env var value to set, or ``None`` to leave it unset.
+        """
+        if value is None:
+            monkeypatch.delenv("SYS_STATS_PANEL_ONLY", raising=False)
+        else:
+            monkeypatch.setenv("SYS_STATS_PANEL_ONLY", value)
+        importlib.reload(server)
+
+    def test_default_registers_every_route(self, monkeypatch):
+        """Unset means every route is registered, exactly as before this flag existed."""
+        self._reload_with(monkeypatch, None)
+
+        rules = {rule.rule for rule in server.app.url_map.iter_rules()}
+
+        assert {"/", "/stats", "/favicon.png", "/panel"} <= rules
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "Yes"])
+    def test_truthy_values_remove_the_general_routes(self, monkeypatch, value):
+        """A truthy value, in any case, registers only ``/panel``.
+
+        Asserted directly against ``app.url_map``, not just against response
+        codes: the requirement is that the rule was never registered at all,
+        not merely that it answers 404.
+        """
+        self._reload_with(monkeypatch, value)
+
+        rules = {rule.rule for rule in server.app.url_map.iter_rules()}
+
+        assert "/" not in rules
+        assert "/stats" not in rules
+        assert "/favicon.png" not in rules
+        assert "/panel" in rules
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "banana", ""])
+    def test_falsy_or_unrecognized_values_keep_every_route(self, monkeypatch, value):
+        """Anything that is not a recognised truthy value behaves like unset."""
+        self._reload_with(monkeypatch, value)
+
+        rules = {rule.rule for rule in server.app.url_map.iter_rules()}
+
+        assert {"/", "/stats", "/favicon.png", "/panel"} <= rules
+
+    def test_removed_routes_are_flasks_own_404_not_a_guard(self, monkeypatch):
+        """A never-registered route answers Flask's genuine 404, not a 403 or 500.
+
+        This is the whole point of not registering the route rather than
+        guarding it with a ``before_request`` 403: a path-traversal trick, a
+        proxy quirk, or a future middleware bug cannot reach code that was
+        never wired in.
+        """
+        self._reload_with(monkeypatch, "1")
+        server.app.config.update(TESTING=True)
+        client = server.app.test_client()
+
+        for path in ("/", "/stats", "/favicon.png"):
+            response = client.get(path)
+            assert response.status_code == 404

@@ -212,6 +212,20 @@ whenever the virtual environment is activated.
    `SYS_STATS_PANEL_MAX_TEMPS`, `SYS_STATS_PANEL_MAX_FANS` and
    `SYS_STATS_PANEL_MAX_GPUS` — each unset by default, meaning no cap.
 
+5. **`SYS_STATS_PANEL_ONLY` (optional, security-relevant):** set to `1`,
+   `true` or `yes` to register only the `/panel` route — `/`, `/stats` and
+   `/favicon.png` are never registered at all, so a request to them gets
+   Flask's own 404 rather than a guarded rejection. `/stats` exposes the
+   full host process table, complete command lines included, with no
+   authentication; on a host you do not fully trust the network of (a
+   hypervisor on a LAN whose guest WiFi shares a VLAN with the main
+   network, say), and where the wall-display consumer only ever needs
+   `/panel`, removing the route beats guarding it. Default is off: unset
+   registers every route exactly as before this flag existed. Note that the
+   Helm chart's default liveness/readiness/startup probes hit `/`, so
+   enabling this in the chart means repointing them at `/panel` too (see
+   `chart/values.yaml`).
+
 ## 📺 Using the CLI
 
 To use the terminal dashboard for live monitoring, run:

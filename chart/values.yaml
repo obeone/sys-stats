@@ -70,6 +70,16 @@ controllers:
           # SYS_STATS_PANEL_MAX_FANS: "4"
           # SYS_STATS_PANEL_MAX_GPUS: "2"
 
+          # Security-relevant: "1"/"true"/"yes" registers ONLY /panel --
+          # /, /stats and /favicon.png are never registered at all, not just
+          # guarded, so /stats' unauthenticated full process table (complete
+          # command lines included) can never be reached on a host whose
+          # network is not fully trusted. Default is off (every route
+          # registered). Enabling this ALSO breaks the liveness/readiness/
+          # startup probes below, which hit "/" by default -- repoint them
+          # at "/panel" if you turn this on.
+          # SYS_STATS_PANEL_ONLY: "1"
+
         securityContext:
           # nvidia-smi and the host's /proc both need more than the image's
           # unprivileged user gets by default. Dropping this is worth trying
