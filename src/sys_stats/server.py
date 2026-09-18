@@ -42,6 +42,36 @@ _FIRST_SNAPSHOT_TIMEOUT = 5.0
 _RANKING_KEYS = ("top_cpu", "top_memory", "top_gpu_processes")
 
 
+def _rank_gpu_processes(processes: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Re-select the top ``limit`` GPU processes by VRAM, then reapply display order.
+
+    The sampler's cached ``top_gpu_processes`` is stored in *display* order
+    (grouped by ``gpu_index``, heaviest first within each card; see
+    :func:`sys_stats.collectors.get_gpu_processes`), not in descending
+    ``memory_used`` order. Slicing that list directly would keep whichever
+    GPU happens to sort first rather than the biggest VRAM consumers across
+    every card. This mirrors the collector's own two-phase sort exactly:
+    select by memory first, then reorder the surviving slice for display.
+
+    Parameters
+    ----------
+    processes : list of dict
+        The cached ``top_gpu_processes`` entries, in display order.
+    limit : int
+        Maximum number of entries to keep.
+
+    Returns
+    -------
+    list of dict
+        The ``limit`` heaviest entries, ordered by ``gpu_index`` (unresolved
+        entries last) then by descending ``memory_used``.
+    """
+    by_memory = sorted(processes, key=lambda p: -p["memory_used"])
+    top = by_memory[:limit]
+    top.sort(key=lambda p: (p["gpu_index"] is None, p["gpu_index"] or 0, -p["memory_used"]))
+    return top
+
+
 def _slice_to_limit(stats: dict[str, Any], limit: int) -> dict[str, Any]:
     """Return a copy of a cached payload with its rankings capped at ``limit``.
 
@@ -63,7 +93,11 @@ def _slice_to_limit(stats: dict[str, Any], limit: int) -> dict[str, Any]:
     -------
     dict
         A shallow copy of ``stats`` with ``top_cpu``, ``top_memory`` and
-        ``top_gpu_processes`` replaced by sliced list copies, same key order.
+        ``top_gpu_processes`` replaced by rankings capped at ``limit``, same
+        key order. ``top_gpu_processes`` is re-selected by descending VRAM
+        usage before truncation, then redisplayed in the collector's order;
+        the other two rankings are already sorted by their metric, so a
+        plain slice keeps the heaviest entries.
     """
     response = dict(stats)
     warned = False
@@ -79,7 +113,10 @@ def _slice_to_limit(stats: dict[str, Any], limit: int) -> dict[str, Any]:
                 f"re-collecting"
             )
             warned = True
-        response[key] = list(sampled[:limit])
+        if key == "top_gpu_processes":
+            response[key] = _rank_gpu_processes(sampled, limit)
+        else:
+            response[key] = sampled[:limit]
     return response
 
 

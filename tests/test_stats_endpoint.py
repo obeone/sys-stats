@@ -286,7 +286,7 @@ def test_slice_to_limit_returns_independent_list_copies():
     cached = {
         "top_cpu": [{"pid": 1}],
         "top_memory": [{"pid": 2}],
-        "top_gpu_processes": [{"pid": 3}],
+        "top_gpu_processes": [{"pid": 3, "gpu_index": 0, "memory_used": 100}],
         "other_key": "unchanged",
     }
 
@@ -297,6 +297,48 @@ def test_slice_to_limit_returns_independent_list_copies():
     assert cached["top_cpu"] == [{"pid": 1}]
     assert cached["top_memory"] == [{"pid": 2}]
     assert cached["other_key"] == "unchanged"
+
+
+def test_slice_to_limit_selects_top_gpu_processes_by_memory_before_truncating():
+    """``limit`` must keep the heaviest GPU processes, not whichever GPU sorts first.
+
+    The sampler stores ``top_gpu_processes`` in *display* order (grouped by
+    ``gpu_index``, heaviest first within each card), not in descending
+    ``memory_used`` order. Slicing that display-ordered list directly keeps
+    whichever card happens to sort first rather than the biggest VRAM
+    consumers. Reproduces the review's repro case: 10 processes at 100 MiB on
+    GPU 0 plus 3 processes at 10 GiB on GPU 1, with ``limit=3``.
+    """
+    light = [
+        {
+            "pid": pid,
+            "gpu_index": 0,
+            "gpu_uuid": "GPU-light",
+            "memory_used": 100 * 1024 * 1024,
+            "name": f"light{pid}",
+        }
+        for pid in range(10)
+    ]
+    heavy = [
+        {
+            "pid": 100 + pid,
+            "gpu_index": 1,
+            "gpu_uuid": "GPU-heavy",
+            "memory_used": 10 * 1024**3,
+            "name": f"heavy{pid}",
+        }
+        for pid in range(3)
+    ]
+    # Already in display order: GPU 0's (lighter) processes first, then GPU 1's.
+    cached = {
+        "top_cpu": [],
+        "top_memory": [],
+        "top_gpu_processes": light + heavy,
+    }
+
+    sliced = server._slice_to_limit(cached, limit=3)
+
+    assert {p["pid"] for p in sliced["top_gpu_processes"]} == {100, 101, 102}
 
 
 def test_index_serves_the_dashboard(client):
