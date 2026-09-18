@@ -7,7 +7,7 @@ pin them down.
 
 import pytest
 
-from sys_stats import collectors, server
+from sys_stats import collectors, sampler, server
 
 
 class _FakeVirtualMemory:
@@ -59,6 +59,18 @@ class _FakeProcess:
         return ["python", "train.py"]
 
 
+def _seed_cache() -> None:
+    """Collect one sample synchronously under whatever stubs are active.
+
+    ``/stats`` now serves ``sampler``'s cache instead of collecting inline
+    (see :mod:`sys_stats.sampler`), so a test that changes a collector stub
+    after the ``client`` fixture ran must re-seed the cache before hitting
+    the route, exactly where the old inline call would have picked the
+    change up on its own.
+    """
+    sampler._sample_once(limit=sampler._get_top_processes_cap())
+
+
 @pytest.fixture
 def client(monkeypatch):
     """A Flask test client with every host-level collector stubbed out."""
@@ -71,7 +83,18 @@ def client(monkeypatch):
     monkeypatch.setattr(collectors.GPUtil, "getGPUs", lambda: [])
 
     server.app.config.update(TESTING=True)
-    return server.app.test_client()
+
+    # Start every test from a clean sampler: no leftover thread from a
+    # previous test, no leftover cached sample. Seed one sample synchronously
+    # under the stubs above rather than starting the real background thread,
+    # so tests stay instant and deterministic instead of depending on
+    # wall-clock timing.
+    sampler._reset_for_tests()
+    _seed_cache()
+
+    yield server.app.test_client()
+
+    sampler._reset_for_tests()
 
 
 def test_stats_exposes_the_full_payload_without_a_gpu(client):
@@ -105,6 +128,7 @@ def test_stats_converts_gpu_memory_to_bytes(client, monkeypatch):
         collectors, "get_gpu_fan_and_power", lambda: {0: {"fan_speed": 30.0, "power_draw": 220.0}}
     )
     monkeypatch.setattr(collectors, "get_gpu_processes", lambda limit=5, uuid_to_index=None: [])
+    _seed_cache()
 
     gpu = client.get("/stats").get_json()["gpu"][0]
 
@@ -121,6 +145,7 @@ def test_stats_summary_mirrors_the_first_gpu(client, monkeypatch):
     monkeypatch.setattr(collectors.GPUtil, "getGPUs", lambda: [_FakeGPU()])
     monkeypatch.setattr(collectors, "get_gpu_fan_and_power", lambda: {})
     monkeypatch.setattr(collectors, "get_gpu_processes", lambda limit=5, uuid_to_index=None: [])
+    _seed_cache()
 
     summary = client.get("/stats").get_json()["summary"]
 
@@ -134,6 +159,7 @@ def test_stats_defaults_to_zero_fan_and_power_when_nvidia_smi_is_silent(client, 
     monkeypatch.setattr(collectors.GPUtil, "getGPUs", lambda: [_FakeGPU()])
     monkeypatch.setattr(collectors, "get_gpu_fan_and_power", lambda: {})
     monkeypatch.setattr(collectors, "get_gpu_processes", lambda limit=5, uuid_to_index=None: [])
+    _seed_cache()
 
     gpu = client.get("/stats").get_json()["gpu"][0]
 
@@ -162,6 +188,7 @@ def test_stats_attributes_gpu_processes_to_their_card(client, monkeypatch):
         ),
     )
     monkeypatch.setattr(collectors.psutil, "Process", lambda pid: _FakeProcess(pid))
+    _seed_cache()
 
     processes = client.get("/stats").get_json()["top_gpu_processes"]
 
@@ -181,6 +208,7 @@ def test_stats_leaves_the_gpu_index_unresolved_for_an_unknown_uuid(client, monke
         lambda *a, **kw: _FakeCompletedProcess("GPU-zzz, 100, /usr/bin/python3, 512\n"),
     )
     monkeypatch.setattr(collectors.psutil, "Process", lambda pid: _FakeProcess(pid))
+    _seed_cache()
 
     process = client.get("/stats").get_json()["top_gpu_processes"][0]
 
@@ -189,28 +217,86 @@ def test_stats_leaves_the_gpu_index_unresolved_for_an_unknown_uuid(client, monke
 
 
 def test_stats_forwards_the_limit_query_parameter(client, monkeypatch):
-    """``?limit=`` controls how many processes each ranking returns."""
-    seen = {}
-    monkeypatch.setattr(
-        collectors, "get_top_processes_by_cpu", lambda limit=5: seen.setdefault("cpu", limit) and []
-    )
+    """``?limit=`` slices the sampler's cached ranking down to that many entries.
 
-    client.get("/stats?limit=3")
+    The sampler, not the route, decides how many entries to collect (up to
+    its own cap); ``?limit=`` only controls how much of that cache a given
+    request gets back.
+    """
+    processes = [
+        {"pid": pid, "name": f"proc{pid}", "cpu_percent": 0.0, "cmdline": "N/A"} for pid in range(10)
+    ]
+    monkeypatch.setattr(collectors, "get_top_processes_by_cpu", lambda limit=5: processes[:limit])
+    _seed_cache()
 
-    assert seen["cpu"] == 3
+    response = client.get("/stats?limit=3").get_json()
+
+    assert [p["pid"] for p in response["top_cpu"]] == [0, 1, 2]
 
 
 def test_stats_falls_back_to_five_on_a_non_numeric_limit(client, monkeypatch):
-    """A bogus ``limit`` is ignored rather than returning a 500."""
-    seen = {}
-    monkeypatch.setattr(
-        collectors, "get_top_processes_by_cpu", lambda limit=5: seen.setdefault("cpu", limit) and []
-    )
+    """A bogus ``limit`` is ignored, defaulting to 5, rather than returning a 500."""
+    processes = [
+        {"pid": pid, "name": f"proc{pid}", "cpu_percent": 0.0, "cmdline": "N/A"} for pid in range(10)
+    ]
+    monkeypatch.setattr(collectors, "get_top_processes_by_cpu", lambda limit=5: processes[:limit])
+    _seed_cache()
 
     response = client.get("/stats?limit=banana")
 
     assert response.status_code == 200
-    assert seen["cpu"] == 5
+    assert [p["pid"] for p in response.get_json()["top_cpu"]] == [0, 1, 2, 3, 4]
+
+
+def test_stats_limit_above_the_sampled_cap_returns_what_was_sampled(client, monkeypatch, caplog):
+    """A ``?limit=`` beyond what the sampler collected returns what exists.
+
+    The route must never re-collect inline to satisfy an oversized limit:
+    it just hands back everything the sampler already has, and logs once.
+    """
+    processes = [
+        {"pid": pid, "name": f"proc{pid}", "cpu_percent": 0.0, "cmdline": "N/A"} for pid in range(3)
+    ]
+    monkeypatch.setattr(collectors, "get_top_processes_by_cpu", lambda limit=5: processes[:limit])
+    _seed_cache()  # sampled at the cap (default 50), but the stub only ever has 3 to give
+
+    with caplog.at_level("WARNING"):
+        response = client.get("/stats?limit=1000").get_json()
+
+    assert [p["pid"] for p in response["top_cpu"]] == [0, 1, 2]
+    assert any("exceeds" in record.message for record in caplog.records)
+
+
+def test_stats_served_from_cache_matches_the_sampled_payload(client):
+    """The route answers from the sampler's cache, not a fresh collection.
+
+    Requesting exactly the sampled cap makes slicing a no-op, so the
+    response must equal the snapshot the sampler already stored.
+    """
+    cached_stats, _wall_ts, _monotonic_ts = sampler.get_snapshot()
+    cap = sampler._get_top_processes_cap()
+
+    response = client.get(f"/stats?limit={cap}").get_json()
+
+    assert response == cached_stats
+
+
+def test_slice_to_limit_returns_independent_list_copies():
+    """Mutating a per-request response must never corrupt the shared cache."""
+    cached = {
+        "top_cpu": [{"pid": 1}],
+        "top_memory": [{"pid": 2}],
+        "top_gpu_processes": [{"pid": 3}],
+        "other_key": "unchanged",
+    }
+
+    sliced = server._slice_to_limit(cached, limit=5)
+    sliced["top_cpu"].append({"pid": 999, "name": "intruder"})
+    sliced["top_memory"] = "replaced"
+
+    assert cached["top_cpu"] == [{"pid": 1}]
+    assert cached["top_memory"] == [{"pid": 2}]
+    assert cached["other_key"] == "unchanged"
 
 
 def test_index_serves_the_dashboard(client):
