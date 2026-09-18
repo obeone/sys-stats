@@ -25,9 +25,10 @@ two console scripts:
 
 Everything hinges on one contract: the JSON payload returned by `GET /stats`.
 
-- **Server side** ([server.py](src/sys_stats/server.py)) is the only place that touches the
-  machine. It gathers metrics from three unrelated sources and merges them into one
-  response:
+- **Collector side** ([collectors.py](src/sys_stats/collectors.py)) is the only place that
+  touches the machine; `server.py` is a thin Flask layer with no direct calls into
+  `psutil`, `GPUtil` or `nvidia-smi`. It gathers metrics from three unrelated sources
+  and merges them into one response:
   - `psutil` for CPU / RAM / top processes,
   - `GPUtil` for GPU enumeration, plus **direct `nvidia-smi` subprocess calls**
     (`get_gpu_fan_and_power`, `get_gpu_processes`) for fan speed, power draw and
@@ -86,7 +87,7 @@ when smoke-testing locally.
 ### Testing conventions
 
 No test touches the real machine: `psutil`, `GPUtil`, `subprocess.run` and
-`requests.get` are all monkeypatched at the `sys_stats.server` module boundary.
+`requests.get` are all monkeypatched at the `sys_stats.collectors` module boundary.
 [tests/test_stats_endpoint.py](tests/test_stats_endpoint.py) is the contract test for
 the `/stats` payload — if you add or rename a key there, that file is the one that
 must change first. Two classes of failure matter most and are already covered:
