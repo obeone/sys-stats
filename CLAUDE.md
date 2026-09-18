@@ -106,6 +106,7 @@ unprivileged hosts.
 | `OLLAMA_API_URL`              | server      | Enables the Ollama panel; unset ⇒ panel empty   |
 | `HOST` / `PORT`               | server      | Bind address, default `0.0.0.0:5000`            |
 | `FLASK_DEBUG`                 | server      | `true` enables Flask debug mode                 |
+| `SYS_STATS_AUTOSTART`         | server      | Set to `0`/`false`/`no` to skip the module-scope sampler autostart, default on |
 | `SYS_STATS_SAMPLE_INTERVAL`   | sampler     | Seconds between background samples, default `2.0` |
 | `SYS_STATS_TOP_PROCESSES_MAX` | sampler     | Per-process ranking cap the sampler collects, default `50`; a `?limit=` above this returns only what was sampled |
 | `SYS_STATS_API_URL`           | CLI         | Default `--url`, default `http://localhost:5000/stats` |

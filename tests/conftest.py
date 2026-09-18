@@ -9,12 +9,14 @@ that import would spawn a real sampler thread calling real ``psutil`` /
 ``GPUtil`` / ``nvidia-smi``, touching the actual machine this suite is meant
 to never touch.
 
-Setting ``FLASK_DEBUG=true`` here, before that import happens, trips the
-same guard ``sys_stats.server`` uses to skip the sampler in Flask's debug
-reloader monitor process (no ``WERKZEUG_RUN_MAIN`` set), so no real
-background thread spawns during collection.
+Setting ``SYS_STATS_AUTOSTART=0`` here, before that import happens, trips
+the dedicated opt-out ``sys_stats.server`` exposes for exactly this case, so
+no real background thread spawns during collection. This is intentionally a
+different flag than ``FLASK_DEBUG``: that one is the production debug-mode
+toggle and must stay off so the suite runs under the same conditions as
+production.
 """
 
 import os
 
-os.environ.setdefault("FLASK_DEBUG", "true")
+os.environ.setdefault("SYS_STATS_AUTOSTART", "0")

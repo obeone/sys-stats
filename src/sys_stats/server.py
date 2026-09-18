@@ -31,7 +31,18 @@ CORS(app)
 # calling psutil.cpu_percent independently, corrupting each other's baseline
 # exactly like the two-caller problem the sampler exists to prevent, so it is
 # skipped in the monitor process.
-if os.getenv('FLASK_DEBUG', 'false').lower() != 'true' or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+_in_debug_reloader_monitor = (
+    os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
+    and os.environ.get('WERKZEUG_RUN_MAIN') != 'true'
+)
+
+# SYS_STATS_AUTOSTART is an unrelated concern: an explicit opt-out for
+# callers -- namely this project's own test suite -- that need to import
+# this module without spawning a thread that touches the real machine. It
+# defaults to on; production entry points never need to set it.
+_autostart_disabled = os.getenv('SYS_STATS_AUTOSTART', '1').strip().lower() in ('0', 'false', 'no')
+
+if not _in_debug_reloader_monitor and not _autostart_disabled:
     sampler.start()
 
 @app.errorhandler(Exception)

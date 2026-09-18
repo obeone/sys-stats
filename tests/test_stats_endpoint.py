@@ -394,7 +394,15 @@ def test_importing_the_server_module_starts_the_sampler(monkeypatch):
     ``flask --app sys_stats.server run`` never invoked it, so ``/stats``
     burned the full ``wait_for_first_snapshot`` timeout on every request,
     forever.
+
+    ``conftest.py`` sets ``SYS_STATS_AUTOSTART=0`` suite-wide so collecting
+    this very module does not spawn a real sampler thread. Left as-is, that
+    default would make this test pass vacuously, so it is removed here to
+    fall back to the unset, production default (autostart on) before
+    reloading the module -- with ``sampler.start`` stubbed out below, so the
+    reload still never touches the real machine.
     """
+    monkeypatch.delenv("SYS_STATS_AUTOSTART", raising=False)
     monkeypatch.delenv("FLASK_DEBUG", raising=False)
     monkeypatch.delenv("WERKZEUG_RUN_MAIN", raising=False)
     started = []

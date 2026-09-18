@@ -58,6 +58,11 @@ controllers:
           # dashboard ?limit= above this only returns what was sampled.
           # SYS_STATS_TOP_PROCESSES_MAX: "50"
 
+          # Skips the module-scope sampler autostart when set to "0",
+          # "false" or "no". Defaults to on; a normal deployment never
+          # needs this.
+          # SYS_STATS_AUTOSTART: "0"
+
         securityContext:
           # nvidia-smi and the host's /proc both need more than the image's
           # unprivileged user gets by default. Dropping this is worth trying
