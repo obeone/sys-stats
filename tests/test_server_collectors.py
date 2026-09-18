@@ -490,6 +490,162 @@ class TestTopProcesses:
         assert top[0]["memory_usage"] == 4096
 
 
+class _FakeSensorEntry:
+    """Stand-in for a ``psutil.shwtemp``/``sfan`` namedtuple entry."""
+
+    def __init__(self, label: str, current: float | None) -> None:
+        self.label = label
+        self.current = current
+
+
+class TestGetTemperatures:
+    def test_sorts_entries_by_name(self, monkeypatch):
+        """Regression guard: sysfs hwmon* enumeration order is not stable.
+
+        A wall-mounted display renders these positionally, so an unsorted
+        dict fed in must still come out sorted, or rows would swap places
+        on screen between refreshes even though nothing physically changed.
+        """
+        monkeypatch.setattr(
+            collectors.psutil,
+            "sensors_temperatures",
+            lambda: {
+                "zzz_chip": [_FakeSensorEntry("core0", 50.0)],
+                "aaa_chip": [_FakeSensorEntry("core0", 40.0)],
+            },
+            raising=False,
+        )
+
+        entries = collectors.get_temperatures()
+
+        assert [e["n"] for e in entries] == ["aaa_chip/core0", "zzz_chip/core0"]
+
+    def test_falls_back_to_chip_and_index_for_empty_labels(self, monkeypatch):
+        """Multiple unlabeled probes on one chip must not collide on ``n``."""
+        monkeypatch.setattr(
+            collectors.psutil,
+            "sensors_temperatures",
+            lambda: {"k10temp": [_FakeSensorEntry("", 30.0), _FakeSensorEntry("", 40.0)]},
+            raising=False,
+        )
+
+        entries = collectors.get_temperatures()
+
+        assert [e["n"] for e in entries] == ["k10temp/0", "k10temp/1"]
+
+    def test_skips_entries_with_no_reading(self, monkeypatch):
+        """A None ``current`` must be skipped, not crash on ``round(None, 1)``."""
+        monkeypatch.setattr(
+            collectors.psutil,
+            "sensors_temperatures",
+            lambda: {"chip": [_FakeSensorEntry("core0", None), _FakeSensorEntry("core1", 55.0)]},
+            raising=False,
+        )
+
+        assert collectors.get_temperatures() == [{"n": "chip/core1", "c": 55.0}]
+
+    def test_rounds_to_one_decimal(self, monkeypatch):
+        """The temperature is rounded, not truncated or passed through raw."""
+        monkeypatch.setattr(
+            collectors.psutil,
+            "sensors_temperatures",
+            lambda: {"chip": [_FakeSensorEntry("core0", 44.567)]},
+            raising=False,
+        )
+
+        assert collectors.get_temperatures() == [{"n": "chip/core0", "c": 44.6}]
+
+    def test_returns_empty_list_when_sensors_temperatures_is_absent(self, monkeypatch):
+        """``sensors_temperatures`` does not exist as an attribute on macOS.
+
+        Regression guard: on macOS ``psutil.sensors_temperatures`` is
+        missing entirely (accessing it raises ``AttributeError``), unlike
+        Linux where it always exists but may return ``{}``. The collector
+        must degrade to ``[]`` without raising, so the server stays
+        smoke-testable locally per CLAUDE.md.
+        """
+        monkeypatch.delattr(collectors.psutil, "sensors_temperatures", raising=False)
+
+        assert collectors.get_temperatures() == []
+
+
+class TestGetFans:
+    def test_sorts_entries_by_name(self, monkeypatch):
+        """Same positional-stability contract as temperatures: re-sort every sample."""
+        monkeypatch.setattr(
+            collectors.psutil,
+            "sensors_fans",
+            lambda: {
+                "zzz_chip": [_FakeSensorEntry("fan1", 1200)],
+                "aaa_chip": [_FakeSensorEntry("fan1", 900)],
+            },
+            raising=False,
+        )
+
+        entries = collectors.get_fans()
+
+        assert [e["n"] for e in entries] == ["aaa_chip/fan1", "zzz_chip/fan1"]
+
+    def test_falls_back_to_chip_and_index_for_empty_labels(self, monkeypatch):
+        """Multiple unlabeled fans on one chip must not collide on ``n``."""
+        monkeypatch.setattr(
+            collectors.psutil,
+            "sensors_fans",
+            lambda: {"nct6775": [_FakeSensorEntry("", 800), _FakeSensorEntry("", 1600)]},
+            raising=False,
+        )
+
+        entries = collectors.get_fans()
+
+        assert [e["n"] for e in entries] == ["nct6775/0", "nct6775/1"]
+
+    def test_skips_entries_with_no_reading(self, monkeypatch):
+        """A None ``current`` must be skipped, not crash converting to int."""
+        monkeypatch.setattr(
+            collectors.psutil,
+            "sensors_fans",
+            lambda: {"chip": [_FakeSensorEntry("fan1", None), _FakeSensorEntry("fan2", 1500)]},
+            raising=False,
+        )
+
+        assert collectors.get_fans() == [{"n": "chip/fan2", "rpm": 1500}]
+
+    def test_returns_empty_list_when_sensors_fans_is_absent(self, monkeypatch):
+        """``sensors_fans`` does not exist as an attribute on macOS.
+
+        Regression guard: same shape as get_temperatures's macOS gate.
+        """
+        monkeypatch.delattr(collectors.psutil, "sensors_fans", raising=False)
+
+        assert collectors.get_fans() == []
+
+
+class TestGetSwap:
+    def test_returns_bytes_and_rounded_percent(self, monkeypatch):
+        """Straight passthrough of psutil.swap_memory(), percent rounded."""
+
+        class _FakeSwap:
+            used = 1024
+            total = 4096
+            percent = 33.333
+
+        monkeypatch.setattr(collectors.psutil, "swap_memory", lambda: _FakeSwap())
+
+        assert collectors.get_swap() == {"used": 1024, "total": 4096, "pct": 33.3}
+
+
+class TestGetPerCoreCpu:
+    def test_returns_one_rounded_percentage_per_core(self, monkeypatch):
+        """Each core's percentage is rounded to 1 decimal, order preserved."""
+        monkeypatch.setattr(
+            collectors.psutil,
+            "cpu_percent",
+            lambda interval=None, percpu=False: [12.345, 99.999] if percpu else 50.0,
+        )
+
+        assert collectors.get_per_core_cpu() == [12.3, 100.0]
+
+
 class _FakeMemoryInfo:
     """Stand-in for the ``memory_info`` namedtuple exposed by psutil."""
 

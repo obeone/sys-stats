@@ -291,6 +291,120 @@ def get_ollama_process():
 
     return ollama_data
 
+def get_temperatures() -> list[dict[str, Any]]:
+    """Retrieve hardware temperature sensors, sorted for stable display order.
+
+    ``psutil.sensors_temperatures`` does not exist as an attribute at all on
+    macOS (as opposed to existing and returning an empty dict), so the
+    platform gate happens through ``getattr`` before any call is attempted,
+    exactly like the ``nvidia-smi`` degradation elsewhere in this module.
+
+    Returns
+    -------
+    list of dict
+        Entries ``{"n": "<chip>/<label>", "c": <float, rounded to 1
+        decimal>}``, sorted by ``"n"``. A probe with an empty ``label``
+        falls back to the chip name plus its index within that chip (e.g.
+        ``"k10temp/1"``) so several unlabeled probes on one chip do not
+        collide on ``"n"``. Entries whose ``current`` reading is ``None``
+        are skipped. Empty on a platform without sensor support.
+    """
+    sensors_temperatures = getattr(psutil, "sensors_temperatures", None)
+    if sensors_temperatures is None:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for chip, chip_entries in sensors_temperatures().items():
+        for index, entry in enumerate(chip_entries):
+            if entry.current is None:
+                continue
+            label = entry.label or str(index)
+            entries.append({"n": f"{chip}/{label}", "c": round(entry.current, 1)})
+
+    # psutil.sensors_temperatures() iterates hwmon* sysfs entries in
+    # whatever order the kernel enumerated them, which is NOT guaranteed
+    # stable across boots or module reloads. The consumer is a wall-mounted
+    # display that renders these positionally, so this list must be
+    # re-sorted on every single sample, or rows would physically swap
+    # places on screen between refreshes even though nothing changed. Do
+    # not remove this sort believing psutil already orders the dict.
+    entries.sort(key=lambda e: e["n"])
+    return entries
+
+
+def get_fans() -> list[dict[str, Any]]:
+    """Retrieve fan speed sensors, sorted for stable display order.
+
+    Same macOS gate as :func:`get_temperatures`: ``psutil.sensors_fans`` is
+    an absent attribute there, not a function returning an empty dict.
+
+    Returns
+    -------
+    list of dict
+        Entries ``{"n": "<chip>/<label>", "rpm": <int>}``, sorted by
+        ``"n"``. A probe with an empty ``label`` falls back to the chip
+        name plus its index within that chip, same as
+        :func:`get_temperatures`. Entries whose ``current`` reading is
+        ``None`` are skipped. Empty on a platform without sensor support.
+    """
+    sensors_fans = getattr(psutil, "sensors_fans", None)
+    if sensors_fans is None:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for chip, chip_entries in sensors_fans().items():
+        for index, entry in enumerate(chip_entries):
+            if entry.current is None:
+                continue
+            label = entry.label or str(index)
+            entries.append({"n": f"{chip}/{label}", "rpm": int(entry.current)})
+
+    # See get_temperatures: sysfs hwmon* enumeration order is not stable
+    # across boots or module reloads, so this list is re-sorted on every
+    # sample rather than trusted to already be ordered.
+    entries.sort(key=lambda e: e["n"])
+    return entries
+
+
+def get_swap() -> dict[str, Any]:
+    """Retrieve swap memory usage.
+
+    Returns
+    -------
+    dict
+        ``{"used": <int bytes>, "total": <int bytes>, "pct": <float,
+        rounded to 1 decimal>}``, straight from ``psutil.swap_memory()``.
+    """
+    swap = psutil.swap_memory()
+    return {
+        "used": swap.used,
+        "total": swap.total,
+        "pct": round(swap.percent, 1),
+    }
+
+
+def get_per_core_cpu() -> list[float]:
+    """Retrieve per-logical-core CPU usage percentages.
+
+    Uses the same non-blocking ``interval=None`` convention as the
+    aggregate figure in :func:`collect_stats`: it reports usage since the
+    previous ``percpu=True`` call. Critically, psutil keeps a SEPARATE
+    internal baseline for ``cpu_percent(percpu=True)`` from the one it
+    keeps for the plain ``cpu_percent()`` call; they do not share state.
+    :mod:`sys_stats.sampler` primes both baselines once at startup before
+    the first real sample, so this function must never be called before
+    that priming has happened, or its first reading will be a meaningless
+    near-zero regardless of actual load.
+
+    Returns
+    -------
+    list of float
+        One percentage per logical core, each rounded to 1 decimal, in
+        ``psutil.cpu_percent(percpu=True)`` order.
+    """
+    return [round(p, 1) for p in psutil.cpu_percent(interval=None, percpu=True)]
+
+
 def collect_stats(limit: int = 5) -> dict:
     """Collect the full ``/stats`` payload from the host machine.
 
