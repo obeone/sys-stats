@@ -164,19 +164,28 @@ def _slice_to_limit(stats: dict[str, Any], limit: int) -> dict[str, Any]:
         plain slice keeps the heaviest entries.
     """
     response = copy.deepcopy(stats)
-    warned = False
+
+    # The warning is about the sampler's CAP truncating data, so it is the
+    # cap -- not the length of any one ranking -- that ``limit`` is compared
+    # against. A ranking shorter than ``limit`` while the cap was never
+    # reached simply means the host has nothing more to report: on any
+    # machine without an NVIDIA GPU ``top_gpu_processes`` is permanently
+    # empty, and comparing against its length made every single request log
+    # "exceeds the 0 entries sampled", a standing false alarm that made a
+    # perfectly healthy 200 look like a 503 that failed to fire.
+    cap = sampler._get_top_processes_cap()
+    if limit > cap:
+        # The sampler only ever collects up to its own cap; asking for more
+        # than that cannot be satisfied without re-collecting inline, which
+        # is exactly what the sampler exists to avoid.
+        logger.warning(
+            f"Requested limit={limit} exceeds the sampler's cap of {cap} "
+            f"entries (SYS_STATS_TOP_PROCESSES_MAX); returning what was "
+            f"sampled instead of re-collecting"
+        )
+
     for key in _RANKING_KEYS:
         sampled = response[key]
-        if limit > len(sampled) and not warned:
-            # The sampler already returned everything it collected; asking
-            # for more than that cannot be satisfied without re-collecting
-            # inline, which is exactly what the sampler exists to avoid.
-            logger.warning(
-                f"Requested limit={limit} exceeds the {len(sampled)} entries "
-                f"sampled; returning what is available instead of "
-                f"re-collecting"
-            )
-            warned = True
         if key == "top_gpu_processes":
             response[key] = _rank_gpu_processes(sampled, limit)
         else:
@@ -197,8 +206,11 @@ def get_stats():
     Returns
     -------
     flask.Response
-        JSON response whose top-level keys are the public contract of the
-        project; adding keys is a minor bump, renaming one is a major bump.
+        200 with the JSON payload whose top-level keys are the public
+        contract of the project (adding keys is a minor bump, renaming one
+        is a major bump), or 503 with ``{}`` when no snapshot landed within
+        the cold-start wait, or when the one that did is not a complete
+        payload.
     """
     limit_str = request.args.get("limit", "5")
     try:
@@ -223,6 +235,21 @@ def get_stats():
         # import time, this path is only reachable as a genuine failure, not
         # during normal startup.
         logger.error("No sampler snapshot available after waiting; returning 503")
+        return jsonify({}), 503
+
+    # "A snapshot exists" and "the snapshot is usable" are two different
+    # questions, and only the first one was ever asked here. A non-None but
+    # incomplete cache entry -- an empty dict, or anything not produced by
+    # collect_stats -- used to reach _slice_to_limit and surface as a 500
+    # KeyError naming a contract key, which tells a caller nothing about
+    # what to do next. Absence of usable data is a 503 and a retry, exactly
+    # like the branch above and like /panel's own contract.
+    missing = [key for key in _RANKING_KEYS if key not in stats]
+    if missing:
+        logger.error(
+            f"Sampler snapshot is missing {', '.join(missing)}; it is not a "
+            f"complete /stats payload, returning 503"
+        )
         return jsonify({}), 503
 
     return jsonify(_slice_to_limit(stats, limit))

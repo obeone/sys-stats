@@ -398,6 +398,78 @@ def test_stats_returns_503_when_no_snapshot_lands(client, monkeypatch):
     assert response.get_json() == {}
 
 
+def test_stats_cold_start_serves_real_data_without_claiming_truncation(client, monkeypatch, caplog):
+    """A healthy cold start must not log that it truncated anything.
+
+    Live regression: on a host with no NVIDIA GPU, ``top_gpu_processes`` is
+    permanently ``[]``, and the route compared ``limit`` against the length
+    of each ranking. Every request therefore logged "Requested limit=1
+    exceeds the 0 entries sampled", which reads exactly like ``/stats``
+    answering 200 with an empty payload -- the warning, not the payload, was
+    the defect. The whole suite missed it because the ``client`` fixture
+    leaves every ranking empty and nobody ever asserted the *absence* of
+    that warning; the one test that does look at it only proves the warning
+    fires when the sampler's cap really is exceeded, which the correct rule
+    satisfies too.
+
+    Drives the real sampler loop at a NON-DEFAULT interval, through the
+    actual cold-start wait, rather than the fixture's pre-seeded cache.
+    """
+    monkeypatch.setenv("SYS_STATS_SAMPLE_INTERVAL", "0.25")  # non-default
+    monkeypatch.setenv("SYS_STATS_TOP_PROCESSES_MAX", "50")
+    monkeypatch.setattr(
+        collectors,
+        "get_top_processes_by_cpu",
+        lambda limit=5: [{"pid": 1, "name": "proc", "cpu_percent": 3.0, "cmdline": "N/A"}],
+    )
+    monkeypatch.setattr(
+        collectors,
+        "get_top_processes_by_memory",
+        lambda limit=5: [
+            {"pid": 1, "name": "proc", "memory_usage": 1024, "memory_percent": 1.0, "cmdline": "N/A"}
+        ],
+    )
+    # The sampler primes psutil's baselines itself; stub that too so the
+    # background thread never reaches the real machine.
+    monkeypatch.setattr(
+        sampler.psutil, "cpu_percent", lambda interval=None, percpu=False: [] if percpu else 1.0
+    )
+
+    # Discard the fixture's pre-seeded cache: this test is about what the
+    # very first request sees while the sampler is still warming up.
+    sampler._reset_for_tests()
+    sampler.start()
+
+    with caplog.at_level("WARNING"):
+        response = client.get("/stats?limit=5")
+
+    payload = response.get_json()
+    assert response.status_code == 200
+    assert [p["pid"] for p in payload["top_cpu"]] == [1]
+    assert [p["pid"] for p in payload["top_memory"]] == [1]
+    # Legitimately empty on a GPU-less host, and not evidence of truncation.
+    assert payload["top_gpu_processes"] == []
+    assert not [record for record in caplog.records if "exceeds" in record.message]
+
+
+def test_stats_returns_503_when_the_cached_snapshot_is_incomplete(client, monkeypatch):
+    """A non-None snapshot that is not a full payload must 503, not 500.
+
+    The readiness check only ever asked "is the snapshot None?". A cache
+    entry that exists but carries none of the contract's rankings sailed
+    past it into ``_slice_to_limit`` and came back as a 500 naming a missing
+    key, which tells a caller nothing about whether to retry. Absence of
+    usable data is a 503, same as a cold start that never landed.
+    """
+    monkeypatch.setenv("SYS_STATS_SAMPLE_INTERVAL", "12")  # non-default
+    monkeypatch.setattr(sampler, "get_snapshot", lambda: ({"cpu": 12.5}, 1.0, 1.0))
+
+    response = client.get("/stats?limit=1")
+
+    assert response.status_code == 503
+    assert response.get_json() == {}
+
+
 def test_importing_the_server_module_starts_the_sampler(monkeypatch):
     """Any WSGI entry point that only imports ``app`` must get a live sampler.
 
