@@ -16,6 +16,23 @@ coloredlogs.install(level='INFO', logger=logger, fmt='%(asctime)s - %(levelname)
 app = Flask(__name__)
 CORS(app)
 
+# Start the background sampler as soon as this module is imported, not just
+# when server.main() runs the ``sys-stats-server`` console script. A WSGI
+# entry point that imports ``app`` directly (``gunicorn sys_stats.server:app``,
+# ``flask --app sys_stats.server run``) never calls main(), and without this
+# the cache would never fill: every request would burn the full
+# wait_for_first_snapshot() timeout and still find nothing. start() is
+# lock-guarded and idempotent, so a later call from main() is harmless.
+#
+# In Flask's debug reloader the module is imported twice: once by the
+# lightweight monitor process, once by the actual worker (marked by
+# WERKZEUG_RUN_MAIN). Starting the sampler in both would spawn two threads
+# calling psutil.cpu_percent independently, corrupting each other's baseline
+# exactly like the two-caller problem the sampler exists to prevent, so it is
+# skipped in the monitor process.
+if os.getenv('FLASK_DEBUG', 'false').lower() != 'true' or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+    sampler.start()
+
 @app.errorhandler(Exception)
 def handle_exception(e):
     logger.error(f"Unhandled exception: {e}")
@@ -150,12 +167,16 @@ def get_stats():
 
     if stats is None:
         # Every sampler iteration failed within the wait window (the sampler
-        # itself is crash-proof and logs each failure). There is nothing
-        # real to serve; returning an empty-shell payload keeps existing
-        # consumers, which expect 200 + JSON, working rather than handing
-        # them a 500.
-        logger.error("No sampler snapshot available after waiting; returning an empty payload")
-        return jsonify({})
+        # itself is crash-proof and logs each failure), or the sampler never
+        # started at all. A 200 + {} here would be a lie: both consumers (the
+        # inline JS dashboard and the Rich CLI) expect every key in the
+        # contract to be present and would fail on a missing key instead of
+        # seeing the real error. 503 tells the caller to retry rather than
+        # silently rendering nothing. With the sampler now started at module
+        # import time, this path is only reachable as a genuine failure, not
+        # during normal startup.
+        logger.error("No sampler snapshot available after waiting; returning 503")
+        return jsonify({}), 503
 
     return jsonify(_slice_to_limit(stats, limit))
 
@@ -168,15 +189,8 @@ def main() -> None:
     host = os.getenv('HOST', '0.0.0.0')
     port = int(os.getenv('PORT', 5000))
 
-    # In debug mode Flask's reloader re-execs this module in a worker
-    # process (marked by WERKZEUG_RUN_MAIN) after an initial import in a
-    # lightweight monitor process. Starting the sampler in both would spawn
-    # two threads calling psutil.cpu_percent independently, corrupting each
-    # other's baseline exactly like the two-caller problem the sampler
-    # exists to prevent, so skip it in the monitor process.
-    if not debug_mode or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-        sampler.start()
-
+    # The sampler is already started at module import time, above; nothing
+    # left to do here but run the app.
     app.run(host=host, port=port, debug=debug_mode)
 
 

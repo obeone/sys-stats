@@ -5,6 +5,8 @@ key names and the units are the actual public API of the project. These tests
 pin them down.
 """
 
+import importlib
+
 import pytest
 
 from sys_stats import collectors, sampler, server
@@ -355,3 +357,41 @@ def test_favicon_is_packaged_alongside_the_template(client):
 
     assert response.status_code == 200
     assert response.mimetype == "image/png"
+
+
+def test_stats_returns_503_when_no_snapshot_lands(client, monkeypatch):
+    """An empty payload is a lie; a genuine cold-start failure must 503.
+
+    Both consumers (the inline JS and the Rich CLI) expect every key in the
+    contract to be present. A ``200 {}`` response after the wait window
+    elapses without a sample silently breaks both instead of surfacing the
+    failure.
+    """
+    monkeypatch.setattr(sampler, "get_snapshot", lambda: (None, None, None))
+    monkeypatch.setattr(sampler, "wait_for_first_snapshot", lambda timeout: (None, None, None))
+
+    response = client.get("/stats")
+
+    assert response.status_code == 503
+    assert response.get_json() == {}
+
+
+def test_importing_the_server_module_starts_the_sampler(monkeypatch):
+    """Any WSGI entry point that only imports ``app`` must get a live sampler.
+
+    Before this fix, ``sampler.start()`` was called solely from
+    ``server.main()``. Running under ``gunicorn sys_stats.server:app`` or
+    ``flask --app sys_stats.server run`` never invoked it, so ``/stats``
+    burned the full ``wait_for_first_snapshot`` timeout on every request,
+    forever.
+    """
+    monkeypatch.delenv("FLASK_DEBUG", raising=False)
+    monkeypatch.delenv("WERKZEUG_RUN_MAIN", raising=False)
+    started = []
+    # Patched before the reload, so the module-scope call the reload triggers
+    # hits this stub instead of spawning a real background thread.
+    monkeypatch.setattr(sampler, "start", lambda: started.append(True))
+
+    importlib.reload(server)
+
+    assert started == [True]
