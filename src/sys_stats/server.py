@@ -48,10 +48,30 @@ def favicon():
     return send_from_directory(os.path.join(app.root_path, 'templates'), 'favicon.png', mimetype='image/png')
 
 
-#: How long ``/stats`` waits for the sampler's first snapshot on a cold
-#: start, in seconds, before giving up rather than blocking the request
-#: forever.
-_FIRST_SNAPSHOT_TIMEOUT = 5.0
+#: Floor on how long ``/stats`` waits for the sampler's first snapshot on a
+#: cold start, in seconds, regardless of how short the configured sampling
+#: interval is.
+_MIN_FIRST_SNAPSHOT_TIMEOUT = 5.0
+
+
+def _first_snapshot_timeout() -> float:
+    """Compute how long ``/stats`` waits for the sampler's first snapshot.
+
+    ``sampler._run`` waits one full sampling interval before it takes its
+    first sample (see :mod:`sys_stats.sampler`). A wait shorter than that
+    would time out on every cold start whenever
+    ``SYS_STATS_SAMPLE_INTERVAL`` is configured above the floor, so the
+    timeout is derived from the same interval instead of a value hardcoded
+    independently of it.
+
+    Returns
+    -------
+    float
+        Seconds to wait: twice the configured interval plus a one second
+        margin, never less than :data:`_MIN_FIRST_SNAPSHOT_TIMEOUT`.
+    """
+    interval = sampler._get_sample_interval()
+    return max(_MIN_FIRST_SNAPSHOT_TIMEOUT, interval * 2 + 1.0)
 
 # Per-process ranking keys carried by the sampler payload. ``/stats`` slices
 # each of these down to the requested ``limit``; every other key is returned
@@ -162,7 +182,7 @@ def get_stats():
     stats, _wall_ts, _monotonic_ts = sampler.get_snapshot()
     if stats is None:
         stats, _wall_ts, _monotonic_ts = sampler.wait_for_first_snapshot(
-            timeout=_FIRST_SNAPSHOT_TIMEOUT
+            timeout=_first_snapshot_timeout()
         )
 
     if stats is None:

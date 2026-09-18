@@ -395,3 +395,22 @@ def test_importing_the_server_module_starts_the_sampler(monkeypatch):
     importlib.reload(server)
 
     assert started == [True]
+
+
+def test_first_snapshot_timeout_scales_with_the_sample_interval(monkeypatch):
+    """A slow ``SYS_STATS_SAMPLE_INTERVAL`` must not make every cold start time out.
+
+    ``sampler._run`` waits a full interval before its first sample. A
+    hardcoded 5-second wait here is shorter than that whenever the interval
+    is configured above ~2s, so the very first requests always timed out.
+    """
+    monkeypatch.setenv("SYS_STATS_SAMPLE_INTERVAL", "10")
+
+    assert server._first_snapshot_timeout() == 21.0
+
+
+def test_first_snapshot_timeout_floors_at_five_seconds(monkeypatch):
+    """A short interval still gets a reasonable minimum wait."""
+    monkeypatch.setenv("SYS_STATS_SAMPLE_INTERVAL", "1")
+
+    assert server._first_snapshot_timeout() == 5.0
