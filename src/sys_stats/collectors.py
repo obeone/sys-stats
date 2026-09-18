@@ -363,13 +363,24 @@ def get_temperatures() -> list[dict[str, Any]]:
             label = entry.label or str(index)
             entries.append({"n": f"{chip}/{label}", "c": round(entry.current, 1)})
 
-    # psutil.sensors_temperatures() iterates hwmon* sysfs entries in
-    # whatever order the kernel enumerated them, which is NOT guaranteed
-    # stable across boots or module reloads. The consumer is a wall-mounted
-    # display that renders these positionally, so this list must be
-    # re-sorted on every single sample, or rows would physically swap
-    # places on screen between refreshes even though nothing changed. Do
-    # not remove this sort believing psutil already orders the dict.
+    # Observed: psutil.sensors_temperatures() returns an UNSORTED mapping.
+    # Measured on the target host (AMD EPYC, Debian), the k10temp entries
+    # came back as Tctl, Tccd8, Tccd1, Tccd2 ... Tccd7 -- neither
+    # alphabetical nor numeric. That single observation is the whole
+    # justification for sorting here.
+    #
+    # Why it matters: the consumer is a wall-mounted display that renders
+    # this list POSITIONALLY. An order that differs between two samples
+    # makes rows physically swap places on screen while someone is looking
+    # at it. Sorting removes the question entirely.
+    #
+    # Deliberately NOT claimed: that the order tracks sysfs hwmon*
+    # enumeration, or that it varies across reboots or module reloads.
+    # Those are plausible mechanisms nobody here verified, and an earlier
+    # version of this comment asserted them as fact. The sort is correct
+    # on the observation alone; it does not need the story.
+    #
+    # Do not remove this sort believing psutil already orders the mapping.
     entries.sort(key=lambda e: e["n"])
     return entries
 
@@ -401,9 +412,10 @@ def get_fans() -> list[dict[str, Any]]:
             label = entry.label or str(index)
             entries.append({"n": f"{chip}/{label}", "rpm": int(entry.current)})
 
-    # See get_temperatures: sysfs hwmon* enumeration order is not stable
-    # across boots or module reloads, so this list is re-sorted on every
-    # sample rather than trusted to already be ordered.
+    # See get_temperatures: psutil was observed returning its sensor
+    # mapping unsorted, and the wall panel renders this list positionally,
+    # so it is re-sorted on every sample rather than trusted to be ordered.
+    # No claim is made here about WHY the order comes out as it does.
     entries.sort(key=lambda e: e["n"])
     return entries
 
@@ -512,11 +524,12 @@ def get_ipmi_fans() -> list[dict[str, Any]]:
 
         entries.append({"n": name, "rpm": rpm})
 
-    # Same rationale as get_fans/get_temperatures: sensor enumeration
-    # order is not guaranteed stable across BMC firmware versions or
-    # reboots, and the wall panel renders this list positionally, so it
-    # is re-sorted on every single sample rather than trusted to already
-    # be ordered.
+    # Same treatment as get_fans/get_temperatures, for the same reason:
+    # the wall panel renders this list positionally, so a stable order is
+    # part of the contract and sorting guarantees it whatever ipmitool
+    # hands back. Unlike the psutil case we have no observation of this
+    # BMC's output order, and no claim is made about it -- sorting is
+    # cheap enough that it does not need one.
     entries.sort(key=lambda e: e["n"])
     return entries
 
@@ -698,10 +711,14 @@ def get_load_average() -> list[float]:
 def get_cpu_frequency_mhz() -> int:
     """Retrieve the current CPU frequency in MHz.
 
-    ``psutil.cpu_freq()`` returns ``None`` on some platforms and commonly
-    reports ``0`` inside a container without access to the host's
-    frequency-scaling files. Both cases degrade to ``0`` instead of
-    propagating a misleading reading.
+    ``psutil.cpu_freq()`` is documented upstream as returning ``None`` on
+    platforms that cannot report it, and it may also raise. Both cases
+    degrade to ``0`` here rather than propagating a misleading reading.
+
+    An earlier version of this docstring also asserted that it "commonly
+    reports 0 inside a container". That was never measured, so it is gone:
+    the ``None`` guard and the ``except`` are justified by the documented
+    behaviour alone and do not need the extra claim.
 
     Returns
     -------

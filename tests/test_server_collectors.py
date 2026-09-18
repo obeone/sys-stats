@@ -528,11 +528,16 @@ class _FakeSensorEntry:
 
 class TestGetTemperatures:
     def test_sorts_entries_by_name(self, monkeypatch):
-        """Regression guard: sysfs hwmon* enumeration order is not stable.
+        """Regression guard: psutil returns its sensor mapping unsorted.
 
-        A wall-mounted display renders these positionally, so an unsorted
-        dict fed in must still come out sorted, or rows would swap places
-        on screen between refreshes even though nothing physically changed.
+        Measured on the target host, ``k10temp`` came back as Tctl, Tccd8,
+        Tccd1 ... Tccd7 -- neither alphabetical nor numeric. A wall-mounted
+        display renders these positionally, so an unsorted mapping fed in
+        must still come out sorted, or rows would swap places on screen
+        between refreshes even though nothing physically changed.
+
+        Do not delete this test on the grounds that psutil "obviously"
+        orders its output: the observation above says it does not.
         """
         monkeypatch.setattr(
             collectors.psutil,
