@@ -405,6 +405,45 @@ def get_per_core_cpu() -> list[float]:
     return [round(p, 1) for p in psutil.cpu_percent(interval=None, percpu=True)]
 
 
+def get_load_average() -> list[float]:
+    """Retrieve the 1/5/15 minute load average.
+
+    ``os.getloadavg()`` is unavailable on some platforms (Windows) and
+    raises ``OSError`` there instead of returning a fallback value itself.
+    The ``/panel`` contract always needs three numbers regardless, so the
+    degradation happens here rather than in every caller.
+
+    Returns
+    -------
+    list of float
+        ``[1min, 5min, 15min]`` load average, or ``[0.0, 0.0, 0.0]`` on a
+        platform without ``os.getloadavg()`` support.
+    """
+    try:
+        return list(os.getloadavg())
+    except OSError:
+        return [0.0, 0.0, 0.0]
+
+
+def get_cpu_frequency_mhz() -> int:
+    """Retrieve the current CPU frequency in MHz.
+
+    ``psutil.cpu_freq()`` returns ``None`` on some platforms and commonly
+    reports ``0`` inside a container without access to the host's
+    frequency-scaling files. Both cases degrade to ``0`` instead of
+    propagating a misleading reading.
+
+    Returns
+    -------
+    int
+        Current CPU frequency in MHz, or ``0`` when unavailable.
+    """
+    freq = psutil.cpu_freq()
+    if freq is None or freq.current is None:
+        return 0
+    return int(freq.current)
+
+
 def collect_stats(limit: int = 5) -> dict:
     """Collect the full ``/stats`` payload from the host machine.
 

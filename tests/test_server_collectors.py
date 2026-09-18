@@ -646,6 +646,56 @@ class TestGetPerCoreCpu:
         assert collectors.get_per_core_cpu() == [12.3, 100.0]
 
 
+class TestGetLoadAverage:
+    def test_returns_the_triple_as_a_list(self, monkeypatch):
+        """Straight passthrough of ``os.getloadavg()``, tupled into a list."""
+        monkeypatch.setattr(collectors.os, "getloadavg", lambda: (0.5, 1.25, 2.0))
+
+        assert collectors.get_load_average() == [0.5, 1.25, 2.0]
+
+    def test_degrades_to_zeros_when_getloadavg_is_unsupported(self, monkeypatch):
+        """``os.getloadavg()`` raises ``OSError`` on platforms without it (Windows).
+
+        The /panel contract always needs three numbers, so this must
+        degrade instead of letting the sampler's iteration fail.
+        """
+
+        def _raise():
+            raise OSError("getloadavg() not supported")
+
+        monkeypatch.setattr(collectors.os, "getloadavg", _raise)
+
+        assert collectors.get_load_average() == [0.0, 0.0, 0.0]
+
+
+class TestGetCpuFrequencyMhz:
+    def test_returns_the_current_frequency_as_an_int(self, monkeypatch):
+        """The current frequency is truncated to an int MHz value."""
+
+        class _FakeFreq:
+            current = 3400.7
+
+        monkeypatch.setattr(collectors.psutil, "cpu_freq", lambda: _FakeFreq())
+
+        assert collectors.get_cpu_frequency_mhz() == 3400
+
+    def test_degrades_to_zero_when_cpu_freq_returns_none(self, monkeypatch):
+        """``psutil.cpu_freq()`` returns ``None`` on some platforms."""
+        monkeypatch.setattr(collectors.psutil, "cpu_freq", lambda: None)
+
+        assert collectors.get_cpu_frequency_mhz() == 0
+
+    def test_degrades_to_zero_when_current_is_none(self, monkeypatch):
+        """A frequency object with no readable current value degrades too."""
+
+        class _FakeFreq:
+            current = None
+
+        monkeypatch.setattr(collectors.psutil, "cpu_freq", lambda: _FakeFreq())
+
+        assert collectors.get_cpu_frequency_mhz() == 0
+
+
 class _FakeMemoryInfo:
     """Stand-in for the ``memory_info`` namedtuple exposed by psutil."""
 
