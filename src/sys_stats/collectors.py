@@ -311,8 +311,13 @@ def collect_stats(limit: int = 5) -> dict:
         The payload whose top-level keys are the public contract of the
         project; adding keys is a minor bump, renaming one is a major bump.
     """
-    # CPU usage
-    cpu_usage = psutil.cpu_percent(interval=1)
+    # CPU usage. Deliberately non-blocking (interval=None): it reports usage
+    # since the previous call rather than sampling for a second, which is
+    # only meaningful because sys_stats.sampler is the sole caller of
+    # psutil.cpu_percent and primes the baseline before the first real
+    # sample. Calling this with a blocking interval here would fight that
+    # baseline every time collect_stats() runs.
+    cpu_usage = psutil.cpu_percent(interval=None)
     cpu_cores = psutil.cpu_count(logical=True)
 
     # RAM usage
