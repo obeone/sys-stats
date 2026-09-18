@@ -314,8 +314,11 @@ def _run(interval: float, limit: int) -> None:
     """
     # psutil.cpu_percent(interval=None) reports usage since the *previous*
     # call. The very first call in a process has no previous call to compare
-    # against, so it returns a meaningless 0.0 (or an arbitrary bootstrap
-    # value depending on platform). The loop's first iteration "primes the
+    # against, so its return value is meaningless -- psutil documents this
+    # and tests/test_sampler.py pins the priming order. (An earlier version
+    # of this comment added "or an arbitrary bootstrap value depending on
+    # platform"; that was never observed here, so it is gone.) The loop's
+    # first iteration "primes the
     # pump" by making (and discarding) that first call instead of collecting
     # a real sample; every call after that (made inside collect_stats, one
     # interval later) is meaningful relative to it. The priming call runs
