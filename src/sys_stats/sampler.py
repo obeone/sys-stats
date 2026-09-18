@@ -177,11 +177,14 @@ def _run(interval: float, limit: int) -> None:
     # psutil.cpu_percent(interval=None) reports usage since the *previous*
     # call. The very first call in a process has no previous call to compare
     # against, so it returns a meaningless 0.0 (or an arbitrary bootstrap
-    # value depending on platform). Calling it once here, before the loop
-    # proper, "primes the pump": this reading is thrown away, and every
-    # subsequent call (made inside collect_stats, one interval later) is
-    # meaningful relative to it.
-    psutil.cpu_percent(interval=None)
+    # value depending on platform). The loop's first iteration "primes the
+    # pump" by making (and discarding) that first call instead of collecting
+    # a real sample; every call after that (made inside collect_stats, one
+    # interval later) is meaningful relative to it. The priming call runs
+    # inside the same try/except as a real sample below, so a failure there
+    # is logged and retried on the next interval instead of silently killing
+    # the thread with no retry and an empty cache forever.
+    primed = False
 
     # _stop_event.wait(timeout=interval) sleeps for `interval` seconds unless
     # stop() sets the event first, in which case it returns True immediately
@@ -189,6 +192,10 @@ def _run(interval: float, limit: int) -> None:
     # polling loop.
     while not _stop_event.wait(timeout=interval):
         try:
+            if not primed:
+                psutil.cpu_percent(interval=None)
+                primed = True
+                continue
             _sample_once(limit)
         except Exception:
             # A single bad collection (e.g. nvidia-smi wedged, Ollama

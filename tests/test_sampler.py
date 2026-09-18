@@ -105,6 +105,46 @@ def test_run_survives_a_raising_collector_and_keeps_sampling(monkeypatch, caplog
     assert any("Sampler iteration failed" in record.message for record in caplog.records)
 
 
+def test_run_survives_a_raising_priming_call_and_keeps_sampling(monkeypatch, caplog):
+    """A ``psutil.cpu_percent`` priming failure must not kill the thread either.
+
+    The priming call used to run before the loop's try/except, so a failure
+    there killed the thread silently with no retry and the cache never
+    filled. It must be logged and retried on the next interval, exactly like
+    any other iteration failure.
+    """
+    outcomes = iter([RuntimeError("boom"), 0.0])
+
+    def _cpu_percent(interval=None):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(sampler.psutil, "cpu_percent", _cpu_percent)
+    monkeypatch.setattr(
+        sampler.collectors,
+        "collect_stats",
+        lambda limit=5: {"top_cpu": [], "top_memory": [], "top_gpu_processes": []},
+    )
+
+    thread = threading.Thread(target=sampler._run, args=(0.01, 5), daemon=True)
+    with caplog.at_level("ERROR"):
+        thread.start()
+        try:
+            assert sampler._first_snapshot_event.wait(
+                timeout=2
+            ), "no sample landed after the priming failure"
+        finally:
+            sampler._stop_event.set()
+            thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    stats, _wall_ts, _monotonic_ts = sampler.get_snapshot()
+    assert stats == {"top_cpu": [], "top_memory": [], "top_gpu_processes": []}
+    assert any("Sampler iteration failed" in record.message for record in caplog.records)
+
+
 def test_wait_for_first_snapshot_returns_immediately_once_a_sample_exists():
     """A snapshot that already landed is returned without waiting out the timeout."""
     sampler._store_snapshot({"marker": "already-here"})
