@@ -213,7 +213,7 @@ whenever the virtual environment is activated.
    `SYS_STATS_PANEL_MAX_GPUS` — each unset by default, meaning no cap.
 
 5. **`SYS_STATS_PANEL_ONLY` (optional, security-relevant):** set to `1`,
-   `true` or `yes` to register only the `/panel` route — `/`, `/stats` and
+   `true` or `yes` to register only the `/panel` route: `/`, `/stats` and
    `/favicon.png` are never registered at all, so a request to them gets
    Flask's own 404 rather than a guarded rejection. `/stats` exposes the
    full host process table, complete command lines included, with no
@@ -225,6 +225,14 @@ whenever the virtual environment is activated.
    Helm chart's default liveness/readiness/startup probes hit `/`, so
    enabling this in the chart means repointing them at `/panel` too (see
    `chart/values.yaml`).
+
+6. **`SYS_STATS_INSTANCE_LABEL` (optional):** a free-text label shown in the
+   web UI's page title and body, for telling apart two instances that would
+   otherwise look identical, such as a Kubernetes pod seeing the Talos VM
+   next to a second instance running on the Proxmox hypervisor underneath
+   it, both named "sys-stats" and both describing the same physical box.
+   Unset (default) renders the page exactly as before this variable
+   existed.
 
 ## 📺 Using the CLI
 

@@ -383,6 +383,52 @@ def test_favicon_is_packaged_alongside_the_template(client):
     assert response.mimetype == "image/png"
 
 
+def test_index_shows_no_instance_label_when_unset(client, monkeypatch):
+    """Unset renders exactly as before this variable existed: no empty element.
+
+    Checks the ``id="instance-label"`` element specifically, not the bare
+    string "instance-label", which also appears in the page's static CSS
+    regardless of whether the label is set.
+    """
+    monkeypatch.delenv("SYS_STATS_INSTANCE_LABEL", raising=False)
+
+    html = client.get("/").data.decode()
+
+    assert "<title>Server Dashboard</title>" in html
+    assert 'id="instance-label"' not in html
+
+
+def test_index_shows_no_instance_label_when_blank(client, monkeypatch):
+    """A whitespace-only value behaves exactly like unset, not like an empty label."""
+    monkeypatch.setenv("SYS_STATS_INSTANCE_LABEL", "   ")
+
+    html = client.get("/").data.decode()
+
+    assert "<title>Server Dashboard</title>" in html
+    assert 'id="instance-label"' not in html
+
+
+def test_index_shows_the_instance_label_in_title_and_body(client, monkeypatch):
+    """A set label appears in both the page title and a visible body element."""
+    monkeypatch.setenv("SYS_STATS_INSTANCE_LABEL", "Talos VM (bart-worker)")
+
+    html = client.get("/").data.decode()
+
+    assert "<title>Server Dashboard: Talos VM (bart-worker)</title>" in html
+    assert 'id="instance-label"' in html
+    assert "Talos VM (bart-worker)" in html
+
+
+def test_index_html_escapes_the_instance_label(client, monkeypatch):
+    """The label comes from the environment and must never inject raw markup."""
+    monkeypatch.setenv("SYS_STATS_INSTANCE_LABEL", "<script>alert(1)</script>")
+
+    html = client.get("/").data.decode()
+
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+
+
 def test_stats_returns_503_when_no_snapshot_lands(client, monkeypatch):
     """An empty payload is a lie; a genuine cold-start failure must 503.
 

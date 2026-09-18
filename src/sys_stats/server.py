@@ -79,6 +79,35 @@ def _panel_only_enabled() -> bool:
 # var per request the way the sampler's own env readers do.
 _panel_only = _panel_only_enabled()
 
+#: Env var naming which physical instance the web UI is looking at, shown in
+#: the page title and body so two co-located deployments (e.g. a Kubernetes
+#: pod seeing a Talos VM, and a second instance on the Proxmox hypervisor
+#: underneath it, both reporting on the same box under the same app name)
+#: are told apart at a glance instead of looking like one is lying.
+_INSTANCE_LABEL_ENV = "SYS_STATS_INSTANCE_LABEL"
+
+
+def _instance_label() -> str | None:
+    """Read the optional instance label displayed in the web UI.
+
+    Read per-request rather than cached at import time, like the ``/panel``
+    truncation caps (:func:`_get_panel_cap`), so relabeling an instance takes
+    effect without a restart.
+
+    Returns
+    -------
+    str or None
+        The env var's value with surrounding whitespace stripped, or
+        ``None`` when it is unset or blank -- either case renders the page
+        exactly as it looked before this variable existed: no empty
+        element, no dangling separator.
+    """
+    raw = os.getenv(_INSTANCE_LABEL_ENV)
+    if raw is None:
+        return None
+    label = raw.strip()
+    return label or None
+
 
 @app.errorhandler(Exception)
 def handle_exception(e):
@@ -100,7 +129,7 @@ def handle_exception(e):
 if not _panel_only:
     @app.route('/')
     def index():
-        return render_template('index.html')
+        return render_template('index.html', instance_label=_instance_label())
 
 
     @app.route('/favicon.png')
