@@ -91,6 +91,7 @@ def client(monkeypatch):
     # these locally.
     monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
     monkeypatch.setattr(collectors, "get_fans", lambda: [])
+    monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
     monkeypatch.setattr(collectors, "get_swap", lambda: {"used": 0, "total": 0, "pct": 0.0})
     monkeypatch.setattr(collectors, "get_per_core_cpu", lambda: [])
     monkeypatch.setattr(collectors, "get_load_average", lambda: [0.0, 0.0, 0.0])

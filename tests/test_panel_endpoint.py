@@ -53,6 +53,7 @@ def client(monkeypatch):
 
     monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
     monkeypatch.setattr(collectors, "get_fans", lambda: [])
+    monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
     monkeypatch.setattr(collectors, "get_swap", lambda: {"used": 0, "total": 0, "pct": 0.0})
     monkeypatch.setattr(collectors, "get_per_core_cpu", lambda: [])
     monkeypatch.setattr(collectors, "get_load_average", lambda: [0.0, 0.0, 0.0])
@@ -310,6 +311,108 @@ class TestTempsAndFansTruncation:
         assert payload["gpu_n"] == 2
         assert len(payload["gpu"]) == 1
         assert payload["gpu"][0]["i"] == 0
+
+
+class TestFansUnion:
+    """``fans`` is the union of the hwmon and IPMI sources, concatenated then sorted."""
+
+    def test_both_sources_populated_are_interleaved_by_the_sort(self, client, monkeypatch):
+        """hwmon and IPMI entries land in one list, ordered together by ``n``."""
+        monkeypatch.setattr(
+            collectors, "get_fans", lambda: [{"n": "nct6775/fan2", "rpm": 900}]
+        )
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_fans",
+            lambda: [{"n": "FAN1", "rpm": 7100}, {"n": "FAN2", "rpm": 6900}],
+        )
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["fans"] == [
+            {"n": "FAN1", "rpm": 7100},
+            {"n": "FAN2", "rpm": 6900},
+            {"n": "nct6775/fan2", "rpm": 900},
+        ]
+        assert payload["fans_n"] == 3
+
+    def test_only_hwmon_populated(self, client, monkeypatch):
+        """A desktop with a Super I/O chip and no BMC reports hwmon fans alone."""
+        monkeypatch.setattr(
+            collectors, "get_fans", lambda: [{"n": "nct6775/fan1", "rpm": 1200}]
+        )
+        monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["fans"] == [{"n": "nct6775/fan1", "rpm": 1200}]
+        assert payload["fans_n"] == 1
+
+    def test_only_ipmi_populated(self, client, monkeypatch):
+        """A Proxmox hypervisor with zero hwmon fans reports IPMI fans alone."""
+        monkeypatch.setattr(collectors, "get_fans", lambda: [])
+        monkeypatch.setattr(
+            collectors, "get_ipmi_fans", lambda: [{"n": "FAN1", "rpm": 7100}]
+        )
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["fans"] == [{"n": "FAN1", "rpm": 7100}]
+        assert payload["fans_n"] == 1
+
+    def test_neither_source_populated(self, client, monkeypatch):
+        """No hwmon and no IPMI fans is an empty list and a zero count, not an error."""
+        monkeypatch.setattr(collectors, "get_fans", lambda: [])
+        monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["fans"] == []
+        assert payload["fans_n"] == 0
+
+    def test_one_source_raising_does_not_lose_the_other(self, client, monkeypatch):
+        """A raising collector degrades only its own contribution to the union."""
+        monkeypatch.setattr(
+            collectors, "get_fans", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        monkeypatch.setattr(
+            collectors, "get_ipmi_fans", lambda: [{"n": "FAN1", "rpm": 7100}]
+        )
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["fans"] == [{"n": "FAN1", "rpm": 7100}]
+        assert payload["fans_n"] == 1
+        assert "fans_hwmon" in payload["err"]
+
+    def test_cap_applies_to_the_union_with_fans_n_reporting_the_true_total(
+        self, client, monkeypatch
+    ):
+        """SYS_STATS_PANEL_MAX_FANS caps the sorted union; fans_n stays the pre-cap total."""
+        monkeypatch.setattr(
+            collectors, "get_fans", lambda: [{"n": "nct6775/fan1", "rpm": 1200}]
+        )
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_fans",
+            lambda: [{"n": "FAN1", "rpm": 7100}, {"n": "FAN2", "rpm": 6900}],
+        )
+        monkeypatch.setenv("SYS_STATS_PANEL_MAX_FANS", "2")
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["fans"] == [
+            {"n": "FAN1", "rpm": 7100},
+            {"n": "FAN2", "rpm": 6900},
+        ]
+        assert payload["fans_n"] == 3
+        assert len(payload["fans"]) < payload["fans_n"]
 
 
 class TestAge:

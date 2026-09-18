@@ -43,6 +43,7 @@ def _stub_panel_extra_collectors(monkeypatch):
     """
     monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
     monkeypatch.setattr(collectors, "get_fans", lambda: [])
+    monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
     monkeypatch.setattr(collectors, "get_swap", lambda: {"used": 0, "total": 0, "pct": 0.0})
     monkeypatch.setattr(collectors, "get_per_core_cpu", lambda: [])
     monkeypatch.setattr(collectors, "get_load_average", lambda: [0.0, 0.0, 0.0])
@@ -456,6 +457,7 @@ class TestCollectPanelExtras:
         """The happy path returns every field and an empty ``err`` list."""
         monkeypatch.setattr(collectors, "get_temperatures", lambda: [{"n": "cpu", "c": 55.0}])
         monkeypatch.setattr(collectors, "get_fans", lambda: [{"n": "fan1", "rpm": 1200}])
+        monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
         monkeypatch.setattr(collectors, "get_swap", lambda: {"used": 1, "total": 2, "pct": 50.0})
         monkeypatch.setattr(collectors, "get_per_core_cpu", lambda: [10.0, 20.0])
         monkeypatch.setattr(collectors, "get_load_average", lambda: [0.1, 0.2, 0.3])
@@ -478,6 +480,7 @@ class TestCollectPanelExtras:
         [
             ("get_temperatures", []),
             ("get_fans", []),
+            ("get_ipmi_fans", []),
             ("get_swap", {"used": 0, "total": 0, "pct": 0.0}),
             ("get_per_core_cpu", []),
             ("get_load_average", [0.0, 0.0, 0.0]),
@@ -503,6 +506,7 @@ class TestCollectPanelExtras:
         field = {
             "get_temperatures": "temps",
             "get_fans": "fans",
+            "get_ipmi_fans": "fans",
             "get_swap": "swap",
             "get_per_core_cpu": "per_core",
             "get_load_average": "load",
@@ -511,6 +515,66 @@ class TestCollectPanelExtras:
 
         assert extras[field] == default
         assert len(extras["err"]) == 1
+
+    def test_fans_are_the_union_of_hwmon_and_ipmi_sorted_by_name(self, monkeypatch):
+        """The two fan sources are concatenated, then sorted together by ``n``.
+
+        Their names cannot collide in practice (hwmon: ``chip/fanN``, IPMI:
+        ``FANn``), so a plain concatenate-then-sort is the whole contract --
+        no deduplication, no priority rule.
+        """
+        monkeypatch.setattr(
+            collectors, "get_fans", lambda: [{"n": "nct6775/fan2", "rpm": 900}]
+        )
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_fans",
+            lambda: [{"n": "FAN1", "rpm": 7100}, {"n": "FAN2", "rpm": 6900}],
+        )
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["fans"] == [
+            {"n": "FAN1", "rpm": 7100},
+            {"n": "FAN2", "rpm": 6900},
+            {"n": "nct6775/fan2", "rpm": 900},
+        ]
+
+    def test_fans_are_empty_when_neither_source_reports_anything(self, monkeypatch):
+        """No hwmon fans and no IPMI fans is a legitimate empty union, not an error."""
+        monkeypatch.setattr(collectors, "get_fans", lambda: [])
+        monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["fans"] == []
+        assert extras["err"] == []
+
+    def test_ipmi_fans_survive_a_raising_hwmon_collector(self, monkeypatch):
+        """hwmon raising must not cost the IPMI data, only its own field's slice."""
+        monkeypatch.setattr(
+            collectors, "get_fans", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [{"n": "FAN1", "rpm": 7100}])
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["fans"] == [{"n": "FAN1", "rpm": 7100}]
+        assert extras["err"] == ["fans_hwmon"]
+
+    def test_hwmon_fans_survive_a_raising_ipmi_collector(self, monkeypatch):
+        """IPMI raising must not cost the hwmon data, only its own field's slice."""
+        monkeypatch.setattr(
+            collectors, "get_fans", lambda: [{"n": "nct6775/fan1", "rpm": 1200}]
+        )
+        monkeypatch.setattr(
+            collectors, "get_ipmi_fans", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["fans"] == [{"n": "nct6775/fan1", "rpm": 1200}]
+        assert extras["err"] == ["fans_ipmi"]
 
 
 class TestGetPanelSnapshot:

@@ -173,7 +173,17 @@ def _collect_panel_extras() -> dict[str, Any]:
     only its own field, with a safe default substituted and a short tag
     appended to ``err``, instead of losing every panel field the way an
     uncaught exception in :func:`_sample_once` would drop the whole
-    iteration.
+    iteration. This applies in particular to the two independent fan
+    sources below: hwmon (:func:`sys_stats.collectors.get_fans`) and IPMI
+    (:func:`sys_stats.collectors.get_ipmi_fans`) are collected and guarded
+    separately, so one raising never costs the other its data.
+
+    ``fans`` is the union of both sources: concatenated, THEN sorted by
+    ``"n"``. The two are disjoint in practice (hwmon names look like
+    ``nct6775/fan1``, IPMI names look like ``FAN1``), so no deduplication
+    or priority rule is needed -- a Proxmox hypervisor host with zero hwmon
+    fans and five IPMI ones, and a desktop with the reverse, both fall out
+    of the same code path.
 
     Returns
     -------
@@ -192,11 +202,25 @@ def _collect_panel_extras() -> dict[str, Any]:
         err.append("temps")
 
     try:
-        fans = collectors.get_fans()
+        hwmon_fans = collectors.get_fans()
     except Exception:
-        logger.exception("Panel: failed to collect fan speeds")
-        fans = []
-        err.append("fans")
+        logger.exception("Panel: failed to collect hwmon fan speeds")
+        hwmon_fans = []
+        err.append("fans_hwmon")
+
+    try:
+        ipmi_fans = collectors.get_ipmi_fans()
+    except Exception:
+        logger.exception("Panel: failed to collect IPMI fan speeds")
+        ipmi_fans = []
+        err.append("fans_ipmi")
+
+    # Concatenate first, sort second -- never the reverse. Positional
+    # stability on the wall display is part of the frozen /panel contract
+    # (see get_temperatures/get_fans/get_ipmi_fans), and sorting only the
+    # individual sources before concatenating would not guarantee the
+    # union itself comes out ordered.
+    fans = sorted(hwmon_fans + ipmi_fans, key=lambda e: e["n"])
 
     try:
         swap = collectors.get_swap()
