@@ -481,7 +481,11 @@ def get_ipmi_fans() -> list[dict[str, Any]]:
     Returns
     -------
     list of dict
-        Entries ``{"n": <sensor name>, "rpm": <int>}``, sorted by ``"n"``.
+        Entries ``{"n": "ipmi/<sensor name>", "rpm": <int>}``, sorted by
+        ``"n"`` after the prefix is applied. See :func:`get_ipmi_temperatures`
+        for why the ``ipmi/`` prefix exists; the same reasoning applies here
+        (BMC fan labels like ``FAN1``/``FAN2`` collide in shape with the
+        unprefixed hwmon convention used by :func:`get_fans`).
         A sensor the BMC reports as unreadable (``No Reading``,
         ``Disabled``, ``N/A``, ...) is a sensor that is not there, not a
         fan spinning at 0 RPM -- publishing it as 0 would render on the
@@ -522,14 +526,19 @@ def get_ipmi_fans() -> list[dict[str, Any]]:
         except (ValueError, IndexError):
             continue
 
-        entries.append({"n": name, "rpm": rpm})
+        # Prefixed here, before sorting: see get_ipmi_temperatures for why
+        # IPMI entries carry an "ipmi/" prefix while hwmon entries carry a
+        # "chip/" prefix (get_fans/get_temperatures), and why the two
+        # conventions must stay visually distinct rather than unified.
+        entries.append({"n": f"ipmi/{name}", "rpm": rpm})
 
     # Same treatment as get_fans/get_temperatures, for the same reason:
     # the wall panel renders this list positionally, so a stable order is
     # part of the contract and sorting guarantees it whatever ipmitool
     # hands back. Unlike the psutil case we have no observation of this
     # BMC's output order, and no claim is made about it -- sorting is
-    # cheap enough that it does not need one.
+    # cheap enough that it does not need one. Sorted on the prefixed name,
+    # never the raw BMC label, so the order matches what ships in /panel.
     entries.sort(key=lambda e: e["n"])
     return entries
 
@@ -597,16 +606,44 @@ def get_ipmi_temperatures() -> list[dict[str, Any]]:
     section of ``/panel``: a GPU entry with only a temperature and zeros
     everywhere else would read as an idle card, not as missing data.
 
+    Every entry name is prefixed ``ipmi/``, e.g. ``ipmi/CPU Temp``,
+    ``ipmi/GPU1 Temp``. hwmon entries are already prefixed ``chip/label``
+    by :func:`get_temperatures` (``k10temp/Tctl``, ``nvme/Composite``); this
+    matches the two lists to one convention instead of mixing a prefixed
+    and an unprefixed name in the same ``temps`` list. Two concrete
+    ambiguities this removes, both observed on the same host:
+
+    - The BMC reports ``GPU1 Temp`` / ``GPU4 Temp`` (motherboard slot
+      labels, on a board with four slots of which two are populated). The
+      ``/panel`` payload separately carries a ``gpu[]`` array indexed
+      ``i=0`` / ``i=1`` from GPUtil/nvidia-smi. These two numbering systems
+      are unrelated and nothing joins them; an unprefixed ``GPU1 Temp``
+      sitting next to ``gpu[].i = 1`` invites pairing them, and the pairing
+      would be wrong.
+    - CPU temperature arrives twice, from two different measurement
+      points: ``k10temp/Tctl`` (on-die, ~58 degrees C observed) and
+      ``ipmi/CPU Temp`` (motherboard sensor, ~52 degrees C observed). Both
+      readings are correct; they measure different points. Without the
+      prefixes these are two lines that disagree by six degrees with
+      nothing on the line explaining why.
+
+    ``ipmi/`` names a protocol, not a chip, so ``bmc/`` (the component)
+    would be more consistent with the ``chip/label`` convention above. It
+    was not used: ``ipmi`` is the term someone searches for or greps when
+    they hit an unfamiliar line on the wall display, and that
+    recognisability was judged more useful here than taxonomic consistency
+    with ``k10temp/``/``nvme/``.
+
     Returns
     -------
     list of dict
-        Entries ``{"n": <sensor name>, "c": <float, rounded to 1 decimal>}``,
-        sorted by ``"n"``. A sensor the BMC reports as unreadable (``No
-        Reading``, ``Disabled``, ``N/A``, ...) is a sensor that is not
-        there, not a probe reading 0degC -- such entries are omitted rather
-        than coerced, exactly like :func:`get_ipmi_fans`. Empty when
-        ``ipmitool`` is missing, fails, times out, or its output does not
-        parse.
+        Entries ``{"n": "ipmi/<sensor name>", "c": <float, rounded to 1
+        decimal>}``, sorted by ``"n"`` after the prefix is applied. A
+        sensor the BMC reports as unreadable (``No Reading``, ``Disabled``,
+        ``N/A``, ...) is a sensor that is not there, not a probe reading
+        0degC -- such entries are omitted rather than coerced, exactly
+        like :func:`get_ipmi_fans`. Empty when ``ipmitool`` is missing,
+        fails, times out, or its output does not parse.
     """
     stdout = _run_ipmitool_sdr_temperature()
     if stdout is None:
@@ -638,13 +675,20 @@ def get_ipmi_temperatures() -> list[dict[str, Any]]:
         except (ValueError, IndexError):
             continue
 
-        entries.append({"n": name, "c": round(celsius, 1)})
+        # See the docstring above for why this prefix exists: it keeps
+        # BMC slot labels like "GPU1 Temp" from being mistaken for the
+        # /panel gpu[] array's own i=0/i=1 index, and keeps the two CPU
+        # temperature readings (k10temp/Tctl vs ipmi/CPU Temp) visibly
+        # distinct instead of looking like a contradiction.
+        entries.append({"n": f"ipmi/{name}", "c": round(celsius, 1)})
 
     # Same rationale as get_ipmi_fans/get_temperatures: sensor enumeration
     # order is not guaranteed stable across BMC firmware versions or
     # reboots, and the wall panel renders this list positionally, so it is
     # re-sorted on every single sample rather than trusted to already be
-    # ordered.
+    # ordered. Sorted on the prefixed name, applied before this sort and
+    # before concatenation with the hwmon list in
+    # sys_stats.sampler._collect_panel_extras, never after either.
     entries.sort(key=lambda e: e["n"])
     return entries
 

@@ -680,8 +680,8 @@ class TestGetIpmiFans:
         )
 
         assert collectors.get_ipmi_fans() == [
-            {"n": "FAN1", "rpm": 7100},
-            {"n": "FAN2", "rpm": 6900},
+            {"n": "ipmi/FAN1", "rpm": 7100},
+            {"n": "ipmi/FAN2", "rpm": 6900},
         ]
 
     def test_omits_no_reading_sensors_instead_of_zero(self, monkeypatch):
@@ -700,7 +700,7 @@ class TestGetIpmiFans:
             ),
         )
 
-        assert collectors.get_ipmi_fans() == [{"n": "FAN1", "rpm": 6300}]
+        assert collectors.get_ipmi_fans() == [{"n": "ipmi/FAN1", "rpm": 6300}]
 
     def test_returns_empty_list_when_ipmitool_fails(self, monkeypatch):
         """A failing ipmitool (no BMC reachable) degrades to no fan data."""
@@ -742,8 +742,8 @@ class TestGetIpmiTemperatures:
         )
 
         assert collectors.get_ipmi_temperatures() == [
-            {"n": "CPU1 Temp", "c": 38.0},
-            {"n": "CPU2 Temp", "c": 41.0},
+            {"n": "ipmi/CPU1 Temp", "c": 38.0},
+            {"n": "ipmi/CPU2 Temp", "c": 41.0},
         ]
 
     def test_rounds_the_reading_to_one_decimal(self, monkeypatch):
@@ -754,7 +754,7 @@ class TestGetIpmiTemperatures:
             _fake_run("CPU1 Temp        | 31h | ok  |  3.1 | 38.04 degrees C\n"),
         )
 
-        assert collectors.get_ipmi_temperatures() == [{"n": "CPU1 Temp", "c": 38.0}]
+        assert collectors.get_ipmi_temperatures() == [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
 
     def test_omits_no_reading_sensors_instead_of_zero(self, monkeypatch):
         """A sensor the BMC cannot poll must be dropped, never published as 0degC.
@@ -772,7 +772,7 @@ class TestGetIpmiTemperatures:
             ),
         )
 
-        assert collectors.get_ipmi_temperatures() == [{"n": "CPU1 Temp", "c": 38.0}]
+        assert collectors.get_ipmi_temperatures() == [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
 
     def test_returns_empty_list_when_ipmitool_fails(self, monkeypatch):
         """A failing ipmitool (no BMC reachable) degrades to no temperature data."""

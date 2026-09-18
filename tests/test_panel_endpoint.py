@@ -325,15 +325,15 @@ class TestTempsUnion:
         monkeypatch.setattr(
             collectors,
             "get_ipmi_temperatures",
-            lambda: [{"n": "CPU1 Temp", "c": 38.0}, {"n": "CPU2 Temp", "c": 41.5}],
+            lambda: [{"n": "ipmi/CPU1 Temp", "c": 38.0}, {"n": "ipmi/CPU2 Temp", "c": 41.5}],
         )
         _seed_cache()
 
         payload = client.get("/panel").get_json()
 
         assert payload["temps"] == [
-            {"n": "CPU1 Temp", "c": 38.0},
-            {"n": "CPU2 Temp", "c": 41.5},
+            {"n": "ipmi/CPU1 Temp", "c": 38.0},
+            {"n": "ipmi/CPU2 Temp", "c": 41.5},
             {"n": "k10temp/Tctl", "c": 45.0},
         ]
         assert payload["temps_n"] == 3
@@ -355,13 +355,13 @@ class TestTempsUnion:
         """A Proxmox hypervisor with zero hwmon sensors reports IPMI temps alone."""
         monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
         monkeypatch.setattr(
-            collectors, "get_ipmi_temperatures", lambda: [{"n": "CPU1 Temp", "c": 38.0}]
+            collectors, "get_ipmi_temperatures", lambda: [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
         )
         _seed_cache()
 
         payload = client.get("/panel").get_json()
 
-        assert payload["temps"] == [{"n": "CPU1 Temp", "c": 38.0}]
+        assert payload["temps"] == [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
         assert payload["temps_n"] == 1
 
     def test_neither_source_populated(self, client, monkeypatch):
@@ -381,13 +381,13 @@ class TestTempsUnion:
             collectors, "get_temperatures", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
         )
         monkeypatch.setattr(
-            collectors, "get_ipmi_temperatures", lambda: [{"n": "CPU1 Temp", "c": 38.0}]
+            collectors, "get_ipmi_temperatures", lambda: [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
         )
         _seed_cache()
 
         payload = client.get("/panel").get_json()
 
-        assert payload["temps"] == [{"n": "CPU1 Temp", "c": 38.0}]
+        assert payload["temps"] == [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
         assert payload["temps_n"] == 1
         assert "temps_hwmon" in payload["err"]
 
@@ -401,7 +401,7 @@ class TestTempsUnion:
         monkeypatch.setattr(
             collectors,
             "get_ipmi_temperatures",
-            lambda: [{"n": "CPU1 Temp", "c": 38.0}, {"n": "CPU2 Temp", "c": 41.5}],
+            lambda: [{"n": "ipmi/CPU1 Temp", "c": 38.0}, {"n": "ipmi/CPU2 Temp", "c": 41.5}],
         )
         monkeypatch.setenv("SYS_STATS_PANEL_MAX_TEMPS", "2")
         _seed_cache()
@@ -409,8 +409,8 @@ class TestTempsUnion:
         payload = client.get("/panel").get_json()
 
         assert payload["temps"] == [
-            {"n": "CPU1 Temp", "c": 38.0},
-            {"n": "CPU2 Temp", "c": 41.5},
+            {"n": "ipmi/CPU1 Temp", "c": 38.0},
+            {"n": "ipmi/CPU2 Temp", "c": 41.5},
         ]
         assert payload["temps_n"] == 3
         assert len(payload["temps"]) < payload["temps_n"]
@@ -427,15 +427,15 @@ class TestFansUnion:
         monkeypatch.setattr(
             collectors,
             "get_ipmi_fans",
-            lambda: [{"n": "FAN1", "rpm": 7100}, {"n": "FAN2", "rpm": 6900}],
+            lambda: [{"n": "ipmi/FAN1", "rpm": 7100}, {"n": "ipmi/FAN2", "rpm": 6900}],
         )
         _seed_cache()
 
         payload = client.get("/panel").get_json()
 
         assert payload["fans"] == [
-            {"n": "FAN1", "rpm": 7100},
-            {"n": "FAN2", "rpm": 6900},
+            {"n": "ipmi/FAN1", "rpm": 7100},
+            {"n": "ipmi/FAN2", "rpm": 6900},
             {"n": "nct6775/fan2", "rpm": 900},
         ]
         assert payload["fans_n"] == 3
@@ -457,13 +457,13 @@ class TestFansUnion:
         """A Proxmox hypervisor with zero hwmon fans reports IPMI fans alone."""
         monkeypatch.setattr(collectors, "get_fans", lambda: [])
         monkeypatch.setattr(
-            collectors, "get_ipmi_fans", lambda: [{"n": "FAN1", "rpm": 7100}]
+            collectors, "get_ipmi_fans", lambda: [{"n": "ipmi/FAN1", "rpm": 7100}]
         )
         _seed_cache()
 
         payload = client.get("/panel").get_json()
 
-        assert payload["fans"] == [{"n": "FAN1", "rpm": 7100}]
+        assert payload["fans"] == [{"n": "ipmi/FAN1", "rpm": 7100}]
         assert payload["fans_n"] == 1
 
     def test_neither_source_populated(self, client, monkeypatch):
@@ -483,13 +483,13 @@ class TestFansUnion:
             collectors, "get_fans", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
         )
         monkeypatch.setattr(
-            collectors, "get_ipmi_fans", lambda: [{"n": "FAN1", "rpm": 7100}]
+            collectors, "get_ipmi_fans", lambda: [{"n": "ipmi/FAN1", "rpm": 7100}]
         )
         _seed_cache()
 
         payload = client.get("/panel").get_json()
 
-        assert payload["fans"] == [{"n": "FAN1", "rpm": 7100}]
+        assert payload["fans"] == [{"n": "ipmi/FAN1", "rpm": 7100}]
         assert payload["fans_n"] == 1
         assert "fans_hwmon" in payload["err"]
 
@@ -503,7 +503,7 @@ class TestFansUnion:
         monkeypatch.setattr(
             collectors,
             "get_ipmi_fans",
-            lambda: [{"n": "FAN1", "rpm": 7100}, {"n": "FAN2", "rpm": 6900}],
+            lambda: [{"n": "ipmi/FAN1", "rpm": 7100}, {"n": "ipmi/FAN2", "rpm": 6900}],
         )
         monkeypatch.setenv("SYS_STATS_PANEL_MAX_FANS", "2")
         _seed_cache()
@@ -511,8 +511,8 @@ class TestFansUnion:
         payload = client.get("/panel").get_json()
 
         assert payload["fans"] == [
-            {"n": "FAN1", "rpm": 7100},
-            {"n": "FAN2", "rpm": 6900},
+            {"n": "ipmi/FAN1", "rpm": 7100},
+            {"n": "ipmi/FAN2", "rpm": 6900},
         ]
         assert payload["fans_n"] == 3
         assert len(payload["fans"]) < payload["fans_n"]

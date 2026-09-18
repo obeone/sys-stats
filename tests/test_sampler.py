@@ -523,7 +523,7 @@ class TestCollectPanelExtras:
         """The two temperature sources are concatenated, then sorted together by ``n``.
 
         Their names cannot collide in practice (hwmon: ``chip/label``, IPMI:
-        free-text sensor names like ``CPU1 Temp``), so a plain
+        ``ipmi/``-prefixed sensor names like ``ipmi/CPU1 Temp``), so a plain
         concatenate-then-sort is the whole contract -- no deduplication, no
         priority rule.
         """
@@ -533,14 +533,14 @@ class TestCollectPanelExtras:
         monkeypatch.setattr(
             collectors,
             "get_ipmi_temperatures",
-            lambda: [{"n": "CPU1 Temp", "c": 38.0}, {"n": "CPU2 Temp", "c": 41.5}],
+            lambda: [{"n": "ipmi/CPU1 Temp", "c": 38.0}, {"n": "ipmi/CPU2 Temp", "c": 41.5}],
         )
 
         extras = sampler._collect_panel_extras()
 
         assert extras["temps"] == [
-            {"n": "CPU1 Temp", "c": 38.0},
-            {"n": "CPU2 Temp", "c": 41.5},
+            {"n": "ipmi/CPU1 Temp", "c": 38.0},
+            {"n": "ipmi/CPU2 Temp", "c": 41.5},
             {"n": "k10temp/Tctl", "c": 45.0},
         ]
 
@@ -560,12 +560,12 @@ class TestCollectPanelExtras:
             collectors, "get_temperatures", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
         )
         monkeypatch.setattr(
-            collectors, "get_ipmi_temperatures", lambda: [{"n": "CPU1 Temp", "c": 38.0}]
+            collectors, "get_ipmi_temperatures", lambda: [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
         )
 
         extras = sampler._collect_panel_extras()
 
-        assert extras["temps"] == [{"n": "CPU1 Temp", "c": 38.0}]
+        assert extras["temps"] == [{"n": "ipmi/CPU1 Temp", "c": 38.0}]
         assert extras["err"] == ["temps_hwmon"]
 
     def test_hwmon_temps_survive_a_raising_ipmi_collector(self, monkeypatch):
@@ -586,8 +586,8 @@ class TestCollectPanelExtras:
         """The two fan sources are concatenated, then sorted together by ``n``.
 
         Their names cannot collide in practice (hwmon: ``chip/fanN``, IPMI:
-        ``FANn``), so a plain concatenate-then-sort is the whole contract --
-        no deduplication, no priority rule.
+        ``ipmi/FANn``), so a plain concatenate-then-sort is the whole
+        contract -- no deduplication, no priority rule.
         """
         monkeypatch.setattr(
             collectors, "get_fans", lambda: [{"n": "nct6775/fan2", "rpm": 900}]
@@ -595,14 +595,14 @@ class TestCollectPanelExtras:
         monkeypatch.setattr(
             collectors,
             "get_ipmi_fans",
-            lambda: [{"n": "FAN1", "rpm": 7100}, {"n": "FAN2", "rpm": 6900}],
+            lambda: [{"n": "ipmi/FAN1", "rpm": 7100}, {"n": "ipmi/FAN2", "rpm": 6900}],
         )
 
         extras = sampler._collect_panel_extras()
 
         assert extras["fans"] == [
-            {"n": "FAN1", "rpm": 7100},
-            {"n": "FAN2", "rpm": 6900},
+            {"n": "ipmi/FAN1", "rpm": 7100},
+            {"n": "ipmi/FAN2", "rpm": 6900},
             {"n": "nct6775/fan2", "rpm": 900},
         ]
 
@@ -621,11 +621,11 @@ class TestCollectPanelExtras:
         monkeypatch.setattr(
             collectors, "get_fans", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
         )
-        monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [{"n": "FAN1", "rpm": 7100}])
+        monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [{"n": "ipmi/FAN1", "rpm": 7100}])
 
         extras = sampler._collect_panel_extras()
 
-        assert extras["fans"] == [{"n": "FAN1", "rpm": 7100}]
+        assert extras["fans"] == [{"n": "ipmi/FAN1", "rpm": 7100}]
         assert extras["err"] == ["fans_hwmon"]
 
     def test_hwmon_fans_survive_a_raising_ipmi_collector(self, monkeypatch):

@@ -185,13 +185,15 @@ def _collect_panel_extras() -> dict[str, Any]:
     ``temps`` and ``fans`` are each the union of their two sources:
     concatenated, THEN sorted by ``"n"``. The two are disjoint in practice
     (hwmon names look like ``nct6775/fan1`` / ``k10temp/Tctl``, IPMI names
-    look like ``FAN1`` / ``CPU1 Temp``), so no deduplication or priority
-    rule is needed -- a Proxmox hypervisor host with zero hwmon sensors and
-    several IPMI ones, and a desktop with the reverse, both fall out of the
-    same code path. Some BMCs report GPU temperatures among their sensors;
-    those stay in ``temps`` under their BMC name rather than being folded
-    into ``gpu[]``, where a temperature-only entry would read as an idle
-    card instead of missing data.
+    are prefixed ``ipmi/`` by :func:`sys_stats.collectors.get_ipmi_fans` /
+    :func:`sys_stats.collectors.get_ipmi_temperatures`, e.g. ``ipmi/FAN1``
+    / ``ipmi/CPU1 Temp``), so no deduplication or priority rule is needed
+    -- a Proxmox hypervisor host with zero hwmon sensors and several IPMI
+    ones, and a desktop with the reverse, both fall out of the same code
+    path. Some BMCs report GPU temperatures among their sensors; those
+    stay in ``temps`` under their prefixed BMC name rather than being
+    folded into ``gpu[]``, where a temperature-only entry would read as an
+    idle card instead of missing data.
 
     Returns
     -------
