@@ -191,6 +191,12 @@ whenever the virtual environment is activated.
    The application starts on `http://localhost:5000`. It honours the `HOST`,
    `PORT` and `FLASK_DEBUG` environment variables.
 
+   A background sampler thread, not each request, collects the metrics.
+   `SYS_STATS_SAMPLE_INTERVAL` sets how many seconds it waits between
+   samples (default `2.0`), and `SYS_STATS_TOP_PROCESSES_MAX` caps how many
+   entries it collects per per-process ranking (default `50`) — a `?limit=`
+   above that cap only returns what was already sampled.
+
 ## 📺 Using the CLI
 
 To use the terminal dashboard for live monitoring, run:

@@ -48,6 +48,16 @@ controllers:
           # error, and the panel simply stays empty.
           # OLLAMA_API_URL: http://ollama.ollama.svc.cluster.local:11434
 
+          # Seconds the background sampler waits between samples. Defaults
+          # to 2.0; raising it lowers CPU/nvidia-smi overhead at the cost of
+          # staler panels.
+          # SYS_STATS_SAMPLE_INTERVAL: "2.0"
+
+          # Cap on how many entries the sampler collects per per-process
+          # ranking (top CPU, top memory, top GPU). Defaults to 50; a
+          # dashboard ?limit= above this only returns what was sampled.
+          # SYS_STATS_TOP_PROCESSES_MAX: "50"
+
         securityContext:
           # nvidia-smi and the host's /proc both need more than the image's
           # unprivileged user gets by default. Dropping this is worth trying
