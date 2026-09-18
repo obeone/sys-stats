@@ -3,6 +3,7 @@
 import copy
 import logging
 import os
+import socket
 import time
 from typing import Any
 
@@ -94,6 +95,12 @@ def _instance_label() -> str | None:
     truncation caps (:func:`_get_panel_cap`), so relabeling an instance takes
     effect without a restart.
 
+    This is human-facing prose for the web UI title/body, meant to be
+    rewritten for readability (e.g. "Talos VM (bart-worker)"). It must never
+    be merged with or used to derive :func:`_panel_hostname`'s ``host``
+    value: that one is a machine identity a consumer does an exact string
+    comparison against, and relabeling this for looks must never change it.
+
     Returns
     -------
     str or None
@@ -107,6 +114,47 @@ def _instance_label() -> str | None:
         return None
     label = raw.strip()
     return label or None
+
+
+#: Env var overriding the ``host`` value ``/panel`` reports, for hosts where
+#: ``socket.gethostname()`` is meaningless (e.g. a container reporting its
+#: pod name rather than the physical machine it runs on).
+_HOSTNAME_ENV = "SYS_STATS_HOSTNAME"
+
+
+def _panel_hostname() -> str:
+    """Read the machine identity reported in the ``/panel`` payload's ``host`` key.
+
+    Read per request, not cached at import time: ``hostnamectl
+    set-hostname`` changes the value at runtime, and caching it at import
+    would keep announcing the old name indefinitely for the cost of one
+    cheap syscall per request.
+
+    ``/panel``'s other guards (``ready``, ``age``, ``err``) protect against
+    data that is missing or stale. None of them protects against data that
+    is fresh, correct, and describing a different machine than the consumer
+    thinks it is talking to -- which a duplicated IP, a repointed DNS
+    record, a migrated DHCP lease, or a service moved while keeping its name
+    can all produce without raising any error. ``host`` lets the consumer
+    detect that case with a plain string comparison.
+
+    This is deliberately independent from :func:`_instance_label`: that one
+    is prose meant to be rewritten for the web UI, this one is a machine
+    identity a consumer compares byte-for-byte (see its docstring for why
+    merging the two was rejected). Never derive one from the other.
+
+    Returns
+    -------
+    str
+        :data:`_HOSTNAME_ENV`'s value verbatim when set, otherwise
+        ``socket.gethostname()`` verbatim -- neither is shortened or
+        normalised, since a consumer comparing this against an FQDN
+        constant would break if it were.
+    """
+    override = os.getenv(_HOSTNAME_ENV)
+    if override:
+        return override
+    return socket.gethostname()
 
 
 @app.errorhandler(Exception)
@@ -498,6 +546,10 @@ def _build_panel_payload(
         "ts": int(wall_ts),
         "age": age,
         "ready": True,
+        # See _panel_hostname: machine identity for a consumer's strcmp,
+        # read fresh every response, never merged with _instance_label's
+        # display prose. /stats does not carry this key -- see get_stats.
+        "host": _panel_hostname(),
         "cpu": {
             "pct": _round1(stats["cpu"]),
             "n": stats["summary"]["cpu"]["cores"],

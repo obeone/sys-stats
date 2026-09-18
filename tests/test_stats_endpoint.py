@@ -138,6 +138,18 @@ def test_stats_exposes_the_full_payload_without_a_gpu(client):
     assert payload["ram"] == {"total": 16 * 1024**3, "used": 8 * 1024**3, "percent": 50.0}
 
 
+def test_stats_never_carries_the_panel_only_host_key(client):
+    """``host`` (SYS_STATS_HOSTNAME) is a ``/panel``-only addition; ``/stats`` is untouched.
+
+    Regression guard for the two payloads staying byte-for-byte independent:
+    the key set assertion above already pins this down implicitly, this
+    test makes the intent explicit.
+    """
+    payload = client.get("/stats").get_json()
+
+    assert "host" not in payload
+
+
 def test_stats_converts_gpu_memory_to_bytes(client, monkeypatch):
     """GPUtil reports MiB; the payload must carry bytes and a percentage."""
     monkeypatch.setattr(collectors.GPUtil, "getGPUs", lambda: [_FakeGPU()])

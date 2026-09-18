@@ -94,6 +94,7 @@ def test_panel_exposes_exactly_the_frozen_top_level_keys(client):
         "ts",
         "age",
         "ready",
+        "host",
         "cpu",
         "mem",
         "swap",
@@ -125,6 +126,51 @@ def test_panel_cpu_and_mem_sections_without_a_gpu(client):
     assert payload["gpu"] == []
     assert payload["gpu_n"] == 0
     assert payload["err"] == []
+
+
+class TestPanelHost:
+    """``host`` identifies which machine produced the sample.
+
+    Unlike every other ``/panel`` guard (``ready``, ``age``, ``err``), this
+    one exists to catch data that is fresh and correct but describing the
+    wrong machine -- a duplicated IP, a repointed DNS record, a migrated
+    DHCP lease, none of which raise an error on their own.
+    """
+
+    def test_falls_back_to_socket_gethostname_when_unset(self, client, monkeypatch):
+        """Unset (default) reports the real host, verbatim, not shortened."""
+        monkeypatch.delenv("SYS_STATS_HOSTNAME", raising=False)
+        monkeypatch.setattr(server.socket, "gethostname", lambda: "bart.virt.obeone.org")
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["host"] == "bart.virt.obeone.org"
+
+    def test_reflects_the_env_override_when_set(self, client, monkeypatch):
+        """SYS_STATS_HOSTNAME wins over socket.gethostname() when set."""
+        monkeypatch.setattr(server.socket, "gethostname", lambda: "bart.virt.obeone.org")
+        monkeypatch.setenv("SYS_STATS_HOSTNAME", "pod-abc123")
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["host"] == "pod-abc123"
+
+    def test_is_re_read_per_request_rather_than_cached(self, client, monkeypatch):
+        """A hostname change must be picked up on the very next request.
+
+        Regression guard: ``hostnamectl set-hostname`` changes the value at
+        runtime, and a process that cached it at import/sample time would
+        keep announcing the old name indefinitely.
+        """
+        monkeypatch.delenv("SYS_STATS_HOSTNAME", raising=False)
+        hostnames = iter(["first-name", "second-name"])
+        monkeypatch.setattr(server.socket, "gethostname", lambda: next(hostnames))
+
+        first = client.get("/panel").get_json()
+        second = client.get("/panel").get_json()
+
+        assert first["host"] == "first-name"
+        assert second["host"] == "second-name"
 
 
 def test_panel_converts_gpu_memory_total_to_bytes(client, monkeypatch):

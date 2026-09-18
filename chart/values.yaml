@@ -80,6 +80,15 @@ controllers:
           # at "/panel" if you turn this on.
           # SYS_STATS_PANEL_ONLY: "1"
 
+          # Overrides the /panel payload's "host" identity field, which is
+          # socket.gethostname() by default (the pod's own hostname, not the
+          # node it landed on). Set this where that value is meaningless to
+          # a consumer comparing it against a known machine name. Unrelated
+          # to SYS_STATS_INSTANCE_LABEL (README.md): that one is a
+          # human-facing display label, this one is a machine identity, and
+          # the two are never derived from one another.
+          # SYS_STATS_HOSTNAME: "bart.virt.obeone.org"
+
         securityContext:
           # nvidia-smi and the host's /proc both need more than the image's
           # unprivileged user gets by default. Dropping this is worth trying

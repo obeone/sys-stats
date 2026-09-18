@@ -234,6 +234,17 @@ whenever the virtual environment is activated.
    Unset (default) renders the page exactly as before this variable
    existed.
 
+7. **`SYS_STATS_HOSTNAME` (optional):** overrides the `host` field of the
+   `/panel` payload, which otherwise carries `socket.gethostname()`, read
+   fresh on every request so a runtime rename (`hostnamectl set-hostname`)
+   takes effect without a restart. Useful where the process's own hostname
+   is not the identity a consumer cares about, such as a container
+   reporting its pod name. This key is `/panel`-only — `/stats` never
+   carries it — and it is never merged with `SYS_STATS_INSTANCE_LABEL`:
+   that one is display prose meant to be rewritten for readability, this
+   one is a machine identity a consumer compares byte-for-byte against a
+   known value, and relabeling one must never change the other.
+
 ## 📺 Using the CLI
 
 To use the terminal dashboard for live monitoring, run:
