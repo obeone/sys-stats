@@ -109,6 +109,9 @@ unprivileged hosts.
 | `SYS_STATS_AUTOSTART`         | server      | Set to `0`/`false`/`no` to skip the module-scope sampler autostart, default on |
 | `SYS_STATS_SAMPLE_INTERVAL`   | sampler     | Seconds between background samples, default `2.0` |
 | `SYS_STATS_TOP_PROCESSES_MAX` | sampler     | Per-process ranking cap the sampler collects, default `50`; a `?limit=` above this returns only what was sampled |
+| `SYS_STATS_PANEL_MAX_TEMPS`   | server      | Caps the `/panel` `temps` list; unset (default) means no cap |
+| `SYS_STATS_PANEL_MAX_FANS`    | server      | Caps the `/panel` `fans` list; unset (default) means no cap |
+| `SYS_STATS_PANEL_MAX_GPUS`    | server      | Caps the `/panel` `gpu` list; unset (default) means no cap |
 | `SYS_STATS_API_URL`           | CLI         | Default `--url`, default `http://localhost:5000/stats` |
 
 ## Versioning

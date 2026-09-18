@@ -83,7 +83,7 @@ Whichever method you choose, you get two console scripts:
 | Command            | Purpose                                            |
 | ------------------ | -------------------------------------------------- |
 | `sys-stats`        | The Rich terminal dashboard (client).              |
-| `sys-stats-server` | The Flask metrics API + web UI (serves `/stats`).  |
+| `sys-stats-server` | The Flask metrics API + web UI (serves `/stats` and `/panel`). |
 
 #### With uv (recommended)
 
@@ -201,6 +201,16 @@ whenever the virtual environment is activated.
    samples (default `2.0`), and `SYS_STATS_TOP_PROCESSES_MAX` caps how many
    entries it collects per per-process ranking (default `50`) — a `?limit=`
    above that cap only returns what was already sampled.
+
+4. **`/panel` (optional):** a compact, frozen-schema endpoint built for a
+   small embedded display (an ESP32-S3 wall panel, in particular) polling
+   every few seconds — no process lists, no Ollama data, just CPU/RAM/swap/
+   GPU/sensor numbers plus an `age` in seconds telling the display how stale
+   the sample is. It shares the same background sampling pass as `/stats`,
+   so enabling it costs nothing extra in `nvidia-smi` calls. Three optional
+   caps truncate its lists for a display with limited room:
+   `SYS_STATS_PANEL_MAX_TEMPS`, `SYS_STATS_PANEL_MAX_FANS` and
+   `SYS_STATS_PANEL_MAX_GPUS` — each unset by default, meaning no cap.
 
 ## 📺 Using the CLI
 

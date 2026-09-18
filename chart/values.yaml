@@ -63,6 +63,13 @@ controllers:
           # needs this.
           # SYS_STATS_AUTOSTART: "0"
 
+          # Caps on the /panel route's temps/fans/gpu lists, for a small
+          # embedded display with limited room (an ESP32-S3 wall panel, in
+          # particular). Each unset by default, meaning no cap.
+          # SYS_STATS_PANEL_MAX_TEMPS: "4"
+          # SYS_STATS_PANEL_MAX_FANS: "4"
+          # SYS_STATS_PANEL_MAX_GPUS: "2"
+
         securityContext:
           # nvidia-smi and the host's /proc both need more than the image's
           # unprivileged user gets by default. Dropping this is worth trying
