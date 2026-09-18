@@ -257,6 +257,19 @@ whenever the virtual environment is activated.
    always stays on the GPUtil/`nvidia-smi` path. Unset (default) leaves
    `/panel` on that same path too.
 
+9. **`SYS_STATS_IPMI_INTERVAL` (optional):** seconds between polls of the
+   two `ipmi/`-prefixed `/panel` collectors (`temps`, `fans`), each an
+   `ipmitool` round trip to the host's BMC, decoupled from
+   `SYS_STATS_SAMPLE_INTERVAL`. Default `30.0` — chassis fan speed and
+   temperature move on a timescale of tens of seconds, not the 2-second
+   default sampling cadence, so polling them that often buys nothing while
+   costing a BMC round trip every pass. Between polls, `temps`/`fans` keep
+   serving the last IPMI reading rather than dropping it, so the lists
+   never lose their IPMI entries on an intermediate pass; the first pass
+   after startup always polls immediately rather than waiting a full
+   interval. hwmon sensors (`get_temperatures`, `get_fans`) are unaffected
+   and keep the normal per-pass cadence.
+
 ## 📺 Using the CLI
 
 To use the terminal dashboard for live monitoring, run:

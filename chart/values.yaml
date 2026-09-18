@@ -98,6 +98,17 @@ controllers:
           # unset (default) leaves /panel on it too.
           # SYS_STATS_DCGM_URL: "http://10.50.0.106:30940/metrics"
 
+          # Seconds between polls of the two ipmi/-prefixed /panel
+          # collectors (temps, fans), each an ipmitool round trip to the
+          # host's BMC -- independent of SYS_STATS_SAMPLE_INTERVAL above.
+          # Defaults to 30.0: fan speed and chassis temperature move on a
+          # timescale of tens of seconds, so polling them every sample
+          # interval buys nothing but BMC round trips. Between polls,
+          # temps/fans keep serving the last IPMI reading instead of
+          # dropping it; hwmon sensors are unaffected and keep the normal
+          # per-pass cadence.
+          # SYS_STATS_IPMI_INTERVAL: "30.0"
+
         securityContext:
           # nvidia-smi and the host's /proc both need more than the image's
           # unprivileged user gets by default. Dropping this is worth trying
