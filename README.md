@@ -128,6 +128,12 @@ Upgrade with `pipx upgrade sys-stats`, remove with `pipx uninstall sys-stats`.
 
 #### With pip
 
+> **Do not run `pip install sys-stats`.** That name belongs to a different,
+> unrelated project on PyPI, and it happens to describe itself as serving
+> system stats over a web interface too — so installing it by mistake looks
+> like success. This project is not published on PyPI under any name; install
+> it from git or from a checkout, as below.
+
 Plain `pip` works too — ideally inside a virtual environment so it doesn't
 pollute your system packages:
 
