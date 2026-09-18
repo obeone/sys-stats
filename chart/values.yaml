@@ -89,6 +89,15 @@ controllers:
           # the two are never derived from one another.
           # SYS_STATS_HOSTNAME: "bart.virt.obeone.org"
 
+          # Points /panel's gpu[] at a dcgm-exporter Prometheus /metrics
+          # endpoint instead of GPUtil/nvidia-smi -- for a host with no
+          # NVIDIA driver of its own (GPUs passed through to a VM running
+          # dcgm-exporter elsewhere in the cluster). Expected to carry a
+          # literal IP, not a hostname (requests' timeout does not bound DNS
+          # resolution). /stats always stays on the GPUtil/nvidia-smi path;
+          # unset (default) leaves /panel on it too.
+          # SYS_STATS_DCGM_URL: "http://10.50.0.106:30940/metrics"
+
         securityContext:
           # nvidia-smi and the host's /proc both need more than the image's
           # unprivileged user gets by default. Dropping this is worth trying

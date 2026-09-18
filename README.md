@@ -245,6 +245,18 @@ whenever the virtual environment is activated.
    one is a machine identity a consumer compares byte-for-byte against a
    known value, and relabeling one must never change the other.
 
+8. **`SYS_STATS_DCGM_URL` (optional):** points `/panel`'s `gpu[]` at a
+   [dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) Prometheus
+   `/metrics` endpoint instead of GPUtil/`nvidia-smi`, for a host with no
+   NVIDIA driver of its own — a Proxmox hypervisor whose GPUs are
+   PCI-passed-through to a Kubernetes VM, say, where `dcgm-exporter` runs
+   inside that VM instead. Scraped in the same background sampling pass as
+   everything else, gated by a circuit breaker so a dead or firewalled
+   endpoint degrades to an empty `gpu[]` (plus a `"gpu"` tag in `err`)
+   instead of stalling the sampler. `/stats` never reads this variable and
+   always stays on the GPUtil/`nvidia-smi` path. Unset (default) leaves
+   `/panel` on that same path too.
+
 ## 📺 Using the CLI
 
 To use the terminal dashboard for live monitoring, run:

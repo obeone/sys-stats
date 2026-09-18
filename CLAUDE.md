@@ -115,6 +115,7 @@ unprivileged hosts.
 | `SYS_STATS_PANEL_ONLY`        | server      | `1`/`true`/`yes` registers ONLY `/panel`: `/`, `/stats` and `/favicon.png` are never registered, not just guarded; unset (default) registers every route |
 | `SYS_STATS_INSTANCE_LABEL`    | server      | Optional label shown in the web UI's title and body, telling apart two co-located instances reporting on different views of the same box (e.g. a Kubernetes pod vs. the underlying hypervisor); unset (default) leaves the page exactly as before this variable existed |
 | `SYS_STATS_HOSTNAME`          | server      | Overrides `/panel`'s `host` field, otherwise `socket.gethostname()` read fresh per request; unset (default) reports the real hostname. `/panel` only, never `/stats`, and never merged with `SYS_STATS_INSTANCE_LABEL` (that one is a rewritable display label, this one is a machine identity a consumer string-compares) |
+| `SYS_STATS_DCGM_URL`          | sampler     | A dcgm-exporter `/metrics` URL; when set, `/panel`'s `gpu[]` is scraped from it instead of GPUtil/`nvidia-smi`, for hosts with no NVIDIA driver of their own (GPUs passed through to a VM). `/stats` never reads this variable and stays on the GPUtil/`nvidia-smi` path either way. Unset (default) leaves `/panel` on that same path too |
 | `SYS_STATS_API_URL`           | CLI         | Default `--url`, default `http://localhost:5000/stats` |
 
 ## Versioning
