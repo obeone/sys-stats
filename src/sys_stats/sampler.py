@@ -288,6 +288,19 @@ def _run(interval: float, limit: int) -> None:
     # nothing for the other. Both calls are primed together here, in the
     # same guarded step, so neither baseline is ever read before it has a
     # previous call to compare against.
+    #
+    # THIRD, and separate again: collectors.get_top_processes_by_cpu() reads
+    # ``cpu_percent`` off ``psutil.process_iter([..., "cpu_percent", ...])``,
+    # which keeps its baseline per-Process object (keyed by pid), entirely
+    # independent of the two module-level baselines above -- priming those
+    # two does nothing for this one, and this one is not redundant with
+    # them. Left unprimed, every process reports ``cpu_percent: 0.0`` on the
+    # first real sample, so ``top_cpu`` sorts an all-zero column into an
+    # arbitrary order that looks plausible and self-corrects one interval
+    # later, which is exactly why it is easy to miss. Priming sweeps
+    # ``process_iter`` once here and discards the result -- establishing the
+    # baseline is the only goal, not collecting data -- tolerating processes
+    # that vanish mid-sweep the same way the collector itself does.
     primed = False
 
     # The interval wait sits at the BOTTOM of the loop, so priming runs
@@ -308,6 +321,11 @@ def _run(interval: float, limit: int) -> None:
             if not primed:
                 psutil.cpu_percent(interval=None)
                 psutil.cpu_percent(interval=None, percpu=True)
+                for proc in psutil.process_iter(["cpu_percent"]):
+                    try:
+                        proc.info["cpu_percent"]
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
                 primed = True
             else:
                 _sample_once(limit)

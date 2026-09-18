@@ -106,14 +106,32 @@ def test_run_primes_the_percpu_cpu_percent_baseline_before_the_first_sample(monk
     would be a meaningless near-zero regardless of actual load. Both
     baselines must be primed, in the same crash-guarded step, before the
     first real sample.
+
+    Also asserts the THIRD baseline alongside these two:
+    ``collectors.get_top_processes_by_cpu()`` reads ``cpu_percent`` off
+    ``psutil.process_iter(...)``, which keeps its baseline per-Process
+    object, entirely separate from both module-level baselines above.
+    Priming the plain and percpu variants does nothing for it; without its
+    own priming sweep, every process reports ``cpu_percent: 0.0`` on the
+    first real sample and ``top_cpu`` sorts a meaningless all-zero column.
     """
-    calls: list[tuple[str, bool]] = []
+    calls: list[tuple[str, bool | None]] = []
 
     def _cpu_percent(interval=None, percpu=False):
         calls.append(("prime", percpu))
         return [] if percpu else 0.0
 
+    class _FakeProcess:
+        def __init__(self, pid):
+            self.info = {"cpu_percent": 0.0}
+            calls.append((f"prime_proc_{pid}", None))
+
+    def _process_iter(attrs=None):
+        calls.append(("process_iter", None))
+        return iter([_FakeProcess(1), _FakeProcess(2)])
+
     monkeypatch.setattr(sampler.psutil, "cpu_percent", _cpu_percent)
+    monkeypatch.setattr(sampler.psutil, "process_iter", _process_iter)
     monkeypatch.setattr(
         sampler.collectors,
         "collect_stats",
@@ -130,10 +148,89 @@ def test_run_primes_the_percpu_cpu_percent_baseline_before_the_first_sample(monk
         thread.join(timeout=2)
 
     priming_calls = [c for c in calls if c[0] == "prime"]
-    # Both variants primed, plain first then percpu, each exactly once,
-    # and both strictly before the first collect_stats() call.
+    # Both cpu_percent variants primed, plain first then percpu, each exactly once.
     assert priming_calls == [("prime", False), ("prime", True)]
-    assert calls[2] == ("collect", None)
+    # The per-process baseline sweep runs once too, strictly after the two
+    # module-level baselines and strictly before the first collect_stats()
+    # call -- proving all three baselines are established together, in
+    # order, before any real sample is taken.
+    assert [c[0] for c in calls] == [
+        "prime",
+        "prime",
+        "process_iter",
+        "prime_proc_1",
+        "prime_proc_2",
+        "collect",
+    ]
+
+
+def test_run_primes_the_per_process_cpu_percent_baseline_tolerating_vanished_processes(
+    monkeypatch,
+):
+    """Priming the per-process baseline must survive processes that vanish mid-sweep.
+
+    ``collectors.get_top_processes_by_cpu()`` already guards its own
+    ``process_iter`` sweep against ``NoSuchProcess``, ``AccessDenied`` and
+    ``ZombieProcess`` -- the CLAUDE.md-documented reality that unreadable
+    attributes come back as ``None`` rather than raising, and that a process
+    can exit between being listed and being read. The priming sweep added
+    alongside the two system-wide baselines must tolerate the same
+    conditions instead of taking the whole iteration (and thus the sampler
+    thread) down with it.
+    """
+    calls: list[str] = []
+
+    class _VanishingProcess:
+        def __init__(self, exc):
+            self._exc = exc
+
+        @property
+        def info(self):
+            raise self._exc
+
+    class _HealthyProcess:
+        def __init__(self, pid):
+            self.info = {"cpu_percent": 0.0}
+            calls.append(f"prime_proc_{pid}")
+
+    def _process_iter(attrs=None):
+        calls.append("process_iter")
+        return iter(
+            [
+                _VanishingProcess(sampler.psutil.NoSuchProcess(1)),
+                _HealthyProcess(2),
+                _VanishingProcess(sampler.psutil.AccessDenied(3)),
+                _VanishingProcess(sampler.psutil.ZombieProcess(4)),
+                _HealthyProcess(5),
+            ]
+        )
+
+    monkeypatch.setattr(
+        sampler.psutil,
+        "cpu_percent",
+        lambda interval=None, percpu=False: [] if percpu else 0.0,
+    )
+    monkeypatch.setattr(sampler.psutil, "process_iter", _process_iter)
+    monkeypatch.setattr(
+        sampler.collectors,
+        "collect_stats",
+        lambda limit=5: calls.append("collect")
+        or {"top_cpu": [], "top_memory": [], "top_gpu_processes": []},
+    )
+
+    thread = threading.Thread(target=sampler._run, args=(0.01, 5), daemon=True)
+    thread.start()
+    try:
+        assert sampler._first_snapshot_event.wait(timeout=2), "no sample landed in time"
+    finally:
+        sampler._stop_event.set()
+        thread.join(timeout=2)
+
+    # The sweep ran, the healthy processes were still primed despite the
+    # vanishing ones interleaved among them, and a real sample landed
+    # afterwards -- none of the three exception types killed the thread.
+    assert not thread.is_alive()
+    assert calls == ["process_iter", "prime_proc_2", "prime_proc_5", "collect"]
 
 
 def test_run_primes_immediately_and_first_sample_lands_one_interval_later(monkeypatch):
