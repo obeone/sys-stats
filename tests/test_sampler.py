@@ -136,6 +136,56 @@ def test_run_primes_the_percpu_cpu_percent_baseline_before_the_first_sample(monk
     assert calls[2] == ("collect", None)
 
 
+def test_run_primes_immediately_and_first_sample_lands_one_interval_later(monkeypatch):
+    """A cold start must cost ONE interval, not two.
+
+    Regression test for the loop that ran its interruptible sleep *before*
+    the priming call, giving a wait-prime-wait-sample sequence: the first
+    snapshot landed at ``2 * interval``, so at
+    ``SYS_STATS_SAMPLE_INTERVAL=12`` the ``/panel`` route answered 503 for
+    24 seconds and ``/stats`` blocked for just as long. The interval between
+    priming and the first sample is load-bearing -- it is what gives
+    ``psutil.cpu_percent`` a baseline to measure against -- so what is
+    asserted here is that priming happens immediately and exactly one
+    interval separates it from the first collection.
+
+    Deliberately runs at a NON-DEFAULT interval: the default 2s made the
+    wrong 4s cold start look unremarkable, which is why the rest of the
+    suite never caught this.
+    """
+    interval = 0.4  # non-default, and long enough to tell one from two
+    started = time.monotonic()
+    prime_at: list[float] = []
+    collect_at: list[float] = []
+
+    def _cpu_percent(interval=None, percpu=False):
+        if not percpu:
+            prime_at.append(time.monotonic() - started)
+        return [] if percpu else 0.0
+
+    def _collect_stats(limit=5):
+        collect_at.append(time.monotonic() - started)
+        return {"top_cpu": [], "top_memory": [], "top_gpu_processes": []}
+
+    monkeypatch.setattr(sampler.psutil, "cpu_percent", _cpu_percent)
+    monkeypatch.setattr(sampler.collectors, "collect_stats", _collect_stats)
+
+    thread = threading.Thread(target=sampler._run, args=(interval, 5), daemon=True)
+    thread.start()
+    try:
+        assert sampler._first_snapshot_event.wait(timeout=5), "no sample landed in time"
+    finally:
+        sampler._stop_event.set()
+        thread.join(timeout=5)
+
+    # Primed on entry, without burning an interval first.
+    assert prime_at[0] < interval / 2
+    # First real sample one interval later -- never two. The upper bound sits
+    # well below 2 * interval so a slow CI box cannot make a two-interval
+    # cold start pass as a one-interval one.
+    assert interval * 0.8 <= collect_at[0] < interval * 1.6
+
+
 def test_run_survives_a_raising_collector_and_keeps_sampling(monkeypatch, caplog):
     """A collector that raises must not kill the sampler thread.
 

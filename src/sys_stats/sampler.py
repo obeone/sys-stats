@@ -290,18 +290,27 @@ def _run(interval: float, limit: int) -> None:
     # previous call to compare against.
     primed = False
 
+    # The interval wait sits at the BOTTOM of the loop, so priming runs
+    # immediately on entry and the first real sample lands exactly one
+    # interval later. With the wait at the top instead, the sequence was
+    # wait-prime-wait-sample and every cold start cost TWO intervals, which
+    # at SYS_STATS_SAMPLE_INTERVAL=12 meant 24 seconds of 503s from /panel
+    # and a blocked /stats. The wait BETWEEN priming and the first sample is
+    # not dead time and must stay: that elapsed interval is precisely what
+    # gives the cpu_percent baseline something to measure against.
+    #
     # _stop_event.wait(timeout=interval) sleeps for `interval` seconds unless
     # stop() sets the event first, in which case it returns True immediately
     # and the loop exits. This gives an interruptible sleep without a manual
     # polling loop.
-    while not _stop_event.wait(timeout=interval):
+    while not _stop_event.is_set():
         try:
             if not primed:
                 psutil.cpu_percent(interval=None)
                 psutil.cpu_percent(interval=None, percpu=True)
                 primed = True
-                continue
-            _sample_once(limit)
+            else:
+                _sample_once(limit)
         except Exception:
             # A single bad collection (e.g. nvidia-smi wedged, Ollama
             # unreachable in a way collectors.py did not already guard
@@ -312,6 +321,13 @@ def _run(interval: float, limit: int) -> None:
                 "Sampler iteration failed; keeping the previous snapshot and "
                 "retrying next interval"
             )
+
+        # Interruptible sleep, at the bottom of the loop on purpose (see
+        # above). A failed priming attempt leaves ``primed`` False, so the
+        # next iteration retries it rather than sampling against a baseline
+        # that was never established.
+        if _stop_event.wait(timeout=interval):
+            break
 
 
 def start() -> None:

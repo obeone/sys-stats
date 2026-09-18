@@ -66,25 +66,38 @@ def favicon():
 #: interval is.
 _MIN_FIRST_SNAPSHOT_TIMEOUT = 5.0
 
+#: Headroom added on top of the one interval the sampler sleeps before its
+#: first sample, covering the duration of the collection itself: a psutil
+#: process sweep, up to two ``nvidia-smi`` subprocess round trips and, when
+#: ``OLLAMA_API_URL`` is set, one HTTP call. That whole pass is well under a
+#: second on a healthy host, so this is roughly an order of magnitude of
+#: slack rather than a tuned value.
+_FIRST_SNAPSHOT_COLLECTION_MARGIN = 3.0
+
 
 def _first_snapshot_timeout() -> float:
     """Compute how long ``/stats`` waits for the sampler's first snapshot.
 
-    ``sampler._run`` waits one full sampling interval before it takes its
-    first sample (see :mod:`sys_stats.sampler`). A wait shorter than that
-    would time out on every cold start whenever
-    ``SYS_STATS_SAMPLE_INTERVAL`` is configured above the floor, so the
-    timeout is derived from the same interval instead of a value hardcoded
-    independently of it.
+    ``sampler._run`` primes the ``cpu_percent`` baseline as soon as it
+    starts, then sleeps exactly one sampling interval before taking its
+    first sample (see :mod:`sys_stats.sampler`). A cold start therefore
+    costs one interval plus one collection, and the wait is derived from
+    that rather than hardcoded independently of the interval.
+
+    This used to double the interval, which was not a derivation at all: it
+    compensated for a sampler loop that waited once *before* priming and
+    once more before sampling. With that fixed, doubling would only make a
+    genuinely dead sampler hold the request thread twice as long as needed.
 
     Returns
     -------
     float
-        Seconds to wait: twice the configured interval plus a one second
-        margin, never less than :data:`_MIN_FIRST_SNAPSHOT_TIMEOUT`.
+        Seconds to wait: the configured interval plus
+        :data:`_FIRST_SNAPSHOT_COLLECTION_MARGIN`, never less than
+        :data:`_MIN_FIRST_SNAPSHOT_TIMEOUT`.
     """
     interval = sampler._get_sample_interval()
-    return max(_MIN_FIRST_SNAPSHOT_TIMEOUT, interval * 2 + 1.0)
+    return max(_MIN_FIRST_SNAPSHOT_TIMEOUT, interval + _FIRST_SNAPSHOT_COLLECTION_MARGIN)
 
 # Per-process ranking keys carried by the sampler payload. ``/stats`` slices
 # each of these down to the requested ``limit``; every other key is returned
