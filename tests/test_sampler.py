@@ -47,9 +47,16 @@ def test_run_primes_the_cpu_percent_baseline_before_the_first_sample(monkeypatch
     is meaningful.
     """
     calls: list[str] = []
-    monkeypatch.setattr(
-        sampler.psutil, "cpu_percent", lambda interval=None: calls.append("prime") or 0.0
-    )
+
+    def _cpu_percent(interval=None, percpu=False):
+        # The percpu priming call is recorded under its own label so this
+        # test can still assert the plain-variant call happened exactly
+        # once, undisturbed by the second priming call added alongside it
+        # (see test_run_primes_the_percpu_cpu_percent_baseline_before_the_first_sample).
+        calls.append("prime_percpu" if percpu else "prime")
+        return [] if percpu else 0.0
+
+    monkeypatch.setattr(sampler.psutil, "cpu_percent", _cpu_percent)
     monkeypatch.setattr(
         sampler.collectors,
         "collect_stats",
@@ -70,13 +77,57 @@ def test_run_primes_the_cpu_percent_baseline_before_the_first_sample(monkeypatch
     assert "collect" in calls[1:]
 
 
+def test_run_primes_the_percpu_cpu_percent_baseline_before_the_first_sample(monkeypatch):
+    """The loop primes the percpu variant too, before ``collect_stats`` runs.
+
+    psutil keeps a SEPARATE internal baseline for
+    ``cpu_percent(percpu=True)`` from the one it keeps for the plain call:
+    priming one does nothing for the other. If the loop only primed the
+    plain variant, ``collectors.get_per_core_cpu()``'s first real reading
+    would be a meaningless near-zero regardless of actual load. Both
+    baselines must be primed, in the same crash-guarded step, before the
+    first real sample.
+    """
+    calls: list[tuple[str, bool]] = []
+
+    def _cpu_percent(interval=None, percpu=False):
+        calls.append(("prime", percpu))
+        return [] if percpu else 0.0
+
+    monkeypatch.setattr(sampler.psutil, "cpu_percent", _cpu_percent)
+    monkeypatch.setattr(
+        sampler.collectors,
+        "collect_stats",
+        lambda limit=5: calls.append(("collect", None))
+        or {"top_cpu": [], "top_memory": [], "top_gpu_processes": []},
+    )
+
+    thread = threading.Thread(target=sampler._run, args=(0.01, 5), daemon=True)
+    thread.start()
+    try:
+        assert sampler._first_snapshot_event.wait(timeout=2), "no sample landed in time"
+    finally:
+        sampler._stop_event.set()
+        thread.join(timeout=2)
+
+    priming_calls = [c for c in calls if c[0] == "prime"]
+    # Both variants primed, plain first then percpu, each exactly once,
+    # and both strictly before the first collect_stats() call.
+    assert priming_calls == [("prime", False), ("prime", True)]
+    assert calls[2] == ("collect", None)
+
+
 def test_run_survives_a_raising_collector_and_keeps_sampling(monkeypatch, caplog):
     """A collector that raises must not kill the sampler thread.
 
     The next iteration has to run regardless, or the cache would freeze on
     whatever was last cached (``None`` on a cold start) forever.
     """
-    monkeypatch.setattr(sampler.psutil, "cpu_percent", lambda interval=None: 0.0)
+    monkeypatch.setattr(
+        sampler.psutil,
+        "cpu_percent",
+        lambda interval=None, percpu=False: [] if percpu else 0.0,
+    )
 
     outcomes = iter(
         [RuntimeError("boom"), {"top_cpu": [1], "top_memory": [], "top_gpu_processes": []}]
@@ -113,13 +164,16 @@ def test_run_survives_a_raising_priming_call_and_keeps_sampling(monkeypatch, cap
     filled. It must be logged and retried on the next interval, exactly like
     any other iteration failure.
     """
-    outcomes = iter([RuntimeError("boom"), 0.0])
+    # The first priming attempt fails on the plain-variant call before ever
+    # reaching the percpu one. The retried attempt succeeds on both calls:
+    # plain, then percpu, in the same guarded step.
+    outcomes = iter([RuntimeError("boom"), 0.0, 0.0])
 
-    def _cpu_percent(interval=None):
+    def _cpu_percent(interval=None, percpu=False):
         outcome = next(outcomes)
         if isinstance(outcome, Exception):
             raise outcome
-        return outcome
+        return [] if percpu else outcome
 
     monkeypatch.setattr(sampler.psutil, "cpu_percent", _cpu_percent)
     monkeypatch.setattr(
@@ -211,7 +265,11 @@ def test_start_is_idempotent(monkeypatch):
     problem the sampler exists to prevent.
     """
     monkeypatch.setenv("SYS_STATS_SAMPLE_INTERVAL", "0.01")
-    monkeypatch.setattr(sampler.psutil, "cpu_percent", lambda interval=None: 0.0)
+    monkeypatch.setattr(
+        sampler.psutil,
+        "cpu_percent",
+        lambda interval=None, percpu=False: [] if percpu else 0.0,
+    )
     monkeypatch.setattr(
         collectors,
         "collect_stats",

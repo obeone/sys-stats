@@ -184,6 +184,13 @@ def _run(interval: float, limit: int) -> None:
     # inside the same try/except as a real sample below, so a failure there
     # is logged and retried on the next interval instead of silently killing
     # the thread with no retry and an empty cache forever.
+    #
+    # psutil keeps a SEPARATE internal baseline for the percpu variant
+    # (``cpu_percent(percpu=True)``, used by collectors.get_per_core_cpu)
+    # from the one it keeps for the plain call above; priming one does
+    # nothing for the other. Both calls are primed together here, in the
+    # same guarded step, so neither baseline is ever read before it has a
+    # previous call to compare against.
     primed = False
 
     # _stop_event.wait(timeout=interval) sleeps for `interval` seconds unless
@@ -194,6 +201,7 @@ def _run(interval: float, limit: int) -> None:
         try:
             if not primed:
                 psutil.cpu_percent(interval=None)
+                psutil.cpu_percent(interval=None, percpu=True)
                 primed = True
                 continue
             _sample_once(limit)
