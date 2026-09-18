@@ -47,6 +47,23 @@ DEFAULT_IPMI_INTERVAL = 30.0
 #: larger ``?limit=`` than this cannot be satisfied without re-collecting.
 DEFAULT_TOP_PROCESSES_MAX = 50
 
+#: How many samples between two heartbeat log lines.
+#:
+#: The ``age`` field of ``/panel`` already tells a consumer how stale the
+#: cached snapshot is, but reading it requires an HTTP request, which in turn
+#: requires the bind address, the host firewall and the network path to all
+#: be working. When the question is "is the sampler thread still running?"
+#: none of that should be in the way. A periodic log line answers it from
+#: ``journalctl -u sys-stats`` alone, with no port involved.
+#:
+#: 30 samples is one line every minute at the default 2s interval. The
+#: number is a judgement about log volume, not a measured threshold.
+HEARTBEAT_EVERY_N_SAMPLES = 30
+
+# Count of samples stored since the process started. Only the sampler thread
+# writes it, and only to decide when to emit a heartbeat, so it needs no lock.
+_sample_count = 0
+
 # Cache of the latest sample. Every access (read or write) must go through
 # ``_lock``; the two timestamps travel together with the payload so a caller
 # can tell how stale a snapshot is without racing the writer.
@@ -482,9 +499,17 @@ def _sample_once(limit: int) -> None:
         Forwarded to :func:`sys_stats.collectors.collect_stats` as the cap
         on each per-process ranking.
     """
+    global _sample_count
+
     stats = collectors.collect_stats(limit=limit)
     panel_extras = _collect_panel_extras()
     _store_snapshot(stats, panel_extras)
+
+    # Heartbeat: proof of life that does not travel over the network. See
+    # HEARTBEAT_EVERY_N_SAMPLES for why this exists alongside /panel's `age`.
+    _sample_count += 1
+    if _sample_count % HEARTBEAT_EVERY_N_SAMPLES == 0:
+        logger.info(f"Sampler alive: {_sample_count} samples collected")
 
 
 def _run(interval: float, limit: int) -> None:
@@ -678,6 +703,8 @@ def _reset_for_tests() -> None:
     """
     global _thread, _cache, _panel_extras, _wall_ts, _monotonic_ts
     global _ipmi_temps_cache, _ipmi_fans_cache, _ipmi_last_poll_monotonic
+    global _sample_count
+    _sample_count = 0
     _stop_event.set()
     with _thread_lock:
         if _thread is not None:

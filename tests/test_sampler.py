@@ -9,6 +9,7 @@ thread it starts and stops itself, rather than the real
 deterministic instead of depending on wall-clock timing.
 """
 
+import logging
 import threading
 import time
 
@@ -977,3 +978,31 @@ def test_sample_once_collects_stats_exactly_once_per_pass(monkeypatch):
     sampler._sample_once(limit=5)
 
     assert len(calls) == 1
+
+
+def test_sample_once_logs_a_heartbeat_every_n_samples(monkeypatch, caplog):
+    """The sampler must prove it is alive without anyone making a request.
+
+    ``/panel``'s ``age`` already exposes staleness, but reading it needs the
+    bind address, the host firewall and the network path to all work. When
+    the question is only "is the thread still running?", a log line answers
+    it from ``journalctl`` alone.
+    """
+    monkeypatch.setattr(
+        collectors,
+        "collect_stats",
+        lambda limit=5: {"top_cpu": [], "top_memory": [], "top_gpu_processes": [], "gpu": []},
+    )
+    monkeypatch.setattr(sampler, "HEARTBEAT_EVERY_N_SAMPLES", 3)
+    sampler._reset_for_tests()
+
+    with caplog.at_level(logging.INFO, logger=sampler.logger.name):
+        for _ in range(6):
+            sampler._sample_once(limit=5)
+
+    heartbeats = [r for r in caplog.records if "Sampler alive" in r.message]
+
+    # Two beats for six samples at one every three, and the count in the
+    # message is the real total rather than a per-window counter.
+    assert len(heartbeats) == 2
+    assert "6 samples" in heartbeats[-1].message
