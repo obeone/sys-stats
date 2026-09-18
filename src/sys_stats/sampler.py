@@ -47,6 +47,14 @@ _cache: dict[str, Any] | None = None
 _wall_ts: float | None = None
 _monotonic_ts: float | None = None
 
+# Extra collectors gathered in the same sampling pass as ``_cache`` but only
+# ever consumed by the ``/panel`` route (temperatures, fans, swap, per-core
+# CPU, load average, CPU frequency; see ``_collect_panel_extras``). Kept in a
+# separate cache slot -- rather than folded into ``_cache`` -- so ``/stats``,
+# which reads ``_cache`` through ``get_snapshot``, is provably unaffected by
+# anything collected here for ``/panel``.
+_panel_extras: dict[str, Any] | None = None
+
 # Set once the first sample has landed, so ``wait_for_first_snapshot`` can
 # block on it instead of polling.
 _first_snapshot_event = threading.Event()
@@ -128,17 +136,23 @@ def _get_top_processes_cap() -> int:
     return cap
 
 
-def _store_snapshot(stats: dict[str, Any]) -> None:
+def _store_snapshot(stats: dict[str, Any], panel_extras: dict[str, Any] | None = None) -> None:
     """Store a freshly collected sample as the current cache entry.
 
     Parameters
     ----------
     stats : dict
         The payload returned by :func:`sys_stats.collectors.collect_stats`.
+    panel_extras : dict, optional
+        The ``/panel``-only extras collected in the same pass (see
+        :func:`_collect_panel_extras`). Defaults to ``None`` so existing
+        direct callers that only care about the ``/stats`` cache (tests, in
+        particular) do not need to pass one.
     """
-    global _cache, _wall_ts, _monotonic_ts
+    global _cache, _panel_extras, _wall_ts, _monotonic_ts
     with _lock:
         _cache = stats
+        _panel_extras = panel_extras
         _wall_ts = time.time()
         _monotonic_ts = time.monotonic()
     # Only ever needs setting once; subsequent samples leave it set so a late
@@ -146,13 +160,95 @@ def _store_snapshot(stats: dict[str, Any]) -> None:
     _first_snapshot_event.set()
 
 
+def _collect_panel_extras() -> dict[str, Any]:
+    """Collect the metrics unique to the ``/panel`` payload, on top of ``/stats``.
+
+    Runs in the same sampling pass as :func:`sys_stats.collectors.collect_stats`
+    (see :func:`_sample_once`) so ``/panel`` never triggers a second round of
+    ``nvidia-smi`` subprocess calls: its GPU section is built by the route
+    from the very same ``collect_stats()`` output ``/stats`` serves, not
+    collected again here.
+
+    Each collector is wrapped individually so one failing sensor degrades
+    only its own field, with a safe default substituted and a short tag
+    appended to ``err``, instead of losing every panel field the way an
+    uncaught exception in :func:`_sample_once` would drop the whole
+    iteration.
+
+    Returns
+    -------
+    dict
+        Keys ``temps``, ``fans``, ``swap``, ``per_core``, ``load``, ``mhz``
+        and ``err``. ``err`` lists the short tags of whichever collectors
+        raised, in call order; empty when every collector succeeded.
+    """
+    err: list[str] = []
+
+    try:
+        temps = collectors.get_temperatures()
+    except Exception:
+        logger.exception("Panel: failed to collect temperatures")
+        temps = []
+        err.append("temps")
+
+    try:
+        fans = collectors.get_fans()
+    except Exception:
+        logger.exception("Panel: failed to collect fan speeds")
+        fans = []
+        err.append("fans")
+
+    try:
+        swap = collectors.get_swap()
+    except Exception:
+        logger.exception("Panel: failed to collect swap usage")
+        swap = {"used": 0, "total": 0, "pct": 0.0}
+        err.append("swap")
+
+    try:
+        per_core = collectors.get_per_core_cpu()
+    except Exception:
+        logger.exception("Panel: failed to collect per-core CPU usage")
+        per_core = []
+        err.append("per_core")
+
+    try:
+        load = collectors.get_load_average()
+    except Exception:
+        logger.exception("Panel: failed to collect load average")
+        load = [0.0, 0.0, 0.0]
+        err.append("loadavg")
+
+    try:
+        mhz = collectors.get_cpu_frequency_mhz()
+    except Exception:
+        logger.exception("Panel: failed to collect CPU frequency")
+        mhz = 0
+        err.append("cpu_freq")
+
+    return {
+        "temps": temps,
+        "fans": fans,
+        "swap": swap,
+        "per_core": per_core,
+        "load": load,
+        "mhz": mhz,
+        "err": err,
+    }
+
+
 def _sample_once(limit: int) -> None:
     """Collect exactly one sample and store it.
 
     Exists as its own step so both the loop and tests can trigger a single
     collection deterministically, without going through the loop's timer.
-    Any exception raised here is the caller's responsibility to handle: the
-    loop wraps this call so a bad collection never kills the thread.
+    Any exception raised by :func:`sys_stats.collectors.collect_stats` here
+    is the caller's responsibility to handle: the loop wraps this call so a
+    bad collection never kills the thread. Also gathers the ``/panel``-only
+    extras (:func:`_collect_panel_extras`) in the same pass, which never
+    raises on its own -- each of its collectors is individually guarded --
+    so it never turns a healthy ``/stats`` collection into a dropped
+    iteration.
 
     Parameters
     ----------
@@ -161,7 +257,8 @@ def _sample_once(limit: int) -> None:
         on each per-process ranking.
     """
     stats = collectors.collect_stats(limit=limit)
-    _store_snapshot(stats)
+    panel_extras = _collect_panel_extras()
+    _store_snapshot(stats, panel_extras)
 
 
 def _run(interval: float, limit: int) -> None:
@@ -252,6 +349,29 @@ def get_snapshot() -> tuple[dict[str, Any] | None, float | None, float | None]:
         return _cache, _wall_ts, _monotonic_ts
 
 
+def get_panel_snapshot() -> tuple[
+    dict[str, Any] | None, dict[str, Any] | None, float | None, float | None
+]:
+    """Return the latest cached sample together with its ``/panel``-only extras.
+
+    Reads the exact same cache entry :func:`get_snapshot` reads, plus the
+    additional collectors (temperatures, fans, swap, per-core CPU, load
+    average, CPU frequency) gathered in the same sampling pass exclusively
+    for the ``/panel`` route. Kept as a separate accessor, rather than
+    folding the extras into :func:`get_snapshot`'s return value, so
+    ``/stats`` -- which calls :func:`get_snapshot` -- is provably unaffected
+    by anything this module now collects for ``/panel``.
+
+    Returns
+    -------
+    tuple
+        ``(stats, panel_extras, wall_ts, monotonic_ts)``, all ``None`` when
+        no sample has landed yet.
+    """
+    with _lock:
+        return _cache, _panel_extras, _wall_ts, _monotonic_ts
+
+
 def wait_for_first_snapshot(
     timeout: float,
 ) -> tuple[dict[str, Any] | None, float | None, float | None]:
@@ -286,7 +406,7 @@ def _reset_for_tests() -> None:
     before and after using the sampler to start from, and leave, a clean
     slate.
     """
-    global _thread, _cache, _wall_ts, _monotonic_ts
+    global _thread, _cache, _panel_extras, _wall_ts, _monotonic_ts
     _stop_event.set()
     with _thread_lock:
         if _thread is not None:
@@ -295,6 +415,7 @@ def _reset_for_tests() -> None:
     _stop_event.clear()
     with _lock:
         _cache = None
+        _panel_extras = None
         _wall_ts = None
         _monotonic_ts = None
     _first_snapshot_event.clear()

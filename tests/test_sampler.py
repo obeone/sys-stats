@@ -30,6 +30,25 @@ def _clean_sampler():
     sampler._reset_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _stub_panel_extra_collectors(monkeypatch):
+    """Stub the ``/panel``-only collectors for every test in this file.
+
+    ``_sample_once`` now calls ``_collect_panel_extras`` in the same pass as
+    ``collect_stats`` (see the "one sampling pass" guarantee /panel relies
+    on), so any test here that drives ``sampler._run`` or calls
+    ``_sample_once`` directly would otherwise reach the real ``psutil``
+    sensors/frequency/load-average calls through it. Tests that care about
+    the extras' own behaviour override these stubs locally.
+    """
+    monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
+    monkeypatch.setattr(collectors, "get_fans", lambda: [])
+    monkeypatch.setattr(collectors, "get_swap", lambda: {"used": 0, "total": 0, "pct": 0.0})
+    monkeypatch.setattr(collectors, "get_per_core_cpu", lambda: [])
+    monkeypatch.setattr(collectors, "get_load_average", lambda: [0.0, 0.0, 0.0])
+    monkeypatch.setattr(collectors, "get_cpu_frequency_mhz", lambda: 0)
+
+
 def test_get_snapshot_is_none_before_any_sample():
     """A fresh sampler with no thread running has nothing cached yet."""
     stats, wall_ts, monotonic_ts = sampler.get_snapshot()
@@ -281,3 +300,130 @@ def test_start_is_idempotent(monkeypatch):
     sampler.start()
 
     assert sampler._thread is first_thread
+
+
+class TestCollectPanelExtras:
+    """Tests for ``_collect_panel_extras``, the ``/panel``-only side of a sampling pass."""
+
+    def test_collects_every_field_with_no_errors(self, monkeypatch):
+        """The happy path returns every field and an empty ``err`` list."""
+        monkeypatch.setattr(collectors, "get_temperatures", lambda: [{"n": "cpu", "c": 55.0}])
+        monkeypatch.setattr(collectors, "get_fans", lambda: [{"n": "fan1", "rpm": 1200}])
+        monkeypatch.setattr(collectors, "get_swap", lambda: {"used": 1, "total": 2, "pct": 50.0})
+        monkeypatch.setattr(collectors, "get_per_core_cpu", lambda: [10.0, 20.0])
+        monkeypatch.setattr(collectors, "get_load_average", lambda: [0.1, 0.2, 0.3])
+        monkeypatch.setattr(collectors, "get_cpu_frequency_mhz", lambda: 3200)
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras == {
+            "temps": [{"n": "cpu", "c": 55.0}],
+            "fans": [{"n": "fan1", "rpm": 1200}],
+            "swap": {"used": 1, "total": 2, "pct": 50.0},
+            "per_core": [10.0, 20.0],
+            "load": [0.1, 0.2, 0.3],
+            "mhz": 3200,
+            "err": [],
+        }
+
+    @pytest.mark.parametrize(
+        "collector_name, default",
+        [
+            ("get_temperatures", []),
+            ("get_fans", []),
+            ("get_swap", {"used": 0, "total": 0, "pct": 0.0}),
+            ("get_per_core_cpu", []),
+            ("get_load_average", [0.0, 0.0, 0.0]),
+            ("get_cpu_frequency_mhz", 0),
+        ],
+    )
+    def test_one_failing_collector_degrades_only_its_own_field(
+        self, monkeypatch, collector_name, default
+    ):
+        """A single raising collector must not take the whole extras dict down.
+
+        Every other field still collects normally; only the failing one
+        falls back to its safe default, and its short tag lands in ``err``.
+        """
+        monkeypatch.setattr(
+            collectors,
+            collector_name,
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        extras = sampler._collect_panel_extras()
+
+        field = {
+            "get_temperatures": "temps",
+            "get_fans": "fans",
+            "get_swap": "swap",
+            "get_per_core_cpu": "per_core",
+            "get_load_average": "load",
+            "get_cpu_frequency_mhz": "mhz",
+        }[collector_name]
+
+        assert extras[field] == default
+        assert len(extras["err"]) == 1
+
+
+class TestGetPanelSnapshot:
+    """Tests for ``get_panel_snapshot``, the accessor exclusive to ``/panel``."""
+
+    def test_returns_all_nones_before_any_sample(self):
+        """A fresh sampler with no thread running has nothing cached yet."""
+        assert sampler.get_panel_snapshot() == (None, None, None, None)
+
+    def test_returns_the_stats_and_extras_stored_together(self, monkeypatch):
+        """``_sample_once`` stores both halves under the same timestamps."""
+        monkeypatch.setattr(
+            collectors, "collect_stats", lambda limit=5: {"top_cpu": [], "top_memory": [], "top_gpu_processes": []}
+        )
+        monkeypatch.setattr(collectors, "get_temperatures", lambda: [{"n": "cpu", "c": 40.0}])
+
+        sampler._sample_once(limit=5)
+        stats, extras, wall_ts, monotonic_ts = sampler.get_panel_snapshot()
+
+        assert stats == {"top_cpu": [], "top_memory": [], "top_gpu_processes": []}
+        assert extras["temps"] == [{"n": "cpu", "c": 40.0}]
+        assert wall_ts is not None
+        assert monotonic_ts is not None
+
+        # get_snapshot() -- the accessor /stats actually uses -- must return
+        # the very same stats dict and timestamps, proving /panel's extras
+        # ride alongside the existing cache rather than replacing it.
+        stats_only, snap_wall_ts, snap_monotonic_ts = sampler.get_snapshot()
+        assert stats_only is stats
+        assert snap_wall_ts == wall_ts
+        assert snap_monotonic_ts == monotonic_ts
+
+    def test_reset_for_tests_clears_the_panel_extras_too(self, monkeypatch):
+        """``_reset_for_tests`` must not leave a stale extras dict behind."""
+        monkeypatch.setattr(
+            collectors, "collect_stats", lambda limit=5: {"top_cpu": [], "top_memory": [], "top_gpu_processes": []}
+        )
+
+        sampler._sample_once(limit=5)
+        sampler._reset_for_tests()
+
+        assert sampler.get_panel_snapshot() == (None, None, None, None)
+
+
+def test_sample_once_collects_stats_exactly_once_per_pass(monkeypatch):
+    """``/panel`` must never double the ``collect_stats`` cost of a pass.
+
+    ``collect_stats`` is the single place GPU data (and its ``nvidia-smi``
+    subprocess calls) gets collected; the whole point of sharing one sampler
+    pass between ``/stats`` and ``/panel`` is that it runs exactly once per
+    iteration, never once per consumer.
+    """
+    calls: list[int] = []
+    monkeypatch.setattr(
+        collectors,
+        "collect_stats",
+        lambda limit=5: calls.append(1)
+        or {"top_cpu": [], "top_memory": [], "top_gpu_processes": [], "gpu": []},
+    )
+
+    sampler._sample_once(limit=5)
+
+    assert len(calls) == 1
