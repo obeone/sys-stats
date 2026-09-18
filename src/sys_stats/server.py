@@ -3,6 +3,7 @@
 import copy
 import logging
 import os
+import time
 from typing import Any
 
 import coloredlogs
@@ -212,6 +213,235 @@ def get_stats():
         return jsonify({}), 503
 
     return jsonify(_slice_to_limit(stats, limit))
+
+
+# Env vars capping each /panel list, each unset by default meaning no cap.
+# Read per-request (not cached) so a config change takes effect without a
+# restart, matching the sampler's own env readers.
+_PANEL_MAX_TEMPS_ENV = "SYS_STATS_PANEL_MAX_TEMPS"
+_PANEL_MAX_FANS_ENV = "SYS_STATS_PANEL_MAX_FANS"
+_PANEL_MAX_GPUS_ENV = "SYS_STATS_PANEL_MAX_GPUS"
+
+
+def _get_panel_cap(env_var: str) -> int | None:
+    """Read an optional truncation cap for the ``/panel`` route.
+
+    Unlike the sampler's env readers (:func:`sys_stats.sampler._get_sample_interval`,
+    :func:`sys_stats.sampler._get_top_processes_cap`), there is no numeric
+    default here: an unset, non-numeric or non-positive value means "do not
+    truncate" rather than falling back to some fixed cap.
+
+    Parameters
+    ----------
+    env_var : str
+        Name of the environment variable to read.
+
+    Returns
+    -------
+    int or None
+        The configured cap, or ``None`` for "no cap".
+    """
+    raw = os.getenv(env_var)
+    if raw is None:
+        return None
+
+    try:
+        cap = int(raw)
+    except ValueError:
+        logger.warning(f"Ignoring non-numeric {env_var}={raw!r}; no cap applied")
+        return None
+
+    if cap <= 0:
+        logger.warning(f"Ignoring non-positive {env_var}={raw!r}; no cap applied")
+        return None
+
+    return cap
+
+
+def _cap_list(items: list[Any], cap: int | None) -> list[Any]:
+    """Slice ``items`` to at most ``cap`` entries, without re-sorting.
+
+    Parameters
+    ----------
+    items : list
+        Entries already sorted by the collector that produced them (by name
+        for temperatures and fans; by GPU index for the GPU list).
+    cap : int or None
+        Maximum number of entries to keep, or ``None`` for no cap.
+
+    Returns
+    -------
+    list
+        ``items`` truncated to ``cap`` entries. Slicing after the incoming
+        sort keeps truncation deterministic -- never re-sort here.
+    """
+    return items if cap is None else items[:cap]
+
+
+def _round1(value: float | None) -> float:
+    """Round a metric to 1 decimal place, treating ``None`` as ``0.0``.
+
+    Some GPUtil-reported fields (temperature in particular) can surface as
+    ``None`` depending on the driver, and the ``/panel`` contract has no
+    nullable fields -- the firmware's ArduinoJson filter reads a fixed POD
+    struct with no room for a missing value.
+
+    Parameters
+    ----------
+    value : float or None
+        The raw metric.
+
+    Returns
+    -------
+    float
+        ``value`` rounded to 1 decimal, or ``0.0`` when ``value`` is ``None``.
+    """
+    return round(value, 1) if value is not None else 0.0
+
+
+def _build_panel_gpu_entry(gpu: dict[str, Any]) -> dict[str, Any]:
+    """Convert one ``/stats``-shaped GPU entry into its ``/panel`` shape.
+
+    ``/stats`` deliberately keeps ``memoryTotal`` in MiB next to
+    ``memoryUsed`` in bytes (see CLAUDE.md, issue #16, a known and
+    deliberately preserved inconsistency). ``/panel`` must not inherit it:
+    ``mem_total`` is converted to bytes here so every memory field in the
+    panel payload shares the same unit.
+
+    Parameters
+    ----------
+    gpu : dict
+        One entry of the cached ``stats["gpu"]`` list, as produced by
+        :func:`sys_stats.collectors.collect_stats`.
+
+    Returns
+    -------
+    dict
+        The ``/panel`` contract's per-GPU shape: ``i``, ``n``, ``load``,
+        ``mem_used``, ``mem_total``, ``mem_pct``, ``temp``, ``fan``, ``power``.
+    """
+    return {
+        "i": gpu["id"],
+        "n": gpu["name"],
+        "load": _round1(gpu.get("load")),
+        "mem_used": gpu.get("memoryUsed") or 0,
+        "mem_total": int((gpu.get("memoryTotal") or 0) * 1024 * 1024),
+        "mem_pct": _round1(gpu.get("memoryPercent")),
+        "temp": _round1(gpu.get("temperature")),
+        "fan": int(round(gpu.get("fanSpeed") or 0.0)),
+        "power": _round1(gpu.get("powerDraw")),
+    }
+
+
+def _build_panel_payload(
+    stats: dict[str, Any],
+    extras: dict[str, Any],
+    wall_ts: float,
+    monotonic_ts: float,
+) -> dict[str, Any]:
+    """Assemble the ``/panel`` response from the shared snapshot and its extras.
+
+    Parameters
+    ----------
+    stats : dict
+        The same cached payload ``/stats`` serves, as returned by
+        :func:`sys_stats.collectors.collect_stats`. Its ``gpu``, ``cpu`` and
+        ``ram`` sections are reused here rather than re-collected, which is
+        what guarantees ``/panel`` never triggers a second round of
+        ``nvidia-smi`` subprocess calls.
+    extras : dict
+        The ``/panel``-only extras collected in the same sampling pass, see
+        :func:`sys_stats.sampler._collect_panel_extras`.
+    wall_ts : float
+        ``time.time()`` recorded when the sample was stored -- the frozen
+        contract's ``ts``, for a human running ``curl``; the firmware does
+        not read it.
+    monotonic_ts : float
+        ``time.monotonic()`` recorded when the sample was stored, used below
+        to compute ``age`` at response time.
+
+    Returns
+    -------
+    dict
+        The full ``/panel`` v1 payload, ready for ``jsonify``.
+    """
+    # Computed at RESPONSE time from the monotonic stamp, never from ts: an
+    # NTP step or a manual clock adjustment between the sample and this
+    # request would make wall-clock arithmetic silently negative or absurd.
+    # Deliberately not cached alongside the snapshot either, or it would be
+    # frozen at whatever it was when the sample landed.
+    age = max(0, int(time.monotonic() - monotonic_ts))
+
+    all_gpus = stats["gpu"]
+    all_temps = extras["temps"]
+    all_fans = extras["fans"]
+
+    return {
+        "v": 1,
+        "ts": int(wall_ts),
+        "age": age,
+        "ready": True,
+        "cpu": {
+            "pct": _round1(stats["cpu"]),
+            "n": stats["summary"]["cpu"]["cores"],
+            "mhz": extras["mhz"],
+            # This "load" is the os.getloadavg() 1/5/15 minute triple, NOT a
+            # percentage. /stats uses the same key "load" (per-GPU and in
+            # its "summary" block) for a load *percentage* instead -- that
+            # collision is part of the frozen firmware contract and is kept
+            # intentionally, not "fixed" to match /stats.
+            "load": [float(v) for v in extras["load"]],
+            "per": extras["per_core"],
+        },
+        "mem": {
+            "used": stats["ram"]["used"],
+            "total": stats["ram"]["total"],
+            "pct": _round1(stats["ram"]["percent"]),
+        },
+        "swap": extras["swap"],
+        "gpu": [
+            _build_panel_gpu_entry(g)
+            for g in _cap_list(all_gpus, _get_panel_cap(_PANEL_MAX_GPUS_ENV))
+        ],
+        "gpu_n": len(all_gpus),
+        "temps": _cap_list(all_temps, _get_panel_cap(_PANEL_MAX_TEMPS_ENV)),
+        "temps_n": len(all_temps),
+        "fans": _cap_list(all_fans, _get_panel_cap(_PANEL_MAX_FANS_ENV)),
+        "fans_n": len(all_fans),
+        "err": extras["err"],
+    }
+
+
+@app.route('/panel', methods=['GET'])
+def get_panel():
+    """Serve the compact ``/panel`` payload for the ESP32-S3 wall display.
+
+    Frozen contract, schema version 1: fixed keys, fixed nesting depth, no
+    process lists, no Ollama data, no cmdlines. Reads the same cached sample
+    ``/stats`` serves, plus the ``/panel``-only extras collected in the same
+    sampling pass (see :mod:`sys_stats.sampler`), so this route never
+    triggers a second round of ``nvidia-smi`` subprocess calls on top of
+    what ``/stats`` already causes.
+
+    Returns
+    -------
+    flask.Response
+        200 with the full payload when a snapshot exists. 503 with exactly
+        ``{"v": 1, "ready": false}`` otherwise -- a payload of zeroes would
+        render as a dead machine on the wall display, which is why absence
+        is a 503, never a 200 full of zeroes.
+    """
+    stats, extras, wall_ts, monotonic_ts = sampler.get_panel_snapshot()
+    if stats is None or extras is None:
+        return jsonify({"v": 1, "ready": False}), 503
+
+    payload = _build_panel_payload(stats, extras, wall_ts, monotonic_ts)
+    # Deep-copied for the same reason /stats' _slice_to_limit is: several
+    # values above (extras["swap"], the capped temps/fans entries) are the
+    # exact same dict objects the sampler's cache holds, not copies, so a
+    # caller mutating the returned payload must never be able to poison it.
+    return jsonify(copy.deepcopy(payload))
+
 
 def main() -> None:
     """Console-script entry point: run the Flask metrics server.

@@ -84,6 +84,18 @@ def client(monkeypatch):
     monkeypatch.setattr(collectors, "get_ollama_process", lambda: {"models": []})
     monkeypatch.setattr(collectors.GPUtil, "getGPUs", lambda: [])
 
+    # /panel-only extras, gathered in the same sampling pass as /stats' own
+    # data (see sys_stats.sampler._collect_panel_extras). Stubbed here too
+    # so _seed_cache()'s call to _sample_once never reaches the real
+    # sensors/frequency/load-average calls; /panel's own tests override
+    # these locally.
+    monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
+    monkeypatch.setattr(collectors, "get_fans", lambda: [])
+    monkeypatch.setattr(collectors, "get_swap", lambda: {"used": 0, "total": 0, "pct": 0.0})
+    monkeypatch.setattr(collectors, "get_per_core_cpu", lambda: [])
+    monkeypatch.setattr(collectors, "get_load_average", lambda: [0.0, 0.0, 0.0])
+    monkeypatch.setattr(collectors, "get_cpu_frequency_mhz", lambda: 0)
+
     server.app.config.update(TESTING=True)
 
     # Start every test from a clean sampler: no leftover thread from a
