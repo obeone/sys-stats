@@ -722,6 +722,78 @@ class TestGetIpmiFans:
         assert collectors.get_ipmi_fans() == []
 
 
+class TestGetIpmiTemperatures:
+    """Sibling of TestGetIpmiFans: same subprocess pattern, same degradation."""
+
+    def test_parses_readable_sensors_sorted_by_name(self, monkeypatch):
+        """Readable sensors are kept, sorted by ``n`` regardless of report order."""
+        monkeypatch.setattr(
+            collectors.subprocess,
+            "run",
+            _fake_run(
+                "CPU2 Temp        | 32h | ok  |  3.2 | 41 degrees C\n"
+                "CPU1 Temp        | 31h | ok  |  3.1 | 38 degrees C\n"
+            ),
+        )
+
+        assert collectors.get_ipmi_temperatures() == [
+            {"n": "CPU1 Temp", "c": 38.0},
+            {"n": "CPU2 Temp", "c": 41.0},
+        ]
+
+    def test_rounds_the_reading_to_one_decimal(self, monkeypatch):
+        """The reading is rounded exactly like get_temperatures's own ``c`` field."""
+        monkeypatch.setattr(
+            collectors.subprocess,
+            "run",
+            _fake_run("CPU1 Temp        | 31h | ok  |  3.1 | 38.04 degrees C\n"),
+        )
+
+        assert collectors.get_ipmi_temperatures() == [{"n": "CPU1 Temp", "c": 38.0}]
+
+    def test_omits_no_reading_sensors_instead_of_zero(self, monkeypatch):
+        """A sensor the BMC cannot poll must be dropped, never published as 0degC.
+
+        Regression guard: 0degC renders on the wall panel as a real (and
+        alarming) reading, which is not what "No Reading" means.
+        """
+        monkeypatch.setattr(
+            collectors.subprocess,
+            "run",
+            _fake_run(
+                "CPU1 Temp        | 31h | ok  |  3.1 | 38 degrees C\n"
+                "DIMM A1 Temp     | 3Ah | ns  |  3.2 | No Reading\n"
+                "DIMM B1 Temp     | 3Bh | ns  |  3.3 | Disabled\n"
+            ),
+        )
+
+        assert collectors.get_ipmi_temperatures() == [{"n": "CPU1 Temp", "c": 38.0}]
+
+    def test_returns_empty_list_when_ipmitool_fails(self, monkeypatch):
+        """A failing ipmitool (no BMC reachable) degrades to no temperature data."""
+        monkeypatch.setattr(collectors.subprocess, "run", _failing_run())
+
+        assert collectors.get_ipmi_temperatures() == []
+
+    def test_returns_empty_list_when_ipmitool_is_absent(self, monkeypatch):
+        """A missing ``ipmitool`` binary must degrade like a failing one."""
+        monkeypatch.setattr(collectors.subprocess, "run", _missing_binary_run())
+
+        assert collectors.get_ipmi_temperatures() == []
+
+    def test_returns_empty_list_when_ipmitool_times_out(self, monkeypatch):
+        """A wedged BMC must degrade to ``[]`` instead of hanging the sampler."""
+        monkeypatch.setattr(collectors.subprocess, "run", _timeout_run())
+
+        assert collectors.get_ipmi_temperatures() == []
+
+    def test_returns_empty_list_for_unrecognised_output(self, monkeypatch):
+        """Output the parser cannot make sense of yields no entries, not a crash."""
+        monkeypatch.setattr(collectors.subprocess, "run", _fake_run("not sensor data\n"))
+
+        assert collectors.get_ipmi_temperatures() == []
+
+
 class TestGetSwap:
     def test_returns_bytes_and_rounded_percent(self, monkeypatch):
         """Straight passthrough of psutil.swap_memory(), percent rounded."""

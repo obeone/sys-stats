@@ -42,6 +42,7 @@ def _stub_panel_extra_collectors(monkeypatch):
     the extras' own behaviour override these stubs locally.
     """
     monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
+    monkeypatch.setattr(collectors, "get_ipmi_temperatures", lambda: [])
     monkeypatch.setattr(collectors, "get_fans", lambda: [])
     monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
     monkeypatch.setattr(collectors, "get_swap", lambda: {"used": 0, "total": 0, "pct": 0.0})
@@ -479,6 +480,7 @@ class TestCollectPanelExtras:
         "collector_name, default",
         [
             ("get_temperatures", []),
+            ("get_ipmi_temperatures", []),
             ("get_fans", []),
             ("get_ipmi_fans", []),
             ("get_swap", {"used": 0, "total": 0, "pct": 0.0}),
@@ -505,6 +507,7 @@ class TestCollectPanelExtras:
 
         field = {
             "get_temperatures": "temps",
+            "get_ipmi_temperatures": "temps",
             "get_fans": "fans",
             "get_ipmi_fans": "fans",
             "get_swap": "swap",
@@ -515,6 +518,69 @@ class TestCollectPanelExtras:
 
         assert extras[field] == default
         assert len(extras["err"]) == 1
+
+    def test_temps_are_the_union_of_hwmon_and_ipmi_sorted_by_name(self, monkeypatch):
+        """The two temperature sources are concatenated, then sorted together by ``n``.
+
+        Their names cannot collide in practice (hwmon: ``chip/label``, IPMI:
+        free-text sensor names like ``CPU1 Temp``), so a plain
+        concatenate-then-sort is the whole contract -- no deduplication, no
+        priority rule.
+        """
+        monkeypatch.setattr(
+            collectors, "get_temperatures", lambda: [{"n": "k10temp/Tctl", "c": 45.0}]
+        )
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_temperatures",
+            lambda: [{"n": "CPU1 Temp", "c": 38.0}, {"n": "CPU2 Temp", "c": 41.5}],
+        )
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["temps"] == [
+            {"n": "CPU1 Temp", "c": 38.0},
+            {"n": "CPU2 Temp", "c": 41.5},
+            {"n": "k10temp/Tctl", "c": 45.0},
+        ]
+
+    def test_temps_are_empty_when_neither_source_reports_anything(self, monkeypatch):
+        """No hwmon temps and no IPMI temps is a legitimate empty union, not an error."""
+        monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
+        monkeypatch.setattr(collectors, "get_ipmi_temperatures", lambda: [])
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["temps"] == []
+        assert extras["err"] == []
+
+    def test_ipmi_temps_survive_a_raising_hwmon_collector(self, monkeypatch):
+        """hwmon raising must not cost the IPMI data, only its own field's slice."""
+        monkeypatch.setattr(
+            collectors, "get_temperatures", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        monkeypatch.setattr(
+            collectors, "get_ipmi_temperatures", lambda: [{"n": "CPU1 Temp", "c": 38.0}]
+        )
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["temps"] == [{"n": "CPU1 Temp", "c": 38.0}]
+        assert extras["err"] == ["temps_hwmon"]
+
+    def test_hwmon_temps_survive_a_raising_ipmi_collector(self, monkeypatch):
+        """IPMI raising must not cost the hwmon data, only its own field's slice."""
+        monkeypatch.setattr(
+            collectors, "get_temperatures", lambda: [{"n": "k10temp/Tctl", "c": 45.0}]
+        )
+        monkeypatch.setattr(
+            collectors, "get_ipmi_temperatures", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["temps"] == [{"n": "k10temp/Tctl", "c": 45.0}]
+        assert extras["err"] == ["temps_ipmi"]
 
     def test_fans_are_the_union_of_hwmon_and_ipmi_sorted_by_name(self, monkeypatch):
         """The two fan sources are concatenated, then sorted together by ``n``.

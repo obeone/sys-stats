@@ -52,6 +52,7 @@ def client(monkeypatch):
     monkeypatch.setattr(collectors.GPUtil, "getGPUs", lambda: [])
 
     monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
+    monkeypatch.setattr(collectors, "get_ipmi_temperatures", lambda: [])
     monkeypatch.setattr(collectors, "get_fans", lambda: [])
     monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
     monkeypatch.setattr(collectors, "get_swap", lambda: {"used": 0, "total": 0, "pct": 0.0})
@@ -311,6 +312,108 @@ class TestTempsAndFansTruncation:
         assert payload["gpu_n"] == 2
         assert len(payload["gpu"]) == 1
         assert payload["gpu"][0]["i"] == 0
+
+
+class TestTempsUnion:
+    """``temps`` is the union of the hwmon and IPMI sources, concatenated then sorted."""
+
+    def test_both_sources_populated_are_interleaved_by_the_sort(self, client, monkeypatch):
+        """hwmon and IPMI entries land in one list, ordered together by ``n``."""
+        monkeypatch.setattr(
+            collectors, "get_temperatures", lambda: [{"n": "k10temp/Tctl", "c": 45.0}]
+        )
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_temperatures",
+            lambda: [{"n": "CPU1 Temp", "c": 38.0}, {"n": "CPU2 Temp", "c": 41.5}],
+        )
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["temps"] == [
+            {"n": "CPU1 Temp", "c": 38.0},
+            {"n": "CPU2 Temp", "c": 41.5},
+            {"n": "k10temp/Tctl", "c": 45.0},
+        ]
+        assert payload["temps_n"] == 3
+
+    def test_only_hwmon_populated(self, client, monkeypatch):
+        """A desktop with hwmon sensors and no BMC reports hwmon temps alone."""
+        monkeypatch.setattr(
+            collectors, "get_temperatures", lambda: [{"n": "k10temp/Tctl", "c": 45.0}]
+        )
+        monkeypatch.setattr(collectors, "get_ipmi_temperatures", lambda: [])
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["temps"] == [{"n": "k10temp/Tctl", "c": 45.0}]
+        assert payload["temps_n"] == 1
+
+    def test_only_ipmi_populated(self, client, monkeypatch):
+        """A Proxmox hypervisor with zero hwmon sensors reports IPMI temps alone."""
+        monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
+        monkeypatch.setattr(
+            collectors, "get_ipmi_temperatures", lambda: [{"n": "CPU1 Temp", "c": 38.0}]
+        )
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["temps"] == [{"n": "CPU1 Temp", "c": 38.0}]
+        assert payload["temps_n"] == 1
+
+    def test_neither_source_populated(self, client, monkeypatch):
+        """No hwmon and no IPMI temps is an empty list and a zero count, not an error."""
+        monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
+        monkeypatch.setattr(collectors, "get_ipmi_temperatures", lambda: [])
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["temps"] == []
+        assert payload["temps_n"] == 0
+
+    def test_one_source_raising_does_not_lose_the_other(self, client, monkeypatch):
+        """A raising collector degrades only its own contribution to the union."""
+        monkeypatch.setattr(
+            collectors, "get_temperatures", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        monkeypatch.setattr(
+            collectors, "get_ipmi_temperatures", lambda: [{"n": "CPU1 Temp", "c": 38.0}]
+        )
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["temps"] == [{"n": "CPU1 Temp", "c": 38.0}]
+        assert payload["temps_n"] == 1
+        assert "temps_hwmon" in payload["err"]
+
+    def test_cap_applies_to_the_union_with_temps_n_reporting_the_true_total(
+        self, client, monkeypatch
+    ):
+        """SYS_STATS_PANEL_MAX_TEMPS caps the sorted union; temps_n stays the pre-cap total."""
+        monkeypatch.setattr(
+            collectors, "get_temperatures", lambda: [{"n": "k10temp/Tctl", "c": 45.0}]
+        )
+        monkeypatch.setattr(
+            collectors,
+            "get_ipmi_temperatures",
+            lambda: [{"n": "CPU1 Temp", "c": 38.0}, {"n": "CPU2 Temp", "c": 41.5}],
+        )
+        monkeypatch.setenv("SYS_STATS_PANEL_MAX_TEMPS", "2")
+        _seed_cache()
+
+        payload = client.get("/panel").get_json()
+
+        assert payload["temps"] == [
+            {"n": "CPU1 Temp", "c": 38.0},
+            {"n": "CPU2 Temp", "c": 41.5},
+        ]
+        assert payload["temps_n"] == 3
+        assert len(payload["temps"]) < payload["temps_n"]
 
 
 class TestFansUnion:

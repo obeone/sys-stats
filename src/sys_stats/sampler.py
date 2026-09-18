@@ -173,17 +173,25 @@ def _collect_panel_extras() -> dict[str, Any]:
     only its own field, with a safe default substituted and a short tag
     appended to ``err``, instead of losing every panel field the way an
     uncaught exception in :func:`_sample_once` would drop the whole
-    iteration. This applies in particular to the two independent fan
-    sources below: hwmon (:func:`sys_stats.collectors.get_fans`) and IPMI
-    (:func:`sys_stats.collectors.get_ipmi_fans`) are collected and guarded
-    separately, so one raising never costs the other its data.
+    iteration. This applies in particular to the independent hwmon/IPMI
+    source pairs below: temperatures
+    (:func:`sys_stats.collectors.get_temperatures` /
+    :func:`sys_stats.collectors.get_ipmi_temperatures`) and fans
+    (:func:`sys_stats.collectors.get_fans` /
+    :func:`sys_stats.collectors.get_ipmi_fans`) are each collected and
+    guarded separately, so one source raising never costs its sibling its
+    data.
 
-    ``fans`` is the union of both sources: concatenated, THEN sorted by
-    ``"n"``. The two are disjoint in practice (hwmon names look like
-    ``nct6775/fan1``, IPMI names look like ``FAN1``), so no deduplication
-    or priority rule is needed -- a Proxmox hypervisor host with zero hwmon
-    fans and five IPMI ones, and a desktop with the reverse, both fall out
-    of the same code path.
+    ``temps`` and ``fans`` are each the union of their two sources:
+    concatenated, THEN sorted by ``"n"``. The two are disjoint in practice
+    (hwmon names look like ``nct6775/fan1`` / ``k10temp/Tctl``, IPMI names
+    look like ``FAN1`` / ``CPU1 Temp``), so no deduplication or priority
+    rule is needed -- a Proxmox hypervisor host with zero hwmon sensors and
+    several IPMI ones, and a desktop with the reverse, both fall out of the
+    same code path. Some BMCs report GPU temperatures among their sensors;
+    those stay in ``temps`` under their BMC name rather than being folded
+    into ``gpu[]``, where a temperature-only entry would read as an idle
+    card instead of missing data.
 
     Returns
     -------
@@ -195,11 +203,25 @@ def _collect_panel_extras() -> dict[str, Any]:
     err: list[str] = []
 
     try:
-        temps = collectors.get_temperatures()
+        hwmon_temps = collectors.get_temperatures()
     except Exception:
-        logger.exception("Panel: failed to collect temperatures")
-        temps = []
-        err.append("temps")
+        logger.exception("Panel: failed to collect hwmon temperatures")
+        hwmon_temps = []
+        err.append("temps_hwmon")
+
+    try:
+        ipmi_temps = collectors.get_ipmi_temperatures()
+    except Exception:
+        logger.exception("Panel: failed to collect IPMI temperatures")
+        ipmi_temps = []
+        err.append("temps_ipmi")
+
+    # Concatenate first, sort second -- never the reverse. Positional
+    # stability on the wall display is part of the frozen /panel contract
+    # (see get_temperatures/get_ipmi_temperatures/get_fans/get_ipmi_fans),
+    # and sorting only the individual sources before concatenating would
+    # not guarantee the union itself comes out ordered.
+    temps = sorted(hwmon_temps + ipmi_temps, key=lambda e: e["n"])
 
     try:
         hwmon_fans = collectors.get_fans()
@@ -215,11 +237,6 @@ def _collect_panel_extras() -> dict[str, Any]:
         ipmi_fans = []
         err.append("fans_ipmi")
 
-    # Concatenate first, sort second -- never the reverse. Positional
-    # stability on the wall display is part of the frozen /panel contract
-    # (see get_temperatures/get_fans/get_ipmi_fans), and sorting only the
-    # individual sources before concatenating would not guarantee the
-    # union itself comes out ordered.
     fans = sorted(hwmon_fans + ipmi_fans, key=lambda e: e["n"])
 
     try:

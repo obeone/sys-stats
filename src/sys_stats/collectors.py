@@ -521,6 +521,121 @@ def get_ipmi_fans() -> list[dict[str, Any]]:
     return entries
 
 
+def _run_ipmitool_sdr_temperature(timeout: float = 5.0) -> str | None:
+    """Ask ``ipmitool`` for the chassis temperature sensors over IPMI.
+
+    Sibling of :func:`_run_ipmitool_sdr_fan`: ``sdr type temperature`` is
+    the narrowest subcommand that still reports every temperature sensor
+    the BMC knows about, readable or not, one pipe-separated line per
+    sensor -- exactly the shape :func:`get_ipmi_temperatures` expects to
+    parse.
+
+    Parameters
+    ----------
+    timeout : float, optional
+        Seconds to wait for ``ipmitool`` before giving up.
+
+    Returns
+    -------
+    str or None
+        Raw stdout of the command, or ``None`` when ``ipmitool`` is
+        missing, fails, times out, or is otherwise unreachable.
+    """
+    try:
+        result = subprocess.run(
+            ['ipmitool', 'sdr', 'type', 'temperature'],
+            capture_output=True,
+            text=True,
+            check=True,
+            # See _run_ipmitool_sdr_fan: ipmitool talks to a BMC over
+            # /dev/ipmi*, and a wedged or unreachable BMC hangs indefinitely
+            # instead of failing fast. This collector runs inside the
+            # sampler's background thread, so an unbounded call would freeze
+            # the cache while the wall panel kept showing stale numbers that
+            # look perfectly fresh.
+            timeout=timeout,
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error fetching IPMI temperature sensors: {e.stderr.strip()}")
+        return None
+    except FileNotFoundError as e:
+        # ``ipmitool`` is not installed at all, as opposed to installed but
+        # failing (CalledProcessError) or hanging (TimeoutExpired).
+        logger.error(f"Error fetching IPMI temperature sensors: {e}")
+        return None
+    except subprocess.TimeoutExpired as e:
+        logger.warning(f"Timed out waiting for IPMI temperature sensors: {e}")
+        return None
+
+    return result.stdout
+
+
+def get_ipmi_temperatures() -> list[dict[str, Any]]:
+    """Retrieve chassis temperature sensors reported over IPMI, sorted for stable display.
+
+    Sibling of :func:`get_ipmi_fans`, complementing :func:`get_temperatures`:
+    some chassis (e.g. Proxmox hypervisor hosts) report temperatures the BMC
+    knows about but hwmon/sysfs does not. Returns the exact same entry shape
+    as :func:`get_temperatures` so the two can be concatenated into one list
+    by the caller (see :func:`sys_stats.sampler._collect_panel_extras`).
+
+    Some BMCs report GPU temperatures among their sensors -- these are named
+    probes like any other and belong here, not folded into the ``gpu[]``
+    section of ``/panel``: a GPU entry with only a temperature and zeros
+    everywhere else would read as an idle card, not as missing data.
+
+    Returns
+    -------
+    list of dict
+        Entries ``{"n": <sensor name>, "c": <float, rounded to 1 decimal>}``,
+        sorted by ``"n"``. A sensor the BMC reports as unreadable (``No
+        Reading``, ``Disabled``, ``N/A``, ...) is a sensor that is not
+        there, not a probe reading 0degC -- such entries are omitted rather
+        than coerced, exactly like :func:`get_ipmi_fans`. Empty when
+        ``ipmitool`` is missing, fails, times out, or its output does not
+        parse.
+    """
+    stdout = _run_ipmitool_sdr_temperature()
+    if stdout is None:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for line in stdout.strip().split('\n'):
+        if not line.strip():
+            continue
+
+        # Same pipe-separated shape as get_ipmi_fans: only the first field
+        # (sensor name) and the last field (reading) are used, so this keeps
+        # working across BMC firmware that formats the middle differently.
+        fields = line.split('|')
+        if len(fields) < 2:
+            logger.warning(f"Skipping malformed IPMI temperature sensor line: '{line}'")
+            continue
+
+        name = fields[0].strip()
+        reading = fields[-1].strip()
+        try:
+            # The reading field is free text: "45 degrees C" for a working
+            # sensor, "No Reading" / "Disabled" / "N/A" for one the BMC
+            # cannot poll right now. Only the leading numeric token is kept;
+            # anything that does not start with one drops the whole entry
+            # rather than being coerced to 0 (see the "No Reading" rationale
+            # above).
+            celsius = float(reading.split()[0])
+        except (ValueError, IndexError):
+            continue
+
+        entries.append({"n": name, "c": round(celsius, 1)})
+
+    # Same rationale as get_ipmi_fans/get_temperatures: sensor enumeration
+    # order is not guaranteed stable across BMC firmware versions or
+    # reboots, and the wall panel renders this list positionally, so it is
+    # re-sorted on every single sample rather than trusted to already be
+    # ordered.
+    entries.sort(key=lambda e: e["n"])
+    return entries
+
+
 def get_swap() -> dict[str, Any]:
     """Retrieve swap memory usage.
 

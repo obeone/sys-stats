@@ -91,6 +91,7 @@ def client(monkeypatch):
     # sensors/frequency/load-average calls; /panel's own tests override
     # these locally.
     monkeypatch.setattr(collectors, "get_temperatures", lambda: [])
+    monkeypatch.setattr(collectors, "get_ipmi_temperatures", lambda: [])
     monkeypatch.setattr(collectors, "get_fans", lambda: [])
     monkeypatch.setattr(collectors, "get_ipmi_fans", lambda: [])
     monkeypatch.setattr(collectors, "get_swap", lambda: {"used": 0, "total": 0, "pct": 0.0})
