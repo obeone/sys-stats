@@ -620,6 +620,80 @@ class TestGetFans:
         assert collectors.get_fans() == []
 
 
+def _timeout_run(cmd: str = "ipmitool", timeout: float = 5.0):
+    """Build a ``subprocess.run`` replacement raising ``TimeoutExpired``.
+
+    Simulates a wedged or unreachable BMC: ``ipmitool`` never returns
+    within the caller's explicit ``timeout=``, as opposed to ``_failing_run``
+    (binary runs, exits non-zero) or ``_missing_binary_run`` (binary absent).
+    """
+
+    def _run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    return _run
+
+
+class TestGetIpmiFans:
+    def test_parses_readable_sensors_sorted_by_name(self, monkeypatch):
+        """Readable sensors are kept, sorted by ``n`` regardless of report order."""
+        monkeypatch.setattr(
+            collectors.subprocess,
+            "run",
+            _fake_run(
+                "FAN2             | 32h | ok  |  7.1 | 6900 RPM\n"
+                "FAN1             | 31h | ok  |  7.2 | 7100 RPM\n"
+            ),
+        )
+
+        assert collectors.get_ipmi_fans() == [
+            {"n": "FAN1", "rpm": 7100},
+            {"n": "FAN2", "rpm": 6900},
+        ]
+
+    def test_omits_no_reading_sensors_instead_of_zero(self, monkeypatch):
+        """A sensor the BMC cannot poll must be dropped, never published as 0 RPM.
+
+        Regression guard: 0 RPM renders on the wall panel as a stopped-fan
+        alarm, which is not what "No Reading" means.
+        """
+        monkeypatch.setattr(
+            collectors.subprocess,
+            "run",
+            _fake_run(
+                "FAN1             | 31h | ok  |  7.1 | 6300 RPM\n"
+                "FANA             | 3Ah | ns  |  7.2 | No Reading\n"
+                "FANB             | 3Bh | ns  |  7.3 | Disabled\n"
+            ),
+        )
+
+        assert collectors.get_ipmi_fans() == [{"n": "FAN1", "rpm": 6300}]
+
+    def test_returns_empty_list_when_ipmitool_fails(self, monkeypatch):
+        """A failing ipmitool (no BMC reachable) degrades to no fan data."""
+        monkeypatch.setattr(collectors.subprocess, "run", _failing_run())
+
+        assert collectors.get_ipmi_fans() == []
+
+    def test_returns_empty_list_when_ipmitool_is_absent(self, monkeypatch):
+        """A missing ``ipmitool`` binary must degrade like a failing one."""
+        monkeypatch.setattr(collectors.subprocess, "run", _missing_binary_run())
+
+        assert collectors.get_ipmi_fans() == []
+
+    def test_returns_empty_list_when_ipmitool_times_out(self, monkeypatch):
+        """A wedged BMC must degrade to ``[]`` instead of hanging the sampler."""
+        monkeypatch.setattr(collectors.subprocess, "run", _timeout_run())
+
+        assert collectors.get_ipmi_fans() == []
+
+    def test_returns_empty_list_for_unrecognised_output(self, monkeypatch):
+        """Output the parser cannot make sense of yields no entries, not a crash."""
+        monkeypatch.setattr(collectors.subprocess, "run", _fake_run("not sensor data\n"))
+
+        assert collectors.get_ipmi_fans() == []
+
+
 class TestGetSwap:
     def test_returns_bytes_and_rounded_percent(self, monkeypatch):
         """Straight passthrough of psutil.swap_memory(), percent rounded."""
