@@ -400,6 +400,262 @@ class TestGetOllamaProcess:
         assert collectors.get_ollama_process() == {"models": []}
 
 
+class _FakeDcgmResponse:
+    """Stand-in for a streamed ``requests.Response``, as ``_fetch_dcgm_text`` expects.
+
+    Only the surface ``_fetch_dcgm_text`` actually touches: ``raise_for_status``,
+    ``iter_content`` and ``close``. Splitting the body across two chunks (rather
+    than yielding it whole) exercises the chunk-assembly path, not just a
+    degenerate single-read case.
+    """
+
+    def __init__(self, body: bytes, status: int = 200) -> None:
+        self._body = body
+        self._status = status
+        self.closed = False
+
+    def raise_for_status(self) -> None:
+        if self._status >= 400:
+            raise requests.HTTPError(f"{self._status} error")
+
+    def iter_content(self, chunk_size: int = 8192):
+        midpoint = len(self._body) // 2
+        if midpoint:
+            yield self._body[:midpoint]
+            yield self._body[midpoint:]
+        else:
+            yield self._body
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _dcgm_sample_line(metric: str, gpu: str, value: str, **extra_labels: str) -> str:
+    """Build one Prometheus exposition line matching dcgm-exporter's real shape.
+
+    Verbatim label set from the sample line given for this feature:
+    ``DCGM_FI_DEV_FB_FREE{gpu="0",UUID="GPU-a9bc...",pci_bus_id="00000000:06:10.0",
+    device="nvidia0",modelName="NVIDIA GeForce RTX 3090",hostname="bart-worker",
+    container="dev",namespace="coder",pod="coder-..."} 24125``.
+    """
+    labels = {
+        "gpu": gpu,
+        "UUID": f"GPU-{gpu}aaa",
+        "pci_bus_id": "00000000:06:10.0",
+        "device": f"nvidia{gpu}",
+        "modelName": "NVIDIA GeForce RTX 3090",
+        "hostname": "bart-worker",
+        "container": "dev",
+        "namespace": "coder",
+        "pod": "coder-1",
+    }
+    labels.update(extra_labels)
+    label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
+    return f"{metric}{{{label_str}}} {value}"
+
+
+def _build_dcgm_body(rows: list[tuple[str, str, str, dict]]) -> bytes:
+    """Assemble a full dcgm-exporter body from ``(metric, gpu, value, extra_labels)`` rows."""
+    lines = ["# HELP DCGM_FI_DEV_GPU_UTIL GPU utilization (in %)", "# TYPE DCGM_FI_DEV_GPU_UTIL gauge"]
+    for metric, gpu, value, extra in rows:
+        lines.append(_dcgm_sample_line(metric, gpu, value, **extra))
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+#: A realistic two-GPU body. GPU 1 is the exact "used 0, free 24125 MiB"
+#: measurement this feature's derived-total math is built around.
+_REALISTIC_DCGM_BODY = _build_dcgm_body([
+    ("DCGM_FI_DEV_GPU_UTIL", "0", "12", {}),
+    ("DCGM_FI_DEV_GPU_UTIL", "1", "0", {}),
+    ("DCGM_FI_DEV_FB_USED", "0", "451", {}),
+    ("DCGM_FI_DEV_FB_USED", "1", "0", {}),
+    ("DCGM_FI_DEV_FB_FREE", "0", "23674", {}),
+    ("DCGM_FI_DEV_FB_FREE", "1", "24125", {}),
+    ("DCGM_FI_DEV_GPU_TEMP", "0", "42", {}),
+    ("DCGM_FI_DEV_GPU_TEMP", "1", "35", {}),
+    ("DCGM_FI_DEV_POWER_USAGE", "0", "112.5", {}),
+    ("DCGM_FI_DEV_POWER_USAGE", "1", "29", {}),
+    ("DCGM_FI_DEV_FAN_SPEED", "0", "0", {}),
+    ("DCGM_FI_DEV_FAN_SPEED", "1", "0", {}),
+])
+
+
+class TestGetDcgmGpus:
+    """Tests for ``get_dcgm_gpus``, the dcgm-exporter Prometheus scraper."""
+
+    def setup_method(self) -> None:
+        collectors._reset_dcgm_breaker_for_tests()
+
+    def teardown_method(self) -> None:
+        collectors._reset_dcgm_breaker_for_tests()
+
+    def test_parses_a_realistic_multi_gpu_body(self, monkeypatch):
+        """Both GPUs come back with every field converted to the /panel shape."""
+        monkeypatch.setattr(
+            collectors.requests, "get", lambda *a, **kw: _FakeDcgmResponse(_REALISTIC_DCGM_BODY)
+        )
+
+        result = collectors.get_dcgm_gpus("http://10.50.0.106:30940/metrics")
+
+        assert result == [
+            {
+                "i": 0,
+                "n": "NVIDIA GeForce RTX 3090",
+                "load": 12.0,
+                "mem_used": 451 * 1024 * 1024,
+                "mem_total": 24125 * 1024 * 1024,
+                "mem_pct": pytest.approx(1.9, abs=0.05),
+                "temp": 42.0,
+                "fan": 0,
+                "power": 112.5,
+            },
+            {
+                "i": 1,
+                "n": "NVIDIA GeForce RTX 3090",
+                "load": 0.0,
+                "mem_used": 0,
+                "mem_total": 24125 * 1024 * 1024,
+                "mem_pct": 0.0,
+                "temp": 35.0,
+                "fan": 0,
+                "power": 29.0,
+            },
+        ]
+
+    def test_derives_total_as_used_plus_free_not_the_nominal_capacity(self, monkeypatch):
+        """GPU 1's total is the measured 24125 MiB, not the card's nominal 24576 MiB.
+
+        The 451 MiB gap (24576 - 24125) is framebuffer the driver reserves
+        for itself; DCGM exposes no total-memory metric at all, so this is
+        the only total /panel can report, and it must not be rounded up to
+        look like the marketing figure.
+        """
+        monkeypatch.setattr(
+            collectors.requests, "get", lambda *a, **kw: _FakeDcgmResponse(_REALISTIC_DCGM_BODY)
+        )
+
+        result = collectors.get_dcgm_gpus("http://10.50.0.106:30940/metrics")
+
+        gpu1 = next(g for g in result if g["i"] == 1)
+        assert gpu1["mem_used"] == 0
+        assert gpu1["mem_total"] == 24125 * 1024 * 1024
+        assert gpu1["mem_total"] != 24576 * 1024 * 1024
+
+    def test_ignores_every_label_except_gpu(self, monkeypatch):
+        """Identical readings under wildly different pod/namespace/container labels
+        must parse to the exact same output -- those labels describe whichever
+        workload currently holds the device and move on their own (measured:
+        GPU 1 held by ``coder`` then ``dockerd``, then both cards under
+        ``coder``, with nothing redeployed in between).
+        """
+        # Same GPU, same readings, two unrelated sets of the labels this
+        # parser must ignore -- modelled on the measured churn: GPU 1 seen
+        # under a "coder" pod, later under a "dockerd" pod on a different
+        # host label, with no redeploy in between.
+        labels_coder = {"namespace": "coder", "pod": "coder-abc", "container": "dev"}
+        labels_dockerd = {
+            "namespace": "default",
+            "pod": "dockerd-xyz",
+            "container": "dockerd",
+            "hostname": "other-host",
+        }
+        readings = [
+            ("DCGM_FI_DEV_GPU_UTIL", "5"),
+            ("DCGM_FI_DEV_FB_USED", "100"),
+            ("DCGM_FI_DEV_FB_FREE", "24025"),
+            ("DCGM_FI_DEV_GPU_TEMP", "40"),
+            ("DCGM_FI_DEV_POWER_USAGE", "50"),
+            ("DCGM_FI_DEV_FAN_SPEED", "0"),
+        ]
+        body_a = _build_dcgm_body([(metric, "1", value, labels_coder) for metric, value in readings])
+        body_b = _build_dcgm_body(
+            [(metric, "1", value, labels_dockerd) for metric, value in readings]
+        )
+
+        monkeypatch.setattr(
+            collectors.requests, "get", lambda *a, **kw: _FakeDcgmResponse(body_a)
+        )
+        result_a = collectors.get_dcgm_gpus("http://10.50.0.106:30940/metrics")
+
+        monkeypatch.setattr(
+            collectors.requests, "get", lambda *a, **kw: _FakeDcgmResponse(body_b)
+        )
+        result_b = collectors.get_dcgm_gpus("http://10.50.0.106:30940/metrics")
+
+        assert result_a == result_b
+
+    def test_times_out_and_degrades_to_an_empty_list(self, monkeypatch):
+        """A per-socket timeout must not raise past this function."""
+
+        def _timeout(*args, **kwargs):
+            raise requests.exceptions.ReadTimeout("timed out")
+
+        monkeypatch.setattr(collectors.requests, "get", _timeout)
+
+        assert collectors.get_dcgm_gpus("http://10.50.0.106:30940/metrics") == []
+
+    def test_connection_refused_degrades_to_an_empty_list(self, monkeypatch):
+        """A refused connection must not raise past this function either."""
+
+        def _refused(*args, **kwargs):
+            raise requests.exceptions.ConnectionError("connection refused")
+
+        monkeypatch.setattr(collectors.requests, "get", _refused)
+
+        assert collectors.get_dcgm_gpus("http://10.50.0.106:30940/metrics") == []
+
+    def test_malformed_body_degrades_to_an_empty_list(self, monkeypatch):
+        """A 200 OK body that is not Prometheus exposition format parses to nothing."""
+        monkeypatch.setattr(
+            collectors.requests,
+            "get",
+            lambda *a, **kw: _FakeDcgmResponse(b"<html>not metrics</html>"),
+        )
+
+        assert collectors.get_dcgm_gpus("http://10.50.0.106:30940/metrics") == []
+
+    def test_breaker_opens_after_threshold_failures_and_closes_on_success(self, monkeypatch):
+        """After ``_DCGM_BREAKER_THRESHOLD`` consecutive failures, further attempts
+        are skipped without calling ``requests.get`` at all, until the backoff
+        window elapses; the first success afterward closes the breaker again.
+        """
+        clock = {"now": 0.0}
+        monkeypatch.setattr(collectors.time, "monotonic", lambda: clock["now"])
+
+        call_count = {"n": 0}
+
+        def _refused(*args, **kwargs):
+            call_count["n"] += 1
+            raise requests.exceptions.ConnectionError("connection refused")
+
+        monkeypatch.setattr(collectors.requests, "get", _refused)
+
+        for _ in range(collectors._DCGM_BREAKER_THRESHOLD):
+            assert collectors.get_dcgm_gpus("http://10.50.0.106:30940/metrics") == []
+        assert call_count["n"] == collectors._DCGM_BREAKER_THRESHOLD
+        assert collectors._dcgm_breaker.consecutive_failures == collectors._DCGM_BREAKER_THRESHOLD
+
+        # Breaker is open: an attempt inside the backoff window skips the
+        # network call entirely.
+        assert collectors.get_dcgm_gpus("http://10.50.0.106:30940/metrics") == []
+        assert call_count["n"] == collectors._DCGM_BREAKER_THRESHOLD
+
+        # Advance past the backoff window, then let the next attempt succeed.
+        clock["now"] += collectors._DCGM_BREAKER_BASE_BACKOFF + 1
+        monkeypatch.setattr(
+            collectors.requests, "get", lambda *a, **kw: _FakeDcgmResponse(_REALISTIC_DCGM_BODY)
+        )
+
+        result = collectors.get_dcgm_gpus("http://10.50.0.106:30940/metrics")
+
+        assert result != []
+        assert collectors._dcgm_breaker.consecutive_failures == 0
+
+        # Breaker closed: the very next attempt is allowed immediately, no
+        # backoff window pending.
+        assert collectors._dcgm_breaker.allow_attempt() is True
+
+
 class TestTopProcesses:
     def test_cpu_ranking_is_sorted_and_limited(self, monkeypatch):
         """Processes come back sorted by CPU usage, truncated to ``limit``."""

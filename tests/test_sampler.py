@@ -425,6 +425,24 @@ def test_get_top_processes_cap_honours_a_valid_override(monkeypatch):
     assert sampler._get_top_processes_cap() == 10
 
 
+@pytest.mark.parametrize("raw", [None, "", "   "])
+def test_get_dcgm_url_is_none_when_unset_or_blank(monkeypatch, raw):
+    """Unset or blank both mean "current behaviour unchanged" (see _get_dcgm_url)."""
+    if raw is None:
+        monkeypatch.delenv("SYS_STATS_DCGM_URL", raising=False)
+    else:
+        monkeypatch.setenv("SYS_STATS_DCGM_URL", raw)
+
+    assert sampler._get_dcgm_url() is None
+
+
+def test_get_dcgm_url_strips_surrounding_whitespace(monkeypatch):
+    """A configured URL is returned with surrounding whitespace stripped."""
+    monkeypatch.setenv("SYS_STATS_DCGM_URL", "  http://10.50.0.106:30940/metrics  ")
+
+    assert sampler._get_dcgm_url() == "http://10.50.0.106:30940/metrics"
+
+
 def test_start_is_idempotent(monkeypatch):
     """Calling ``start()`` twice must not spawn a second thread.
 
@@ -641,6 +659,74 @@ class TestCollectPanelExtras:
 
         assert extras["fans"] == [{"n": "nct6775/fan1", "rpm": 1200}]
         assert extras["err"] == ["fans_ipmi"]
+
+    def test_dcgm_gpu_is_absent_and_uncalled_when_url_is_unset(self, monkeypatch):
+        """Unset SYS_STATS_DCGM_URL: no scrape attempt, no ``dcgm_gpu`` key at all.
+
+        The key's absence -- not an empty list under it -- is what tells
+        server._build_panel_payload to keep building gpu[] from
+        stats["gpu"] the way it always has.
+        """
+        monkeypatch.delenv("SYS_STATS_DCGM_URL", raising=False)
+
+        def _explode(url):
+            raise AssertionError("no DCGM scrape expected when the URL is unset")
+
+        monkeypatch.setattr(collectors, "get_dcgm_gpus", _explode)
+
+        extras = sampler._collect_panel_extras()
+
+        assert "dcgm_gpu" not in extras
+        assert extras["err"] == []
+
+    def test_dcgm_gpu_is_included_and_url_forwarded_when_configured(self, monkeypatch):
+        """A configured URL is forwarded verbatim and the collector's result kept as-is."""
+        monkeypatch.setenv("SYS_STATS_DCGM_URL", "http://10.50.0.106:30940/metrics")
+        seen_urls = []
+        entry = {
+            "i": 0, "n": "RTX 3090", "load": 12.0, "mem_used": 1, "mem_total": 2,
+            "mem_pct": 50.0, "temp": 40.0, "fan": 0, "power": 100.0,
+        }
+
+        def _get_dcgm_gpus(url):
+            seen_urls.append(url)
+            return [entry]
+
+        monkeypatch.setattr(collectors, "get_dcgm_gpus", _get_dcgm_gpus)
+
+        extras = sampler._collect_panel_extras()
+
+        assert seen_urls == ["http://10.50.0.106:30940/metrics"]
+        assert extras["dcgm_gpu"] == [entry]
+        assert extras["err"] == []
+
+    def test_dcgm_empty_result_tags_gpu_in_err(self, monkeypatch):
+        """get_dcgm_gpus never raises on failure -- an empty result while
+        configured is the failure signal itself, so it must land in err.
+        """
+        monkeypatch.setenv("SYS_STATS_DCGM_URL", "http://10.50.0.106:30940/metrics")
+        monkeypatch.setattr(collectors, "get_dcgm_gpus", lambda url: [])
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["dcgm_gpu"] == []
+        assert extras["err"] == ["gpu"]
+
+    def test_dcgm_gpu_survives_an_unexpected_raise(self, monkeypatch):
+        """Defensive backstop, matching every other field above: even though
+        get_dcgm_gpus is documented to never raise, an unexpected exception
+        must degrade to an empty list and the "gpu" tag, not lose the rest
+        of the extras dict.
+        """
+        monkeypatch.setenv("SYS_STATS_DCGM_URL", "http://10.50.0.106:30940/metrics")
+        monkeypatch.setattr(
+            collectors, "get_dcgm_gpus", lambda url: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+
+        extras = sampler._collect_panel_extras()
+
+        assert extras["dcgm_gpu"] == []
+        assert extras["err"] == ["gpu"]
 
 
 class TestGetPanelSnapshot:

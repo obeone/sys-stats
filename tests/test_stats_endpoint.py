@@ -138,6 +138,42 @@ def test_stats_exposes_the_full_payload_without_a_gpu(client):
     assert payload["ram"] == {"total": 16 * 1024**3, "used": 8 * 1024**3, "percent": 50.0}
 
 
+def test_stats_key_set_is_unchanged_when_dcgm_is_configured(client, monkeypatch):
+    """SYS_STATS_DCGM_URL is a /panel-only concern; /stats must never see it.
+
+    Asserts the exact key set matches the no-GPU baseline above -- proof at
+    the payload level that /stats did not change, not a zero-line diff on
+    server.py, which would only show that a *file* did not change.
+    """
+    monkeypatch.setenv("SYS_STATS_DCGM_URL", "http://10.50.0.106:30940/metrics")
+    monkeypatch.setattr(
+        collectors,
+        "get_dcgm_gpus",
+        lambda url: [{
+            "i": 0, "n": "x", "load": 0.0, "mem_used": 0, "mem_total": 0,
+            "mem_pct": 0.0, "temp": 0.0, "fan": 0, "power": 0.0,
+        }],
+    )
+    _seed_cache()
+
+    payload = client.get("/stats").get_json()
+
+    assert set(payload) == {
+        "current_time",
+        "has_gpu",
+        "summary",
+        "cpu",
+        "ram",
+        "gpu",
+        "top_cpu",
+        "top_memory",
+        "top_gpu_processes",
+        "ollama_processes",
+    }
+    # /stats' gpu[] still comes from GPUtil, not DCGM -- unaffected either way.
+    assert payload["gpu"] == []
+
+
 def test_stats_never_carries_the_panel_only_host_key(client):
     """``host`` (SYS_STATS_HOSTNAME) is a ``/panel``-only addition; ``/stats`` is untouched.
 

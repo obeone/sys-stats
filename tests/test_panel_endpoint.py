@@ -216,6 +216,69 @@ def test_panel_gpu_entry_is_an_int_fan_speed(client, monkeypatch):
     assert isinstance(gpu["fan"], int)
 
 
+def test_panel_gpu_never_calls_dcgm_when_url_is_unset(client, monkeypatch):
+    """The GPUtil/nvidia-smi path stays exclusive until SYS_STATS_DCGM_URL is set."""
+    monkeypatch.delenv("SYS_STATS_DCGM_URL", raising=False)
+    monkeypatch.setattr(collectors.GPUtil, "getGPUs", lambda: [_FakeGPU()])
+    monkeypatch.setattr(
+        collectors, "get_gpu_fan_and_power", lambda: {0: {"fan_speed": 30.0, "power_draw": 220.0}}
+    )
+    monkeypatch.setattr(collectors, "get_gpu_processes", lambda limit=5, uuid_to_index=None: [])
+
+    def _explode(url):
+        raise AssertionError("no DCGM scrape expected when the URL is unset")
+
+    monkeypatch.setattr(collectors, "get_dcgm_gpus", _explode)
+    _seed_cache()
+
+    payload = client.get("/panel").get_json()
+
+    assert payload["gpu"][0]["n"] == "NVIDIA GeForce RTX 3090"
+    assert payload["gpu_n"] == 1
+    assert payload["err"] == []
+
+
+def test_panel_gpu_comes_from_dcgm_when_the_url_is_configured(client, monkeypatch):
+    """SYS_STATS_DCGM_URL set: gpu[] is the DCGM collector's output verbatim,
+    not built from stats["gpu"]/GPUtil at all -- GPUtil is stubbed here to a
+    different GPU entirely, and its shape never shows up in the response.
+    """
+    monkeypatch.setenv("SYS_STATS_DCGM_URL", "http://10.50.0.106:30940/metrics")
+    monkeypatch.setattr(collectors.GPUtil, "getGPUs", lambda: [_FakeGPU()])
+    dcgm_entry = {
+        "i": 0,
+        "n": "NVIDIA GeForce RTX 3090",
+        "load": 12.0,
+        "mem_used": 1000,
+        "mem_total": 2000,
+        "mem_pct": 50.0,
+        "temp": 40.0,
+        "fan": 0,
+        "power": 100.0,
+    }
+    monkeypatch.setattr(collectors, "get_dcgm_gpus", lambda url: [dict(dcgm_entry)])
+    _seed_cache()
+
+    payload = client.get("/panel").get_json()
+
+    assert payload["gpu"] == [dcgm_entry]
+    assert payload["gpu_n"] == 1
+    assert payload["err"] == []
+
+
+def test_panel_gpu_err_carries_gpu_tag_when_dcgm_scrape_fails(client, monkeypatch):
+    """A configured but failing DCGM scrape empties gpu[] and tags "gpu" in err."""
+    monkeypatch.setenv("SYS_STATS_DCGM_URL", "http://10.50.0.106:30940/metrics")
+    monkeypatch.setattr(collectors, "get_dcgm_gpus", lambda url: [])
+    _seed_cache()
+
+    payload = client.get("/panel").get_json()
+
+    assert payload["gpu"] == []
+    assert payload["gpu_n"] == 0
+    assert payload["err"] == ["gpu"]
+
+
 def test_panel_load_is_the_loadavg_triple_not_a_percentage(client, monkeypatch):
     """cpu.load is os.getloadavg(), distinct from /stats' percentage under the same key name."""
     monkeypatch.setattr(collectors, "get_load_average", lambda: [1.5, 2.25, 3.0])
