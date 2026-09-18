@@ -79,13 +79,29 @@ def get_top_processes_by_memory(limit: int = 5) -> list[dict[str, Any]]:
 _COMPUTE_APPS_QUERY = '--query-compute-apps=gpu_uuid,pid,process_name,used_memory'
 _LEGACY_COMPUTE_APPS_QUERY = '--query-compute-apps=pid,process_name,used_memory'
 
+# ``nvidia-smi`` talks to the driver through a local ioctl, not over a network
+# or a serial BMC channel like ``ipmitool`` -- on a healthy host it answers in
+# well under 100ms. 3 seconds is therefore ample slack over the healthy case
+# while still bounding a wedged-driver hang tightly: this collector runs
+# inside the sampler's background loop (see sys_stats.sampler), and
+# _query_compute_apps can attempt this call twice (UUID-aware query, then the
+# legacy fallback), so the timeout here directly caps how long one sampling
+# pass can be stuck on GPU process attribution alone.
+_NVIDIA_SMI_TIMEOUT = 3.0
 
-def _query_compute_apps() -> str | None:
+
+def _query_compute_apps(timeout: float = _NVIDIA_SMI_TIMEOUT) -> str | None:
     """Ask nvidia-smi for the running compute apps, newest query shape first.
 
     The UUID-aware query is tried once; if the driver rejects it the legacy
     three-field query is tried as well, so a card attribution failure never
     costs the caller the whole process list.
+
+    Parameters
+    ----------
+    timeout : float, optional
+        Seconds to wait for each ``nvidia-smi`` invocation before giving up
+        on it and moving to the next query (or giving up entirely).
 
     Returns
     -------
@@ -100,16 +116,28 @@ def _query_compute_apps() -> str | None:
                 ['nvidia-smi', query, '--format=csv,noheader,nounits'],
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                # A wedged driver hangs nvidia-smi indefinitely instead of
+                # failing fast. This collector runs inside the sampler's
+                # background thread, so an unbounded call would freeze the
+                # cached snapshot for every consumer while /stats and /panel
+                # kept serving stale numbers that look perfectly fresh. See
+                # _NVIDIA_SMI_TIMEOUT for why this value.
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired as e:
+            logger.warning(f"Timed out waiting for nvidia-smi ({query}): {e}")
+            last_error = e
+            continue
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             last_error = e
             continue
         return result.stdout
 
-    # ``stderr`` is only set on ``CalledProcessError``; ``FileNotFoundError``
-    # (binary missing entirely) has none, so guard both the attribute and the
-    # None case before stripping.
+    # ``stderr`` is only set on ``CalledProcessError`` (and possibly
+    # ``TimeoutExpired`` when the pipes were captured before the timeout
+    # fired); ``FileNotFoundError`` (binary missing entirely) has none, so
+    # guard both the attribute and the None case before stripping.
     stderr = (getattr(last_error, "stderr", None) or "").strip() if last_error is not None else ""
     logger.error(f"Error fetching GPU processes: {stderr or last_error}")
     return None
@@ -232,10 +260,16 @@ def get_gpu_processes(
     logger.debug(f"Top GPU processes: {top_processes}")
     return top_processes
 
-def get_gpu_fan_and_power() -> dict[int, dict[str, float]]:
+def get_gpu_fan_and_power(timeout: float = _NVIDIA_SMI_TIMEOUT) -> dict[int, dict[str, float]]:
     """
     Retrieve fan speed (%) and power draw (W) for each GPU via nvidia-smi.
     Returns a dict keyed by GPU index: {"fan_speed": float, "power_draw": float}.
+
+    Parameters
+    ----------
+    timeout : float, optional
+        Seconds to wait for ``nvidia-smi`` before giving up. See
+        :data:`_NVIDIA_SMI_TIMEOUT` for why this value.
     """
     data = {}
     try:
@@ -243,7 +277,12 @@ def get_gpu_fan_and_power() -> dict[int, dict[str, float]]:
             ['nvidia-smi', '--query-gpu=index,fan.speed,power.draw', '--format=csv,noheader,nounits'],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            # See _query_compute_apps: a wedged driver hangs this call
+            # indefinitely otherwise, freezing the sampler's cached snapshot
+            # while /stats and /panel keep serving stale numbers that look
+            # perfectly fresh.
+            timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
         logger.error(f"Error fetching GPU fan/power: {e.stderr.strip()}")
@@ -252,6 +291,9 @@ def get_gpu_fan_and_power() -> dict[int, dict[str, float]]:
         # The ``nvidia-smi`` binary is not installed at all (no NVIDIA driver
         # on this host), as opposed to the binary existing but failing.
         logger.error(f"Error fetching GPU fan/power: {e}")
+        return {}
+    except subprocess.TimeoutExpired as e:
+        logger.warning(f"Timed out waiting for nvidia-smi (fan/power query): {e}")
         return {}
 
     lines = result.stdout.strip().split('\n')

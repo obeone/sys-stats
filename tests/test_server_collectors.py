@@ -93,6 +93,19 @@ class TestGetGpuFanAndPower:
 
         assert collectors.get_gpu_fan_and_power() == {}
 
+    def test_returns_empty_mapping_when_nvidia_smi_times_out(self, monkeypatch):
+        """A wedged driver must degrade to ``{}`` instead of hanging the sampler.
+
+        Regression guard: this collector runs inside the sampler's
+        background thread (see CLAUDE.md), so an unbounded nvidia-smi call
+        would freeze the cached snapshot for every consumer indefinitely.
+        """
+        monkeypatch.setattr(
+            collectors.subprocess, "run", _timeout_run(cmd="nvidia-smi", timeout=3.0)
+        )
+
+        assert collectors.get_gpu_fan_and_power() == {}
+
 
 class TestGetGpuProcesses:
     @pytest.fixture(autouse=True)
@@ -168,6 +181,21 @@ class TestGetGpuProcesses:
         contract (CLAUDE.md) is to degrade to ``[]``, not to propagate it.
         """
         monkeypatch.setattr(collectors.subprocess, "run", _missing_binary_run())
+
+        assert collectors.get_gpu_processes() == []
+
+    def test_returns_empty_list_when_nvidia_smi_times_out(self, monkeypatch):
+        """A wedged driver must degrade to ``[]`` instead of hanging the sampler.
+
+        Regression guard: :func:`sys_stats.collectors._query_compute_apps`
+        runs inside the sampler's background thread, so an unbounded
+        nvidia-smi call would freeze the cached snapshot for every consumer
+        indefinitely while /stats and /panel kept serving stale data that
+        looks perfectly fresh.
+        """
+        monkeypatch.setattr(
+            collectors.subprocess, "run", _timeout_run(cmd="nvidia-smi", timeout=3.0)
+        )
 
         assert collectors.get_gpu_processes() == []
 
