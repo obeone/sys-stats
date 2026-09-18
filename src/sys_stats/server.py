@@ -193,9 +193,9 @@ _MIN_FIRST_SNAPSHOT_TIMEOUT = 5.0
 #: Headroom added on top of the one interval the sampler sleeps before its
 #: first sample, covering the duration of the collection itself: a psutil
 #: process sweep, up to two ``nvidia-smi`` subprocess round trips and, when
-#: ``OLLAMA_API_URL`` is set, one HTTP call. That whole pass is well under a
-#: second on a healthy host, so this is roughly an order of magnitude of
-#: slack rather than a tuned value.
+#: ``OLLAMA_API_URL`` is set, one HTTP call. Nobody timed that pass, so this
+#: margin is a judgement about how much slack a first collection deserves,
+#: not a multiple of a measured duration.
 _FIRST_SNAPSHOT_COLLECTION_MARGIN = 3.0
 
 

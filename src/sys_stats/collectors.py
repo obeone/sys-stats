@@ -82,9 +82,10 @@ _COMPUTE_APPS_QUERY = '--query-compute-apps=gpu_uuid,pid,process_name,used_memor
 _LEGACY_COMPUTE_APPS_QUERY = '--query-compute-apps=pid,process_name,used_memory'
 
 # ``nvidia-smi`` talks to the driver through a local ioctl, not over a network
-# or a serial BMC channel like ``ipmitool`` -- on a healthy host it answers in
-# well under 100ms. 3 seconds is therefore ample slack over the healthy case
-# while still bounding a wedged-driver hang tightly: this collector runs
+# or a serial BMC channel like ``ipmitool``, so a healthy call is expected to
+# be fast -- nobody here timed it, so 3 seconds is a judgement about how long
+# a stuck one may block, not a multiple of a measured baseline. It bounds a
+# wedged-driver hang tightly: this collector runs
 # inside the sampler's background loop (see sys_stats.sampler), and
 # _query_compute_apps can attempt this call twice (UUID-aware query, then the
 # legacy fallback), so the timeout here directly caps how long one sampling
@@ -683,13 +684,19 @@ def get_dcgm_gpus(url: str) -> list[dict[str, Any]]:
 
     try:
         text = _fetch_dcgm_text(url)
+        # Parsing stays inside the guard: a malformed body -- a non-numeric
+        # ``gpu`` label, a truncated response -- is a failure of this
+        # endpoint like any network error, and this function documents that
+        # it never raises. sampler catches it too, but a contract that only
+        # holds because someone else also guards it is not a contract.
+        gpus = _parse_dcgm_metrics(text)
     except Exception as e:
         logger.warning(f"Error fetching DCGM GPU metrics from {url}: {e}")
         _dcgm_breaker.record_failure()
         return []
 
     _dcgm_breaker.record_success()
-    return _parse_dcgm_metrics(text)
+    return gpus
 
 
 def get_temperatures() -> list[dict[str, Any]]:
@@ -1041,11 +1048,12 @@ def get_ipmi_temperatures() -> list[dict[str, Any]]:
         # distinct instead of looking like a contradiction.
         entries.append({"n": f"ipmi/{name}", "c": round(celsius, 1)})
 
-    # Same rationale as get_ipmi_fans/get_temperatures: sensor enumeration
-    # order is not guaranteed stable across BMC firmware versions or
-    # reboots, and the wall panel renders this list positionally, so it is
-    # re-sorted on every single sample rather than trusted to already be
-    # ordered. Sorted on the prefixed name, applied before this sort and
+    # Same treatment as get_ipmi_fans, for the same reason: the wall panel
+    # renders this list positionally, so a stable order is part of the
+    # contract and sorting guarantees it whatever ipmitool hands back. We
+    # have no observation of this BMC's output order and no claim is made
+    # about it -- sorting is cheap enough that it does not need one.
+    # Sorted on the prefixed name, applied before this sort and
     # before concatenation with the hwmon list in
     # sys_stats.sampler._collect_panel_extras, never after either.
     entries.sort(key=lambda e: e["n"])
