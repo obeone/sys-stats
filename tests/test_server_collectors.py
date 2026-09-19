@@ -6,6 +6,7 @@ the degradation behaviour: a missing GPU or a dead Ollama must yield empty data,
 never an exception, because ``/stats`` has no other error channel.
 """
 
+import logging
 import subprocess
 
 import psutil
@@ -32,25 +33,31 @@ def _fake_run(stdout: str):
     return _run
 
 
-def _failing_run(stderr: str = "no devices"):
-    """Build a ``subprocess.run`` replacement raising ``CalledProcessError``."""
+def _failing_run(stderr: str = "no devices", cmd: str = "nvidia-smi"):
+    """Build a ``subprocess.run`` replacement raising ``CalledProcessError``.
+
+    ``cmd`` only names the binary in the raised exception, which is what ends
+    up in a failure report. It defaults to nvidia-smi because that is what
+    most callers here simulate; the IPMI collectors pass "ipmitool" so their
+    output does not claim a failure they did not have.
+    """
 
     def _run(*args, **kwargs):
-        raise subprocess.CalledProcessError(1, "nvidia-smi", stderr=stderr)
+        raise subprocess.CalledProcessError(1, cmd, stderr=stderr)
 
     return _run
 
 
-def _missing_binary_run():
+def _missing_binary_run(cmd: str = "nvidia-smi"):
     """Build a ``subprocess.run`` replacement raising ``FileNotFoundError``.
 
-    Simulates a host where the ``nvidia-smi`` binary is simply not installed
-    (no NVIDIA driver at all), as opposed to ``_failing_run`` which simulates
-    the binary existing but the command failing.
+    Simulates a host where the named binary is simply not installed (no NVIDIA
+    driver at all, or no ipmitool), as opposed to ``_failing_run`` which
+    simulates the binary existing but the command failing.
     """
 
     def _run(*args, **kwargs):
-        raise FileNotFoundError(2, "No such file or directory", "nvidia-smi")
+        raise FileNotFoundError(2, "No such file or directory", cmd)
 
     return _run
 
@@ -1053,6 +1060,174 @@ class TestGetIpmiTemperatures:
         monkeypatch.setattr(collectors.subprocess, "run", _fake_run("not sensor data\n"))
 
         assert collectors.get_ipmi_temperatures() == []
+
+
+def _ipmi_records_at_level(caplog: pytest.LogCaptureFixture, level: int) -> list[logging.LogRecord]:
+    """Return the ``collectors`` logger's captured records at exactly one level.
+
+    Filters out any record from an unrelated logger so counts stay accurate
+    even if another module happens to log during the same ``caplog`` window.
+    """
+    return [
+        record
+        for record in caplog.records
+        if record.name == collectors.logger.name and record.levelno == level
+    ]
+
+
+class TestIpmiFailureLogDamping:
+    """Regression tests for the IPMI failure-log damping fix.
+
+    Before the fix, ``_run_ipmitool_sdr_fan`` and ``_run_ipmitool_sdr_temperature``
+    called ``logger.error``/``logger.warning`` unconditionally on every failure.
+    Since the sampler polls both collectors on every pass regardless of hardware,
+    a machine with no BMC (the common case) produced two ERROR lines every
+    ``SYS_STATS_IPMI_INTERVAL`` seconds forever. The fix routes every failure
+    through ``_log_ipmi_failure``, which reports a given failure reason once at
+    its natural level and then at DEBUG for as long as it stays unchanged,
+    re-escalating on a changed reason or a recovery followed by a repeat
+    failure. Each test below asserts on record levels and counts only, never on
+    exact log text, so a later wording change cannot break the suite.
+    """
+
+    def setup_method(self) -> None:
+        """Clear damping state before each test, mirroring the DCGM breaker reset."""
+        collectors._reset_ipmi_failure_log_for_tests()
+
+    def teardown_method(self) -> None:
+        """Clear damping state after each test so it cannot leak into the next."""
+        collectors._reset_ipmi_failure_log_for_tests()
+
+    def test_repeated_identical_fan_failure_logs_error_once_then_debug(self, monkeypatch, caplog):
+        """Three consecutive identical failures produce exactly one ERROR record.
+
+        Regression guard: the pre-fix code logged ERROR unconditionally on
+        every call, which would have produced three ERROR records here instead
+        of one.
+        """
+        monkeypatch.setattr(collectors.subprocess, "run", _failing_run("no BMC support", cmd="ipmitool"))
+
+        with caplog.at_level(logging.DEBUG, logger=collectors.logger.name):
+            for _ in range(3):
+                assert collectors.get_ipmi_fans() == []
+
+        assert len(_ipmi_records_at_level(caplog, logging.ERROR)) == 1
+        assert len(_ipmi_records_at_level(caplog, logging.DEBUG)) == 2
+
+    def test_changed_failure_reason_reescalates_to_error(self, monkeypatch, caplog):
+        """A failure reason that changes after being damped logs ERROR again.
+
+        Sequence: same reason twice (damped on the second call), then a
+        different reason (must escalate). Regression guard: the pre-fix code
+        would log ERROR on all three calls, giving three ERROR records instead
+        of two.
+        """
+        with caplog.at_level(logging.DEBUG, logger=collectors.logger.name):
+            monkeypatch.setattr(
+                collectors.subprocess, "run", _failing_run("reason A", cmd="ipmitool")
+            )
+            assert collectors.get_ipmi_fans() == []
+            assert collectors.get_ipmi_fans() == []
+
+            monkeypatch.setattr(
+                collectors.subprocess, "run", _failing_run("reason B", cmd="ipmitool")
+            )
+            assert collectors.get_ipmi_fans() == []
+
+        assert len(_ipmi_records_at_level(caplog, logging.ERROR)) == 2
+
+    def test_recovery_between_identical_failures_reescalates_to_error(self, monkeypatch, caplog):
+        """A success between two identical failure streaks re-escalates the second streak.
+
+        Sequence: fail twice with the same reason (damped on the second),
+        succeed once (clearing the recorded failure), then fail twice more
+        with that same original reason (escalates again on the first of the
+        two, damped on the second). Regression guard: without
+        ``_clear_ipmi_failure`` running on the success path, the post-recovery
+        failures would stay damped and yield only one ERROR record instead of
+        two; the pre-fix code (no damping at all) would instead yield four.
+        """
+        with caplog.at_level(logging.DEBUG, logger=collectors.logger.name):
+            monkeypatch.setattr(
+                collectors.subprocess, "run", _failing_run("bmc unreachable", cmd="ipmitool")
+            )
+            assert collectors.get_ipmi_fans() == []
+            assert collectors.get_ipmi_fans() == []
+
+            monkeypatch.setattr(
+                collectors.subprocess,
+                "run",
+                _fake_run("FAN1             | 31h | ok  |  7.1 | 6300 RPM\n"),
+            )
+            assert collectors.get_ipmi_fans() == [{"n": "ipmi/FAN1", "rpm": 6300}]
+
+            monkeypatch.setattr(
+                collectors.subprocess, "run", _failing_run("bmc unreachable", cmd="ipmitool")
+            )
+            assert collectors.get_ipmi_fans() == []
+            assert collectors.get_ipmi_fans() == []
+
+        assert len(_ipmi_records_at_level(caplog, logging.ERROR)) == 2
+
+    def test_fan_and_temperature_failures_are_damped_independently(self, monkeypatch, caplog):
+        """A fan failure must not damp a temperature failure carrying the same message.
+
+        Sequence: temperature fails twice with one reason (damped on the
+        second), then fan fails once with that identical reason text. Because
+        the two sensor kinds are tracked under separate keys, the fan failure
+        must still log at ERROR. Regression guard: a single dict keyed only by
+        message (collapsing the two sensor kinds) would wrongly damp the fan
+        failure to DEBUG, and the pre-fix code (no damping at all) would yield
+        three ERROR records instead of two.
+        """
+        monkeypatch.setattr(
+            collectors.subprocess, "run", _failing_run("shared reason", cmd="ipmitool")
+        )
+
+        with caplog.at_level(logging.DEBUG, logger=collectors.logger.name):
+            assert collectors.get_ipmi_temperatures() == []
+            assert collectors.get_ipmi_temperatures() == []
+            assert collectors.get_ipmi_fans() == []
+
+        assert len(_ipmi_records_at_level(caplog, logging.ERROR)) == 2
+
+    def test_timeout_logs_warning_not_error_and_is_damped_on_repeat(self, monkeypatch, caplog):
+        """A wedged BMC logs WARNING, never ERROR, and repeats are damped the same way.
+
+        Regression guard: damping must not promote severity, so the first
+        timeout must stay at WARNING; and the pre-fix code logged WARNING
+        unconditionally on every call, which would have produced two WARNING
+        records here instead of one.
+        """
+        monkeypatch.setattr(collectors.subprocess, "run", _timeout_run(cmd="ipmitool"))
+
+        with caplog.at_level(logging.DEBUG, logger=collectors.logger.name):
+            assert collectors.get_ipmi_fans() == []
+            assert collectors.get_ipmi_fans() == []
+
+        assert _ipmi_records_at_level(caplog, logging.ERROR) == []
+        assert len(_ipmi_records_at_level(caplog, logging.WARNING)) == 1
+        assert len(_ipmi_records_at_level(caplog, logging.DEBUG)) == 1
+
+    def test_missing_ipmitool_binary_is_damped_like_any_other_failure(self, monkeypatch, caplog):
+        """The production case that motivated the fix: no BMC, ``ipmitool`` absent entirely.
+
+        This is the everyday scenario the fix targets: a container without
+        ``/dev/ipmi0``, a laptop, or a VM, where ``ipmitool`` is not even
+        installed. Repeated calls must log ERROR once and then DEBUG.
+        Regression guard: the pre-fix code logged ERROR unconditionally on
+        every call, which is exactly the ~5,700-lines-a-day flood this fix
+        eliminates; it would have produced three ERROR records here instead
+        of one.
+        """
+        monkeypatch.setattr(collectors.subprocess, "run", _missing_binary_run(cmd="ipmitool"))
+
+        with caplog.at_level(logging.DEBUG, logger=collectors.logger.name):
+            for _ in range(3):
+                assert collectors.get_ipmi_fans() == []
+
+        assert len(_ipmi_records_at_level(caplog, logging.ERROR)) == 1
+        assert len(_ipmi_records_at_level(caplog, logging.DEBUG)) == 2
 
 
 class TestGetSwap:

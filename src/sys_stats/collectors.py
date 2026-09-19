@@ -35,9 +35,11 @@ def get_top_processes_by_cpu(limit: int = 5) -> list[dict[str, Any]]:
         try:
             # ``process_iter`` does not raise for attributes it cannot read: it
             # fills them with None. That is the common case for root-owned
-            # processes when the server runs unprivileged (macOS, container
-            # without `pid: host` + `privileged`), and sorting None against a
-            # float would blow up the whole endpoint.
+            # processes when the server cannot see them at all (macOS, or a
+            # container started without `pid: host`), and sorting None against
+            # a float would blow up the whole endpoint. Note that privilege is
+            # not the missing ingredient in the container case: /proc is
+            # world-readable, so the host PID namespace alone is enough.
             processes.append({
                 "pid": p.info["pid"],
                 "name": p.info["name"],
@@ -786,6 +788,68 @@ def get_fans() -> list[dict[str, Any]]:
     return entries
 
 
+# Last failure reason reported by each IPMI collector, keyed by sensor kind.
+#
+# The sampler calls both IPMI collectors on its very first pass and every
+# SYS_STATS_IPMI_INTERVAL seconds after that, whatever the hardware. A machine
+# with no BMC is therefore not an edge case, it is the common one: every
+# container without /dev/ipmi0 passed in, every laptop, every VM. Logging each
+# failure at ERROR turned that into two lines every 30s forever, around 5,700 a
+# day, which buries the errors that do deserve attention.
+#
+# So a failure is reported once at its natural level, then at DEBUG for as long
+# as the reason is unchanged, and escalates again the moment the reason changes
+# or the sensor starts answering. Only the sampler's background thread touches
+# this dict, so it needs no lock.
+_ipmi_last_failure: dict[str, str] = {}
+
+
+def _log_ipmi_failure(sensor: str, message: str, level: int = logging.ERROR) -> None:
+    """Report an IPMI collector failure without flooding the log.
+
+    Parameters
+    ----------
+    sensor : str
+        Which collector failed, ``"fan"`` or ``"temperature"``. The two are
+        tracked apart on purpose: a BMC can answer one ``sdr type`` query and
+        fail the other, and collapsing them would hide the second failure
+        behind the first.
+    message : str
+        The failure reason. It is both the logged text and the identity of the
+        failure: an unchanged reason is a repeat, a different one is a new
+        condition that deserves a line of its own.
+    level : int, optional
+        Level for the first report of a given reason. Defaults to
+        ``logging.ERROR``; a timeout passes ``logging.WARNING`` so that
+        damping the volume does not also promote its severity.
+    """
+    if _ipmi_last_failure.get(sensor) == message:
+        logger.debug(f"IPMI {sensor} sensors still failing, unchanged: {message}")
+        return
+
+    _ipmi_last_failure[sensor] = message
+    logger.log(level, f"Error fetching IPMI {sensor} sensors: {message}")
+
+
+def _clear_ipmi_failure(sensor: str) -> None:
+    """Forget a collector's last failure, so the next one logs in full again.
+
+    Called on every successful ``ipmitool`` call. A BMC that recovers and then
+    breaks again the same way is a new incident, not a continuation of the old
+    one, and deserves to be reported as such.
+    """
+    _ipmi_last_failure.pop(sensor, None)
+
+
+def _reset_ipmi_failure_log_for_tests() -> None:
+    """Forget every recorded IPMI failure. Test-only.
+
+    Same purpose as :func:`_reset_dcgm_breaker_for_tests`: without it, one
+    test's induced failure would damp the next test's first log line.
+    """
+    _ipmi_last_failure.clear()
+
+
 def _run_ipmitool_sdr_fan(timeout: float = 5.0) -> str | None:
     """Ask ``ipmitool`` for the chassis fan sensors over IPMI.
 
@@ -821,17 +885,18 @@ def _run_ipmitool_sdr_fan(timeout: float = 5.0) -> str | None:
             timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error fetching IPMI fan sensors: {e.stderr.strip()}")
+        _log_ipmi_failure("fan", e.stderr.strip())
         return None
     except FileNotFoundError as e:
         # ``ipmitool`` is not installed at all, as opposed to installed but
         # failing (CalledProcessError) or hanging (TimeoutExpired).
-        logger.error(f"Error fetching IPMI fan sensors: {e}")
+        _log_ipmi_failure("fan", str(e))
         return None
     except subprocess.TimeoutExpired as e:
-        logger.warning(f"Timed out waiting for IPMI fan sensors: {e}")
+        _log_ipmi_failure("fan", f"timed out: {e}", level=logging.WARNING)
         return None
 
+    _clear_ipmi_failure("fan")
     return result.stdout
 
 
@@ -944,17 +1009,18 @@ def _run_ipmitool_sdr_temperature(timeout: float = 5.0) -> str | None:
             timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error fetching IPMI temperature sensors: {e.stderr.strip()}")
+        _log_ipmi_failure("temperature", e.stderr.strip())
         return None
     except FileNotFoundError as e:
         # ``ipmitool`` is not installed at all, as opposed to installed but
         # failing (CalledProcessError) or hanging (TimeoutExpired).
-        logger.error(f"Error fetching IPMI temperature sensors: {e}")
+        _log_ipmi_failure("temperature", str(e))
         return None
     except subprocess.TimeoutExpired as e:
-        logger.warning(f"Timed out waiting for IPMI temperature sensors: {e}")
+        _log_ipmi_failure("temperature", f"timed out: {e}", level=logging.WARNING)
         return None
 
+    _clear_ipmi_failure("temperature")
     return result.stdout
 
 
