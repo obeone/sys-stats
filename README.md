@@ -55,6 +55,12 @@ Ensure you have the following installed on your system:
     docker compose up -d
     ```
 
+    - **With IPMI Sensors (servers with a BMC, e.g. Supermicro or Dell):**
+
+    ```bash
+    docker compose -f compose.yaml -f compose.ipmi.yaml up -d
+    ```
+
    The service will be running at `http://localhost:5000`.
 
 ### ☸️ Running on Kubernetes
@@ -68,8 +74,9 @@ helm upgrade --install sys-stats ./chart --namespace monitoring --create-namespa
 ```
 
 The dashboard reports on the node the pod lands on, so the chart defaults to the
-host PID namespace and a privileged container — the process tables are empty
-without them. Pin the pod to the machine you actually want to watch, claim a GPU
+host PID namespace: the process tables are empty without it. The container itself
+runs unprivileged: that alone is enough for the process, temperature and fan
+panels. Pin the pod to the machine you actually want to watch, claim a GPU
 if you want the NVIDIA panels, and point `OLLAMA_API_URL` somewhere for the
 Ollama one. [`chart/README.md`](chart/README.md) has the values for all three.
 
