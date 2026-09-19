@@ -109,12 +109,44 @@ controllers:
           # per-pass cadence.
           # SYS_STATS_IPMI_INTERVAL: "30.0"
 
+        # Nothing this dashboard reads needs a privileged container. hostPID
+        # above gives the process tables the host's /proc, which is
+        # world-readable, so the image's UID 10001 sees every process with its
+        # name, command line and memory intact. /sys is mounted read-only into
+        # every container, which is all psutil needs for the hwmon temperature
+        # and fan sensors. nvidia-smi and the driver libraries are injected by
+        # the NVIDIA container runtime against the nvidia.com/gpu resource
+        # claimed below, which is a device allocation, not a privilege.
         securityContext:
-          # nvidia-smi and the host's /proc both need more than the image's
-          # unprivileged user gets by default. Dropping this is worth trying
-          # on a CPU-only node: the CPU, RAM and process panels survive it,
-          # the GPU ones generally do not.
-          privileged: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+
+          # The IPMI exception. The two ipmi/-prefixed sensor collectors talk
+          # to the node's BMC through /dev/ipmi0, and Kubernetes has no
+          # per-device request for it: a hostPath char device is still denied
+          # by the device cgroup unless the container is privileged, and the
+          # node's device node is root-owned. So enabling IPMI here means
+          # giving back everything the three lines above take away, on a pod
+          # that already runs in the host PID namespace.
+          #
+          # That trade is worth making only on a bare-metal node whose fans
+          # are invisible to hwmon. Uncomment all four lines together, plus the
+          # matching volume below, or leave IPMI off and accept two empty
+          # lists in /panel:
+          #
+          # privileged: true
+          # runAsUser: 0
+          # allowPrivilegeEscalation: true   # replaces the false above
+          #
+          # persistence:
+          #   ipmi:
+          #     type: hostPath
+          #     hostPath: /dev/ipmi0
+          #     hostPathType: CharDevice
+          #     globalMounts:
+          #       - path: /dev/ipmi0
 
         resources:
           requests:
