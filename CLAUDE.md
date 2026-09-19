@@ -155,8 +155,26 @@ a `1.3.0` tree fails instead of publishing an image whose tag lies.
 
 ## Deployment constraints worth knowing
 
-- The container needs `pid: host` and `privileged: true` (see [compose.yaml](compose.yaml))
-  to see the host's processes — process listings are meaningless without it.
+- `pid: host` (see [compose.yaml](compose.yaml)) is necessary and sufficient for the
+  process tables: /proc is world-readable, so the image's unprivileged UID 10001
+  sees every process complete, name, command line and memory alike. The same holds
+  for hwmon temperature and fan sensors (/sys is mounted read-only into every
+  container by default) and for the GPU panels (the NVIDIA container runtime
+  injects nvidia-smi and the driver libraries against the `compute`/`utility`
+  capabilities reservation, independent of any privilege bit). None of that needs
+  `privileged: true`.
+- IPMI is the one exception. The two `ipmi/`-prefixed collectors reach the BMC
+  through `/dev/ipmi0`, a root:root 0600 character device a normal container has
+  no entry for, so they need the device mapped in plus root, or the device's
+  group, to open it. `compose.ipmi.yaml` is the opt-in overlay for that
+  (`docker compose -f compose.yaml -f compose.ipmi.yaml up -d`). Kubernetes has no
+  per-device request, so `chart/values.yaml`'s commented IPMI block falls back to
+  `privileged: true` plus `runAsUser: 0` plus a hostPath CharDevice volume instead.
+- `ipmitool` is now an unconditional Dockerfile dependency (see
+  [Dockerfile](Dockerfile)): the sampler calls the two IPMI collectors on its
+  first pass regardless of hardware, so without the binary they raise
+  `FileNotFoundError` and degrade to an empty list on every machine, not only
+  ones without a BMC.
 - The CI matrix targets `linux/amd64,linux/arm64` only. It used to also carry `i386`
   and `arm/v7`; those were dropped in 1.2.0, and `1.1.0` is the last tag that carries
   all four — it stays published as-is. Adding a platform back means re-checking
