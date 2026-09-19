@@ -42,6 +42,26 @@ LABEL org.opencontainers.image.title="sys-stats" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.authors="obeone <obeone@obeone.org>"
 
+# ipmitool is the only runtime dependency that is not a Python package. The two
+# ipmi/-prefixed sensor collectors shell out to it, and the sampler calls them
+# on its very first pass whatever the hardware, so without the binary they do
+# not "stay unused" on a machine with no BMC: they raise FileNotFoundError and
+# degrade to an empty list, every single poll. Reaching an actual BMC needs the
+# host's IPMI character device passed in on top (see compose.ipmi.yaml); the
+# binary alone is inert but cheap, which is why it ships unconditionally rather
+# than behind a build argument that would double the image matrix.
+#
+# nvidia-smi is deliberately NOT installed: the NVIDIA container runtime injects
+# it, along with the driver libraries it has to match. Shipping our own copy
+# would pin a driver version the host does not necessarily run.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ipmitool
+
 # High UID/GID to stay clear of host users mapped into the container.
 RUN groupadd -r -g 10001 stats && \
     useradd -r -u 10001 -g stats -d /app -m stats
