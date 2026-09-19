@@ -7,10 +7,30 @@ services:
     ports:
       - "5000:5000"
     environment:
-      OLLAMA_API_URL: "http://localhost:11434"
+      # pid: host does not share the host's network namespace, so "localhost"
+      # here would be this container, not the machine running Ollama. The
+      # host-gateway alias below is what actually reaches it.
+      OLLAMA_API_URL: "http://host.docker.internal:11434"
 
-    # Both are required for the process listing to mean anything: pid: host
-    # exposes the host's /proc, privileged lets the container actually read it
-    # (and reach the NVIDIA devices when compose.gpu.yaml is layered on top).
+    # Docker Desktop resolves host.docker.internal on its own; on plain Linux
+    # Docker it only exists if it is mapped, which is what this does.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # This is the single setting that makes the process tables mean anything:
+    # without the host PID namespace they list exactly one process, the
+    # server's own.
+    #
+    # It is also the only one needed. The container runs unprivileged, as
+    # UID 10001, and still reads everything the dashboard shows: /proc is
+    # world-readable, so the process tables are complete (names, command
+    # lines and memory alike), and /sys is already mounted read-only in every
+    # container, which is all psutil needs for the hwmon temperature and fan
+    # sensors. NVIDIA devices come from the container runtime when
+    # compose.gpu.yaml is layered on top, not from a privilege bit.
+    #
+    # The one collector that does need more is IPMI, because it talks to a
+    # character device a normal container has no entry for. That is what
+    # compose.ipmi.yaml adds, and it is opt-in precisely so the default here
+    # can stay unprivileged.
     pid: host
-    privileged: true

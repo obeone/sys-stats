@@ -1,0 +1,39 @@
+# Overlay for a host with a BMC, layered on top of compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.ipmi.yaml up -d
+#
+# It fills the two ipmi/-prefixed entries in the /panel payload's temps and
+# fans lists. Without it those two collectors run, fail to open the device and
+# degrade to an empty list, which is the correct behaviour on the vast majority
+# of machines: consumer hardware and virtual machines have no BMC to ask.
+#
+# Chassis that report their fans only over IPMI and not through hwmon are the
+# reason this exists (Supermicro and Dell server boards, in particular). Check
+# before bothering: `ipmitool sdr type fan` on the host either lists sensors or
+# it does not, and this overlay cannot conjure a BMC that is not there.
+services:
+  sys-stats:
+    # The OpenIPMI character device the kernel's ipmi_si/ipmi_devintf modules
+    # create. If it is missing on the host, load them (`modprobe ipmi_devintf`)
+    # rather than expecting this file to work; Compose fails the container
+    # outright when a listed device does not exist.
+    devices:
+      - /dev/ipmi0:/dev/ipmi0
+
+    # The one place in this project where root is the right answer, and the
+    # reason it is confined to an overlay instead of being the default.
+    #
+    # /dev/ipmi0 is root:root 0600 on every distribution that ships it, and the
+    # image runs as UID 10001. Mapping the device in is not enough: the
+    # unprivileged user cannot open it, so the collectors keep returning an
+    # empty list and the only symptom is a panel that stays blank.
+    #
+    # If the host gives the device a group instead (a udev rule setting it to
+    # root:ipmi 0660, say), prefer keeping the unprivileged user and granting
+    # that group's numeric GID here instead of this line:
+    #
+    #   group_add: ["<gid of the device's group>"]
+    #
+    # That is strictly better than running as root, but it depends on host
+    # configuration this file cannot assume.
+    user: "0:0"
