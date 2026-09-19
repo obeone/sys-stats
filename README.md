@@ -1,63 +1,162 @@
-# 📊 Sys-Stats Dashboard ✨
+# 📊 sys-stats
 
-Welcome to the **Sys-Stats Dashboard**! This project is designed to monitor and visualize system performance in real-time through a sleek and interactive dashboard. Whether you're interested in CPU, RAM, or GPU usage, this tool provides comprehensive insights at your fingertips. 
+![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Ready-blue?logo=docker&logoColor=white)
+![Helm](https://img.shields.io/badge/Helm-Chart-0F1689?logo=helm&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
+[![CI](https://github.com/obeone/sys-stats/actions/workflows/build-and-publish.yaml/badge.svg)](https://github.com/obeone/sys-stats/actions/workflows/build-and-publish.yaml)
 
-## 🎢 Features
+Real-time system, GPU and Ollama monitoring for a single machine, with a web
+dashboard, a terminal dashboard, and a compact JSON endpoint for an embedded
+wall display.
 
-- **Real-time Monitoring**: Get instant updates on system metrics such as CPU load, memory usage, GPU stats, and essential processes.
-  
-- **Interactive Dashboards**: Use the web-based or command-line interface for intuitive dashboards, allowing detailed insights into system behavior.
-  
-- **Cross-Platform Support**: Deployed using Docker, ensuring consistency and easy setup across different operating environments.
-  
-- **Customizable Refresh Rates**: Adapt the monitoring frequency to suit your needs, enabling faster updates or conserving resources when needed.
+One process collects everything (CPU, RAM, swap, load, per-core usage,
+temperatures, fans, NVIDIA GPUs, per-process CPU/RAM/VRAM, loaded Ollama
+models) in a background sampler and serves it over HTTP. The terminal
+dashboard is a client of that API, not a second collector, so you can watch a
+remote host from your laptop.
 
-- **Ollama API Integration**: Out-of-the-box compatibility with the Ollama API for additional system-specific metrics and insights.
+---
 
-## 🎆 Screenshots
+## 🚀 Features
 
-![Web Dashboard](https://raw.githubusercontent.com/obeone/sys-stats/main/docs/web.png)
-![CLI Dashboard](https://raw.githubusercontent.com/obeone/sys-stats/main/docs/cli.png)
+| Feature | What it does |
+| --- | --- |
+| 🖥️ Web dashboard | Auto-refreshing UI at `/`, no build step and no JS dependencies |
+| 📺 Terminal dashboard | Rich TUI with focus, zoom, scrolling and adjustable refresh |
+| 🎮 GPU monitoring | Load, VRAM, temperature, fan speed, power draw, per-process VRAM |
+| 🤖 Ollama integration | Loaded models with their VRAM footprint and context window |
+| 🌡️ Sensors | hwmon temperatures and fans, plus IPMI sensors on chassis with a BMC |
+| 📟 Embedded panel | `/panel`, a frozen-schema payload sized for an ESP32-S3 wall display |
+| 🐳 Deployment | Multi-arch image, Compose overlays, and a Helm chart for Kubernetes |
 
-## 🚀 Getting Started
+---
 
-Ready to get your Sys-Stats Dashboard up and running? Follow these steps:
+## ⚡ Quickstart
 
-### 🐳 Running with Docker
+```bash
+docker run -d --pid=host -p 5000:5000 ghcr.io/obeone/sys-stats:1.5.0
+```
 
-#### Requirements
+Open <http://localhost:5000>.
 
-Ensure you have the following installed on your system:
+`--pid=host` is what makes the process tables meaningful. Without it the
+container sees exactly one process, its own. No privileged flag is needed.
 
-- Docker 🐳
-- NVIDIA drivers (if you want GPU monitoring) 🎮
+On macOS, port 5000 belongs to the AirPlay Receiver. Publish on another port
+(`-p 5051:5000`) or turn AirPlay off.
 
-#### Installation
+---
 
-1. **Clone the Repository:**
+## 🖼️ Screenshots
 
-   ```bash
-   git clone https://github.com/obeone/sys-stats.git
-   cd sys-stats
-   `````
+![Web dashboard](https://raw.githubusercontent.com/obeone/sys-stats/main/docs/web.png)
 
-1. **Running the System:**
+![CLI dashboard](https://raw.githubusercontent.com/obeone/sys-stats/main/docs/cli.png)
 
-    - **With nvidia GPU Support:**
+---
 
-    ```bash
-    docker compose -f compose.yaml -f compose.gpu.yaml up -d
-    ```
+## 📦 Installation
 
-    - **Without nvidia GPU Support:**
-  
-    ```bash
-    docker compose up -d
-    ```
+Two console scripts come with the package, whichever way you install it:
 
-   The service will be running at `http://localhost:5000`.
+| Command | Purpose |
+| --- | --- |
+| `sys-stats-server` | Flask metrics API and web UI, serves `/`, `/stats` and `/panel` |
+| `sys-stats` | Rich terminal dashboard, an HTTP client of `/stats` |
 
-### ☸️ Running on Kubernetes
+`python -m sys_stats` is an alias for the CLI.
+
+### With uv (recommended)
+
+[`uv`](https://docs.astral.sh/uv/) is the fastest option and keeps the tool in
+its own environment:
+
+```bash
+uv tool install git+https://github.com/obeone/sys-stats.git
+```
+
+Upgrade with `uv tool upgrade sys-stats`, remove with
+`uv tool uninstall sys-stats`. To run it once without installing anything
+permanent:
+
+```bash
+uvx --from git+https://github.com/obeone/sys-stats.git sys-stats
+```
+
+### With pipx
+
+```bash
+pipx install git+https://github.com/obeone/sys-stats.git
+```
+
+Upgrade with `pipx upgrade sys-stats`, remove with `pipx uninstall sys-stats`.
+
+### With pip
+
+> ⚠️ **Do not run `pip install sys-stats`.** That name belongs to a different,
+> unrelated project on PyPI, which also describes itself as serving system
+> stats over a web interface, so installing it by mistake looks like success.
+> This project is not published on PyPI under any name. Install it from git or
+> from a checkout.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install git+https://github.com/obeone/sys-stats.git
+```
+
+### From a local checkout, for development
+
+```bash
+git clone https://github.com/obeone/sys-stats.git
+cd sys-stats
+uv venv && source .venv/bin/activate
+uv pip install -e '.[dev]'
+```
+
+---
+
+## 🐳 Docker
+
+```bash
+git clone https://github.com/obeone/sys-stats.git
+cd sys-stats
+docker compose up -d
+```
+
+Overlays layer on top of `compose.yaml` for hardware the default cannot reach:
+
+| Command | When |
+| --- | --- |
+| `docker compose up -d` | Any host. CPU, RAM, processes, hwmon sensors |
+| `docker compose -f compose.yaml -f compose.gpu.yaml up -d` | NVIDIA GPU, through the NVIDIA container runtime |
+| `docker compose -f compose.yaml -f compose.ipmi.yaml up -d` | Server with a BMC (Supermicro, Dell) for IPMI sensors |
+
+Images are published on every release to `ghcr.io/obeone/sys-stats` and
+`docker.io/obeoneorg/sys-stats`, for `linux/amd64` and `linux/arm64`, and
+signed with cosign.
+
+### What the container needs, and what it does not
+
+The container runs unprivileged, as UID 10001, and that is enough for
+everything except IPMI:
+
+| Collector | Requirement |
+| --- | --- |
+| Processes, CPU, RAM, swap, load | `pid: host`. `/proc` is world-readable |
+| hwmon temperatures and fans | Nothing. `/sys` is already mounted read-only |
+| NVIDIA GPU | The NVIDIA container runtime, via `compose.gpu.yaml` |
+| IPMI temperatures and fans | `/dev/ipmi0` mapped in, and root to open it |
+
+`/dev/ipmi0` is `root:root 0600` on every distribution that ships it, so
+`compose.ipmi.yaml` runs as root. Where host udev rules give the device a
+group, prefer `group_add` with that GID and keep the unprivileged user; the
+overlay documents both.
+
+---
+
+## ☸️ Kubernetes
 
 [`chart/`](chart/) is a Helm chart built on the
 [bjw-s common library](https://github.com/bjw-s-labs/helm-charts):
@@ -67,228 +166,99 @@ helm dependency update chart/
 helm upgrade --install sys-stats ./chart --namespace monitoring --create-namespace
 ```
 
-The dashboard reports on the node the pod lands on, so the chart defaults to the
-host PID namespace and a privileged container — the process tables are empty
-without them. Pin the pod to the machine you actually want to watch, claim a GPU
-if you want the NVIDIA panels, and point `OLLAMA_API_URL` somewhere for the
-Ollama one. [`chart/README.md`](chart/README.md) has the values for all three.
+The dashboard reports on the node the pod lands on, so the chart defaults to
+`hostPID: true`, without which the process tables are empty. The container
+itself runs unprivileged, with `capabilities.drop: [ALL]`.
 
-### 📦 Installing as a CLI
+Pin the pod to the machine you actually want to watch, claim a GPU if you want
+the NVIDIA panels, and point `OLLAMA_API_URL` somewhere for the Ollama one.
+[`chart/values.yaml`](chart/values.yaml) documents all three, along with the
+commented block for IPMI, which does need a privileged pod on Kubernetes since
+there is no per-device request for a BMC.
 
-Sys-Stats is a proper Python package, so any standard Python installer puts the
-commands on your `PATH`. Pick the one you already use.
+---
 
-Whichever method you choose, you get two console scripts:
+## ⚙️ Configuration
 
-| Command            | Purpose                                            |
-| ------------------ | -------------------------------------------------- |
-| `sys-stats`        | The Rich terminal dashboard (client).              |
-| `sys-stats-server` | The Flask metrics API + web UI (serves `/stats` and `/panel`). |
+Everything is an environment variable. Nothing is required.
 
-#### With uv (recommended)
+### Server
 
-[`uv`](https://docs.astral.sh/uv/) is the fastest option and isolates the tool
-in its own environment:
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `HOST` / `PORT` | `0.0.0.0:5000` | Bind address |
+| `FLASK_DEBUG` | `false` | `true` enables Flask debug mode |
+| `OLLAMA_API_URL` | unset | Enables the Ollama panel; unset means an empty model list, never an error |
+| `SYS_STATS_INSTANCE_LABEL` | unset | Free-text label in the web UI title and body |
+| `SYS_STATS_PANEL_ONLY` | unset | `1`/`true`/`yes` registers only `/panel` |
 
-```bash
-# Install straight from the repository...
-uv tool install git+https://github.com/obeone/sys-stats.git
+### Sampler
 
-# ...or from a local checkout
-git clone https://github.com/obeone/sys-stats.git
-uv tool install ./sys-stats
-```
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SYS_STATS_SAMPLE_INTERVAL` | `2.0` | Seconds between samples |
+| `SYS_STATS_TOP_PROCESSES_MAX` | `50` | Cap per per-process ranking |
+| `SYS_STATS_IPMI_INTERVAL` | `30.0` | Seconds between `ipmitool` polls |
+| `SYS_STATS_DCGM_URL` | unset | Scrape `/panel`'s GPUs from dcgm-exporter |
+| `SYS_STATS_AUTOSTART` | on | `0`/`false`/`no` skips the sampler autostart |
 
-Upgrade later with `uv tool upgrade sys-stats`, remove with
-`uv tool uninstall sys-stats`.
+### Panel
 
-To run the dashboard once without installing anything permanent:
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SYS_STATS_HOSTNAME` | real hostname | Overrides `/panel`'s `host` field |
+| `SYS_STATS_PANEL_MAX_TEMPS` | no cap | Truncates `/panel`'s `temps` list |
+| `SYS_STATS_PANEL_MAX_FANS` | no cap | Truncates `/panel`'s `fans` list |
+| `SYS_STATS_PANEL_MAX_GPUS` | no cap | Truncates `/panel`'s `gpu` list |
 
-```bash
-uvx --from git+https://github.com/obeone/sys-stats.git sys-stats
-```
+### CLI
 
-Building the distributable artifacts from a checkout is `uv build`, which drops
-a wheel and an sdist in `dist/`.
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SYS_STATS_API_URL` | `http://localhost:5000/stats` | Default `--url` |
 
-#### With pipx
+### The ones with a real story behind them
 
-[`pipx`](https://pipx.pypa.io/) also installs the CLI in a dedicated virtual
-environment, keeping it isolated from your system Python:
+**`SYS_STATS_PANEL_ONLY` is security-relevant.** `/stats` exposes the full
+host process table, complete command lines included, with no authentication.
+Set this and `/`, `/stats` and `/favicon.png` are never registered at all, so
+a request gets Flask's own 404 rather than a guarded rejection. On a host
+whose network you do not fully trust, and where the consumer only ever needs
+`/panel`, removing the route beats guarding it. The Helm chart's default
+probes hit `/`, so enabling this there means repointing them at `/panel`.
 
-```bash
-# From the repository...
-pipx install git+https://github.com/obeone/sys-stats.git
+**`SYS_STATS_HOSTNAME` and `SYS_STATS_INSTANCE_LABEL` are not the same thing**
+and are never merged. The label is display prose, meant to be rewritten for
+readability, for telling apart two instances describing the same physical box
+(a Kubernetes pod seeing the Talos VM, and a second instance on the Proxmox
+hypervisor underneath). The hostname is a machine identity a consumer compares
+byte for byte, `/panel` only, and otherwise read fresh on every request so a
+runtime rename takes effect without a restart.
 
-# ...or from a local checkout
-pipx install ./sys-stats
-```
+**`SYS_STATS_DCGM_URL` is for a host with no NVIDIA driver of its own**, such
+as a Proxmox hypervisor whose GPUs are PCI-passed-through to a Kubernetes VM
+where [dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) runs instead.
+It is scraped in the same sampling pass as everything else, behind a circuit
+breaker, so a dead or firewalled endpoint degrades to an empty `gpu[]` with a
+`"gpu"` tag in `err` rather than stalling the sampler. `/stats` never reads
+it and always stays on the GPUtil path.
 
-Upgrade with `pipx upgrade sys-stats`, remove with `pipx uninstall sys-stats`.
+**`SYS_STATS_IPMI_INTERVAL` is decoupled from the sample interval** because
+chassis fan speed and temperature move on a timescale of tens of seconds, and
+each poll costs a BMC round trip. Between polls the lists keep serving the
+last IPMI reading rather than dropping it; the first pass after startup always
+polls immediately. hwmon sensors keep the normal per-pass cadence.
 
-#### With pip
+---
 
-> **Do not run `pip install sys-stats`.** That name belongs to a different,
-> unrelated project on PyPI, and it happens to describe itself as serving
-> system stats over a web interface too — so installing it by mistake looks
-> like success. This project is not published on PyPI under any name; install
-> it from git or from a checkout, as below.
-
-Plain `pip` works too — ideally inside a virtual environment so it doesn't
-pollute your system packages:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate          # On Windows: .venv\Scripts\activate
-
-# From the repository...
-pip install git+https://github.com/obeone/sys-stats.git
-
-# ...or from a local checkout
-pip install ./sys-stats
-```
-
-With this method the `sys-stats` and `sys-stats-server` commands are available
-whenever the virtual environment is activated.
-
-### ⚙️ Running Without Docker
-
-#### Prerequisites
-
-- **Python 3.10+**
-- **NVIDIA drivers**: for GPU monitoring (optional).
-
-#### Setup Instructions
-
-1. **Install the package** (see [Installing as a CLI](#-installing-as-a-cli))
-   or, for development, in an editable virtual environment:
-
-   ```bash
-   git clone https://github.com/obeone/sys-stats.git
-   cd sys-stats
-   uv venv && source .venv/bin/activate
-   uv pip install -e '.[dev]'
-   ```
-
-   The `[dev]` extra adds `pytest` and `ruff`. Run the checks with:
-
-   ```bash
-   pytest
-   ruff check .
-   ```
-
-   Note for macOS: port 5000 is used by AirPlay Receiver, so start the server
-   with `PORT=5051 sys-stats-server` if you don't want to disable it.
-
-2. **Configure environment variables (optional):**
-
-   To enable Ollama metrics, point the server at your Ollama instance:
-
-   ```bash
-   export OLLAMA_API_URL="http://localhost:11434"
-   ```
-
-3. **Start the server:**
-
-   ```bash
-   sys-stats-server
-   ```
-
-   The application starts on `http://localhost:5000`. It honours the `HOST`,
-   `PORT` and `FLASK_DEBUG` environment variables.
-
-   A background sampler thread, not each request, collects the metrics; it
-   starts as soon as the server module is imported, so any WSGI entry point
-   works, not just `sys-stats-server`. Set `SYS_STATS_AUTOSTART` to `0`,
-   `false` or `no` to skip that autostart (default on — this is for
-   embedding the module without a live sampler, not something a normal
-   deployment needs to touch).
-   `SYS_STATS_SAMPLE_INTERVAL` sets how many seconds it waits between
-   samples (default `2.0`), and `SYS_STATS_TOP_PROCESSES_MAX` caps how many
-   entries it collects per per-process ranking (default `50`) — a `?limit=`
-   above that cap only returns what was already sampled.
-
-4. **`/panel` (optional):** a compact, frozen-schema endpoint built for a
-   small embedded display (an ESP32-S3 wall panel, in particular) polling
-   every few seconds — no process lists, no Ollama data, just CPU/RAM/swap/
-   GPU/sensor numbers plus an `age` in seconds telling the display how stale
-   the sample is. It shares the same background sampling pass as `/stats`,
-   so enabling it costs nothing extra in `nvidia-smi` calls. Three optional
-   caps truncate its lists for a display with limited room:
-   `SYS_STATS_PANEL_MAX_TEMPS`, `SYS_STATS_PANEL_MAX_FANS` and
-   `SYS_STATS_PANEL_MAX_GPUS` — each unset by default, meaning no cap.
-
-5. **`SYS_STATS_PANEL_ONLY` (optional, security-relevant):** set to `1`,
-   `true` or `yes` to register only the `/panel` route: `/`, `/stats` and
-   `/favicon.png` are never registered at all, so a request to them gets
-   Flask's own 404 rather than a guarded rejection. `/stats` exposes the
-   full host process table, complete command lines included, with no
-   authentication; on a host you do not fully trust the network of (a
-   hypervisor on a LAN whose guest WiFi shares a VLAN with the main
-   network, say), and where the wall-display consumer only ever needs
-   `/panel`, removing the route beats guarding it. Default is off: unset
-   registers every route exactly as before this flag existed. Note that the
-   Helm chart's default liveness/readiness/startup probes hit `/`, so
-   enabling this in the chart means repointing them at `/panel` too (see
-   `chart/values.yaml`).
-
-6. **`SYS_STATS_INSTANCE_LABEL` (optional):** a free-text label shown in the
-   web UI's page title and body, for telling apart two instances that would
-   otherwise look identical, such as a Kubernetes pod seeing the Talos VM
-   next to a second instance running on the Proxmox hypervisor underneath
-   it, both named "sys-stats" and both describing the same physical box.
-   Unset (default) renders the page exactly as before this variable
-   existed.
-
-7. **`SYS_STATS_HOSTNAME` (optional):** overrides the `host` field of the
-   `/panel` payload, which otherwise carries `socket.gethostname()`, read
-   fresh on every request so a runtime rename (`hostnamectl set-hostname`)
-   takes effect without a restart. Useful where the process's own hostname
-   is not the identity a consumer cares about, such as a container
-   reporting its pod name. This key is `/panel`-only — `/stats` never
-   carries it — and it is never merged with `SYS_STATS_INSTANCE_LABEL`:
-   that one is display prose meant to be rewritten for readability, this
-   one is a machine identity a consumer compares byte-for-byte against a
-   known value, and relabeling one must never change the other.
-
-8. **`SYS_STATS_DCGM_URL` (optional):** points `/panel`'s `gpu[]` at a
-   [dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) Prometheus
-   `/metrics` endpoint instead of GPUtil/`nvidia-smi`, for a host with no
-   NVIDIA driver of its own — a Proxmox hypervisor whose GPUs are
-   PCI-passed-through to a Kubernetes VM, say, where `dcgm-exporter` runs
-   inside that VM instead. Scraped in the same background sampling pass as
-   everything else, gated by a circuit breaker so a dead or firewalled
-   endpoint degrades to an empty `gpu[]` (plus a `"gpu"` tag in `err`)
-   instead of stalling the sampler. `/stats` never reads this variable and
-   always stays on the GPUtil/`nvidia-smi` path. Unset (default) leaves
-   `/panel` on that same path too.
-
-9. **`SYS_STATS_IPMI_INTERVAL` (optional):** seconds between polls of the
-   two `ipmi/`-prefixed `/panel` collectors (`temps`, `fans`), each an
-   `ipmitool` round trip to the host's BMC, decoupled from
-   `SYS_STATS_SAMPLE_INTERVAL`. Default `30.0` — chassis fan speed and
-   temperature move on a timescale of tens of seconds, not the 2-second
-   default sampling cadence, so polling them that often buys nothing while
-   costing a BMC round trip every pass. Between polls, `temps`/`fans` keep
-   serving the last IPMI reading rather than dropping it, so the lists
-   never lose their IPMI entries on an intermediate pass; the first pass
-   after startup always polls immediately rather than waiting a full
-   interval. hwmon sensors (`get_temperatures`, `get_fans`) are unaffected
-   and keep the normal per-pass cadence.
-
-## 📺 Using the CLI
-
-To use the terminal dashboard for live monitoring, run:
+## 📺 Using the terminal dashboard
 
 ```bash
-sys-stats [--url http://localhost:5000/stats] [--interval 5]
+sys-stats --url http://localhost:5000/stats --interval 5
 ```
-
-This launches the dashboard with a 5-second refresh interval. The API URL can
-also be set via the `SYS_STATS_API_URL` environment variable.
 
 Every panel carries a number in its title, and a one line key helper is pinned
-at the bottom of the screen. Press `h` for the full list.
+at the bottom. Press `h` for the full list.
 
 | Key | Action |
 | --- | --- |
@@ -302,20 +272,105 @@ at the bottom of the screen. Press `h` for the full list.
 A panel that cannot show every row says how many it is hiding, so a busy host
 never drops rows silently. A zoomed panel keeps refreshing and keeps scrolling.
 
-The layout follows the terminal: a wide one gets a row of columns, a narrower one
-falls back to a grid, and panels stop where their content stops instead of
+The layout follows the terminal: a wide one gets a row of columns, a narrower
+one falls back to a grid, and panels stop where their content stops instead of
 framing empty space. On a machine with several GPUs the summary keeps cumulated
 figures, each card gets its own detail table (or one row per card when they no
-longer fit side by side), and the GPU processes list tells you which card each
-process is holding VRAM on. The Ollama panel shows each model's context window
-next to its VRAM footprint.
+longer fit side by side), and the GPU process list says which card each process
+is holding VRAM on.
 
-You're all set! Enjoy the Sys-Stats Dashboard.
+---
+
+## 🔌 API
+
+| Route | Returns |
+| --- | --- |
+| `GET /` | The web dashboard |
+| `GET /stats` | Full JSON payload: CPU, RAM, GPUs, top processes, Ollama models |
+| `GET /panel` | Compact frozen-schema payload for an embedded display |
+| `GET /favicon.png` | Icon |
+
+`/stats` takes an optional `?limit=` for the per-process rankings, capped by
+`SYS_STATS_TOP_PROCESSES_MAX`.
+
+`/panel` carries no process lists and no Ollama data, just CPU, RAM, swap, GPU
+and sensor numbers, plus an `age` in seconds telling the display how stale the
+sample is. It shares the same sampling pass as `/stats`, so enabling it costs
+no extra `nvidia-smi` call. Its schema is frozen on purpose: a wall display
+flashed once should not need reflashing when the dashboard gains a field.
+
+Both routes read a cached snapshot. No request ever collects anything itself.
+
+---
+
+## 🛠️ Development
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -e '.[dev]'
+```
+
+| Command | Purpose |
+| --- | --- |
+| `pytest` | Whole suite |
+| `pytest tests/test_stats_endpoint.py` | One file |
+| `pytest -k gpu_processes` | One test or group |
+| `ruff check .` | Lint, add `--fix` to autofix |
+| `uv build` | Wheel and sdist in `dist/` |
+| `docker compose up -d --build` | Rebuild the image and restart |
+
+No test touches the real machine: `psutil`, `GPUtil`, `subprocess.run` and
+`requests.get` are all monkeypatched at the `sys_stats.collectors` boundary.
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+flowchart TB
+    subgraph host["Host machine"]
+        PS["psutil<br/>CPU, RAM, procs, hwmon"]
+        NV["nvidia-smi + GPUtil"]
+        IP["ipmitool<br/>/dev/ipmi0"]
+    end
+
+    subgraph proc["sys-stats-server"]
+        SA["Background sampler<br/>one pass every 2s"]
+        CA[("Cached snapshot")]
+        FL["Flask app"]
+    end
+
+    OL["Ollama /api/ps"]
+    DC["dcgm-exporter /metrics"]
+
+    PS --> SA
+    NV --> SA
+    IP --> SA
+    OL --> SA
+    DC --> SA
+    SA --> CA
+    CA --> FL
+
+    FL -->|"/"| WEB["Web dashboard"]
+    FL -->|"/stats"| CLI["sys-stats TUI"]
+    FL -->|"/panel"| ESP["ESP32-S3 wall display"]
+```
+
+Every collector degrades to empty data rather than raising, so a missing GPU,
+a dead Ollama or a host with no BMC costs you a blank panel, never a 500.
+
+---
 
 ## 🧑‍💻 Contributing
 
-We welcome contributions from the community! Feel free to open issues, suggest features, or submit pull requests. Let's build a better Sys-Stats Dashboard together!
-
-## 📝 Notes
+Issues, feature suggestions and pull requests are all welcome.
 
 This repo is clearly messy, but it was supposed to be only for my own use!
+
+---
+
+## 📝 License
+
+MIT. See [LICENSE](LICENSE).
+
+Made by Grégoire Compagnon (obeone)
