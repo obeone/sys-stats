@@ -1,10 +1,16 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "sys-stats"
-version = "1.5.0"
+# No version here on purpose: git tags are the single source of truth, and
+# hatch-vcs reads the current one (see [tool.hatch.version] below). A build on
+# the v1.6.0 tag is 1.6.0; three commits later it is 1.6.1.dev3+g<sha>, which is
+# exactly what an :edge image should call itself. A build with no repository to
+# read (the Docker image, an unpacked sdist) gets the version handed to it
+# through SETUPTOOLS_SCM_PRETEND_VERSION instead.
+dynamic = ["version"]
 description = "Real-time system, GPU and Ollama monitoring dashboard (terminal + web)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -46,6 +52,9 @@ Issues = "https://github.com/obeone/sys-stats/issues"
 [project.scripts]
 sys-stats = "sys_stats.cli:main"
 sys-stats-server = "sys_stats.server:main"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sys_stats"]

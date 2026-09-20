@@ -23,6 +23,15 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.2 /uv /bin/uv
 # instead of trying to hardlink and falling back with a warning.
 ENV UV_LINK_MODE=copy
 
+# The package version comes from git tags (hatch-vcs), and .dockerignore keeps
+# .git out of the build context on purpose, since shipping the repository into
+# the builder would bust the cache on every commit. So the version is handed in
+# instead, and setuptools-scm, which hatch-vcs drives, reads it from here.
+# The workflow always passes it; a local `docker build` legitimately does not,
+# and gets a default that says so rather than a plausible-looking lie.
+ARG SYS_STATS_VERSION=0.0.0.dev0+local
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SYS_STATS_VERSION}
+
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv /opt/venv && \
     uv pip install --python /opt/venv/bin/python .
