@@ -1,7 +1,8 @@
 services:
   sys-stats:
-    # Kept in sync with the version in pyproject.toml, which is what the
-    # workflow tags the published image with.
+    # Pinned to a published image tag, and nothing here can derive one: this
+    # line is rewritten by scripts/sync-versions.sh, which the release workflow
+    # runs on main once the tag's image is out. Do not edit it by hand.
     image: obeoneorg/sys-stats:1.5.0
     restart: unless-stopped
     ports:
