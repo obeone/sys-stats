@@ -322,6 +322,16 @@ uv pip install -e '.[dev]'
 No test touches the real machine: `psutil`, `GPUtil`, `subprocess.run` and
 `requests.get` are all monkeypatched at the `sys_stats.collectors` boundary.
 
+The version lives in git tags and nowhere else: hatch-vcs derives it, so a build
+on `v1.6.0` is `1.6.0` and three commits later it is `1.6.1.dev3+g<sha>`. A tree
+with no tags in it, a shallow clone or an unpacked source tarball, has nothing to
+derive from and needs `SETUPTOOLS_SCM_PRETEND_VERSION=X.Y.Z` to build at all.
+
+Releasing is one push. `git tag v1.6.0 && git push origin v1.6.0` runs the tests,
+publishes `:1.6.0` and `:latest` to both registries, opens the GitHub release with
+its generated changelog, and commits the new image tag into `compose.yaml`, this
+README and the chart.
+
 ---
 
 ## 🏗️ Architecture
