@@ -25,6 +25,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Full history and tags: the package version is derived from them, so
+          # a shallow clone does not merely mislabel the build, it has nothing
+          # to derive from and the install fails outright.
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -55,6 +60,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # See the test job: tags are where the version comes from.
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -63,23 +71,25 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v9.0.0
 
-      # pyproject.toml is the single source of truth for the version: it feeds
-      # both the image tags and the OCI version label, so neither the Dockerfile
-      # nor this file ever spells a version out. `uv version` reports the project
-      # version because it runs at the repo root; uv's own is `uv self version`.
+      # Git tags are the single source of truth for the version. pyproject.toml
+      # carries none at all: hatch-vcs derives it, and `hatch version` reports
+      # exactly what a build would embed: X.Y.Z on a release tag, and the
+      # X.Y.Z+1.devN+g<sha> that follows the last tag on main. It feeds both the
+      # image tags and the OCI version label, and it is what the Dockerfile gets
+      # handed, since .git never enters the build context.
       - name: Read the package version
         id: version
-        run: echo "version=$(uv version --short)" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(uvx hatch version)" >> "$GITHUB_OUTPUT"
 
-      # A release tag names a version, so it has to be the version the tree
-      # actually carries. Without this, tagging v1.4.0 on a 1.3.0 checkout would
-      # cheerfully publish an image whose tag lies about its contents.
-      - name: Check the tag matches the package version
+      # On a tag the two can only disagree when the derivation did not see the
+      # tag (a shallow checkout, an unreachable ref). Worth catching: the
+      # fallback version would quietly go out as :latest.
+      - name: Check the derived version matches the tag
         if: github.ref_type == 'tag'
         run: |
           expected="v${{ steps.version.outputs.version }}"
           if [ "$GITHUB_REF_NAME" != "$expected" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match pyproject.toml ($expected)."
+            echo "::error::Tag $GITHUB_REF_NAME does not match the derived version ($expected)."
             exit 1
           fi
 
@@ -130,6 +140,9 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # The builder has no repository to read the version from, by design.
+          build-args: |
+            SYS_STATS_VERSION=${{ steps.version.outputs.version }}
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -157,3 +170,74 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: obeoneorg/sys-stats
+
+  # Pushing a v* tag is the whole release ceremony: everything below happens on
+  # its own, and only once the image it announces actually exists.
+  release:
+    name: GitHub release
+    needs: build-and-push
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # --generate-notes is GitHub's own changelog: the commits and merged pull
+      # requests since the previous tag. --verify-tag keeps gh from inventing a
+      # tag if the ref went missing, and the existence check makes a re-run of
+      # this workflow a no-op instead of a failure.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists, nothing to do."
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes
+
+  sync-manifests:
+    name: Point the manifests at the release
+    needs: release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # main, not the tag: this commit lands after the release, on the branch
+      # people clone.
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      # compose.yaml, the README quickstart and the chart have to name an image
+      # tag a human can pull, so they cannot derive anything and are rewritten
+      # here. The consequence is deliberate: the tagged tree still shows the
+      # previous version in those three files, main does not.
+      - name: Rewrite the manifests
+        run: ./scripts/sync-versions.sh "${GITHUB_REF_NAME#v}"
+
+      # [skip ci] because the result is a manifest-only commit: rebuilding
+      # :edge from it would produce the image that just went out as :latest.
+      # If the push is refused (branch protection, main moved on), the release
+      # itself still stands and the fix is to run the script by hand.
+      - name: Commit the change
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Manifests already point at ${GITHUB_REF_NAME#v}."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): point deployment manifests at ${GITHUB_REF_NAME#v} [skip ci]"
+          git push origin main
