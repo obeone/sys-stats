@@ -119,39 +119,55 @@ unprivileged hosts.
 | `SYS_STATS_IPMI_INTERVAL`     | sampler     | Seconds between polls of the two `ipmi/`-prefixed `/panel` collectors (`temps`, `fans`), independent of `SYS_STATS_SAMPLE_INTERVAL`; default `30.0`. Between polls, `temps`/`fans` keep serving the last IPMI reading instead of dropping it; the first pass after startup always polls immediately. hwmon sensors keep the normal per-pass cadence |
 | `SYS_STATS_API_URL`           | CLI         | Default `--url`, default `http://localhost:5000/stats` |
 
-## Versioning
+## Versioning and releases
 
-**Any user-visible change bumps the version, and the bump touches every file that
-spells it out.** Three files do:
+**No file in the tree decides the version any more: git tags do.** Pushing a
+`v*` tag is the entire release ceremony, and there is nothing to bump before it.
 
-| File               | Reference                             |
-| ------------------ | ------------------------------------- |
-| `pyproject.toml`   | `version = "X.Y.Z"` — source of truth |
-| `compose.yaml`     | `image: obeoneorg/sys-stats:X.Y.Z`    |
-| `chart/Chart.yaml` | `appVersion: "X.Y.Z"`                 |
+```bash
+git tag v1.6.0 && git push origin v1.6.0
+```
 
-Nothing reconciles the three, and bumping `pyproject.toml` alone leaves the other two
-pointing at a tag nobody published. `chart/Chart.yaml` also carries its own `version:`,
-which is the chart's semver and moves independently of the application's.
+That single push runs the tests, publishes `:1.6.0` and moves `:latest` on both
+registries, opens a GitHub release whose body is the changelog GitHub generates
+from the commits and merged PRs since the previous tag, and lands a commit on
+`main` pointing the deployment manifests at the new version.
 
-Everything else derives the version instead of repeating it, and must stay that way:
-`src/sys_stats/__init__.py` reads it from the installed package metadata, and
-[the workflow](.github/workflows/build-and-publish.yaml) parses `pyproject.toml` to
-produce both the `:X.Y.Z` image tag and the `org.opencontainers.image.version` label.
-The Dockerfile deliberately carries no version: `LABEL` can only expand `ARG`/`ENV`,
-never the output of a `RUN`, so it cannot read `pyproject.toml` and hardcoding the
-value there would only add a fourth place to forget. The chart's `image.tag` is
-`"{{ .Chart.AppVersion }}"`, rendered through `tpl`, so `values.yaml` is not a fourth
-place either.
+`pyproject.toml` declares `dynamic = ["version"]`, and hatch-vcs derives it from
+`git describe`: a build on the tag is `1.6.0`, three commits later it is
+`1.6.1.dev3+g<sha>`. A tag therefore cannot disagree with what it publishes. Two
+consequences that are easy to trip over:
+
+- **Every job that installs or builds the package needs the tags**, which is why
+  the checkouts pass `fetch-depth: 0`. A shallow clone leaves hatch-vcs with
+  nothing to derive from, and the install fails outright rather than quietly
+  mislabelling itself.
+- **The image build has no repository to read.** `.dockerignore` keeps `.git` out
+  of the build context on purpose, so the Dockerfile takes a `SYS_STATS_VERSION`
+  build argument and feeds it to setuptools-scm through
+  `SETUPTOOLS_SCM_PRETEND_VERSION`. The workflow always passes it; a bare local
+  `docker build` gets `0.0.0.dev0+local`, which is meant to look wrong.
+
+Three files still spell a version out, because they name an image tag a human
+pulls and so cannot derive anything at deploy time: `compose.yaml`, the README
+quickstart, and `chart/Chart.yaml` (`appVersion`, plus a patch bump of the chart's
+own `version`, which otherwise moves independently). Do not edit them by hand:
+[scripts/sync-versions.sh](scripts/sync-versions.sh) rewrites all three, and the
+release workflow runs it on `main` once the images are out. The trade-off is
+deliberate and worth knowing: the *tagged* tree still shows the previous version
+in those three files, `main` does not. If that push is ever refused, run
+`./scripts/sync-versions.sh 1.6.0` and commit it yourself.
+
+Everything else derives the version and must stay that way:
+`src/sys_stats/__init__.py` reads it from the installed package metadata, the
+workflow injects `org.opencontainers.image.version` at build time, and the chart's
+`image.tag` is `"{{ .Chart.AppVersion }}"`, rendered through `tpl`. The Dockerfile
+carries no literal version either: `LABEL` can only expand `ARG`/`ENV`, never the
+output of a `RUN`.
 
 Semver applies to the package as a whole: the `/stats` payload is a public contract
 (see [Architecture](#architecture)), so renaming or removing a key there is a major
 bump, not a patch.
-
-The bump is only half a release. Publishing `:X.Y.Z` takes a matching git tag:
-`git tag v1.4.0 && git push origin v1.4.0`, once the bump commit is on `main`. The
-workflow refuses to build when the tag and `pyproject.toml` disagree, so `v1.4.0` on
-a `1.3.0` tree fails instead of publishing an image whose tag lies.
 
 ## Deployment constraints worth knowing
 

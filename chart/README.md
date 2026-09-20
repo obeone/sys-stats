@@ -96,7 +96,10 @@ instead.
 ## Version
 
 `appVersion` in `Chart.yaml` is the only place the deployed sys-stats version is
-written down — `image.tag` renders it through `tpl`. Bump one, not two.
+written down — `image.tag` renders it through `tpl`. Do not edit it by hand: it
+follows the git tag, rewritten by `scripts/sync-versions.sh` when a release is
+published, together with a patch bump of the chart's own `version`. Bump
+`version` yourself for chart-only changes.
 
 Anything the common library accepts works here; its
 [values reference](https://github.com/bjw-s-labs/helm-charts/blob/main/charts/library/common/values.yaml)
