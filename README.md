@@ -12,9 +12,9 @@ wall display.
 
 One process collects everything (CPU, RAM, swap, load, per-core usage,
 temperatures, fans, NVIDIA GPUs, per-process CPU/RAM/VRAM, loaded Ollama
-models) in a background sampler and serves it over HTTP. The terminal
-dashboard is a client of that API, not a second collector, so you can watch a
-remote host from your laptop.
+models) in a background sampler and serves it over HTTP. Every dashboard is a
+client of that API, not a second collector, so you can watch a remote host
+from your laptop, from a browser or from a terminal.
 
 ---
 
