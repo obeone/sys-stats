@@ -49,12 +49,13 @@ if not _in_debug_reloader_monitor and not _autostart_disabled:
     sampler.start()
 
 #: Env var gating whether the app registers the general-purpose routes
-#: (``/``, ``/stats``, ``/favicon.png``) at all, versus only ``/panel``.
+#: (``/``, ``/stats``, ``/favicon.png``) at all, versus only ``/panel`` and
+#: its command-line-free companion ``/panel/procs``.
 _PANEL_ONLY_ENV = "SYS_STATS_PANEL_ONLY"
 
 
 def _panel_only_enabled() -> bool:
-    """Read whether only the ``/panel`` route should be registered.
+    """Read whether only the ``/panel`` routes should be registered.
 
     This is a security control, not a convenience toggle. ``/stats`` exposes
     the full host process table -- complete command lines -- unauthenticated,
@@ -625,6 +626,129 @@ def get_panel():
     # exact same dict objects the sampler's cache holds, not copies, so a
     # caller mutating the returned payload must never be able to poison it.
     return jsonify(copy.deepcopy(payload))
+
+
+#: The only fields ``/panel/procs`` copies out of each ranking entry. This is
+#: an allowlist on purpose: the collectors attach ``cmdline`` (and may attach
+#: more tomorrow) to every process, and a denylist would leak whatever new
+#: field nobody remembered to strip. Anything not named here never leaves.
+_PROCS_ALLOWED_FIELDS: dict[str, tuple[str, ...]] = {
+    "top_cpu": ("pid", "name", "cpu_percent"),
+    "top_memory": ("pid", "name", "memory_usage"),
+    "top_gpu_processes": ("pid", "name", "memory_used", "gpu_index"),
+}
+
+#: Fields kept from each ``ollama_processes["models"]`` entry. That block is
+#: Ollama's own ``/api/ps`` answer passed through verbatim, so its shape is
+#: not ours; both spellings the wall panel falls back between are kept.
+_PROCS_ALLOWED_OLLAMA_FIELDS = ("name", "model", "size_vram", "size")
+
+
+def _pick_fields(entry: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    """Copy only the allowlisted ``fields`` out of one process or model entry.
+
+    Parameters
+    ----------
+    entry : Any
+        One entry of a cached ranking or of Ollama's model list. Anything
+        that is not a dict (a malformed upstream answer) yields ``{}``.
+    fields : tuple of str
+        The allowlisted keys to copy.
+
+    Returns
+    -------
+    dict
+        A new dict holding the allowlisted keys present in ``entry``, in the
+        order of ``fields``. Absent keys are left out rather than nulled, so
+        a consumer's own fallback (e.g. ``name`` then ``model``) still works.
+    """
+    if not isinstance(entry, dict):
+        return {}
+    return {key: entry[key] for key in fields if key in entry}
+
+
+def _build_procs_payload(stats: dict[str, Any], limit: int) -> dict[str, Any]:
+    """Reduce a cached ``/stats`` payload to the ``/panel/procs`` allowlist.
+
+    Parameters
+    ----------
+    stats : dict
+        The cached sampler payload, as returned by
+        :func:`sys_stats.collectors.collect_stats`.
+    limit : int
+        Maximum number of entries per ranking, applied exactly as ``/stats``
+        applies it (see :func:`_slice_to_limit`).
+
+    Returns
+    -------
+    dict
+        ``top_cpu``, ``top_memory``, ``top_gpu_processes`` and
+        ``ollama_processes`` with the same nesting as ``/stats``, but every
+        entry rebuilt from :data:`_PROCS_ALLOWED_FIELDS` and
+        :data:`_PROCS_ALLOWED_OLLAMA_FIELDS` only. Nothing else is copied.
+    """
+    # Slicing first reuses /stats' exact ranking semantics (including the
+    # cross-GPU VRAM reselection), so a given ?limit= means the same rows on
+    # both routes. _slice_to_limit deep-copies, so the cache stays untouched.
+    sliced = _slice_to_limit(stats, limit)
+
+    payload: dict[str, Any] = {
+        key: [_pick_fields(entry, fields) for entry in sliced[key]]
+        for key, fields in _PROCS_ALLOWED_FIELDS.items()
+    }
+
+    # Ollama's answer is external data: a failed or odd /api/ps reply may not
+    # be a dict at all, and its model list is not guaranteed to be a list.
+    ollama = sliced.get("ollama_processes")
+    models = ollama.get("models") if isinstance(ollama, dict) else None
+    payload["ollama_processes"] = {
+        "models": [
+            _pick_fields(model, _PROCS_ALLOWED_OLLAMA_FIELDS)
+            for model in (models if isinstance(models, list) else [])
+        ]
+    }
+    return payload
+
+
+# Registered in BOTH modes, unlike /stats. It exists precisely so a panel-only
+# deployment (reachable from an untrusted network) can still show process
+# names and figures without ever exposing the command lines /stats carries.
+@app.route('/panel/procs', methods=['GET'])
+def get_panel_procs():
+    """Serve the process and Ollama lists, reduced to names and figures.
+
+    Same keys, nesting and ``?limit=`` handling as the matching parts of
+    ``/stats``, so a client decoding ``/stats`` needs only a URL change, but
+    rebuilt from an explicit allowlist: no ``cmdline``, argv, environment,
+    working directory or user ever appears. Reads the same cached snapshot
+    ``/stats`` reads, so it adds no process enumeration of its own.
+
+    Returns
+    -------
+    flask.Response
+        200 with the reduced payload, or 503 with ``{}`` under exactly the
+        conditions ``/stats`` returns one: no snapshot within the cold-start
+        wait, or a snapshot missing a ranking key.
+    """
+    limit_str = request.args.get("limit", "5")
+    try:
+        limit = int(limit_str)
+    except ValueError:
+        limit = 5
+
+    stats, _wall_ts, _monotonic_ts = sampler.get_snapshot()
+    if stats is None:
+        stats, _wall_ts, _monotonic_ts = sampler.wait_for_first_snapshot(
+            timeout=_first_snapshot_timeout()
+        )
+
+    # Same reasoning as get_stats: absence of usable data is a retryable 503,
+    # never a 200 with empty lists that would read as an idle machine.
+    if stats is None or any(key not in stats for key in _RANKING_KEYS):
+        logger.error("No complete sampler snapshot for /panel/procs; returning 503")
+        return jsonify({}), 503
+
+    return jsonify(_build_procs_payload(stats, limit))
 
 
 def main() -> None:
