@@ -35,7 +35,7 @@ from your laptop, from a browser or from a terminal.
 ## ⚡ Quickstart
 
 ```bash
-docker run -d --pid=host -p 5000:5000 ghcr.io/obeone/sys-stats:1.6.0
+docker run -d --pid=host -p 5000:5000 ghcr.io/obeone/sys-stats:1.7.0
 ```
 
 Open <http://localhost:5000>.
