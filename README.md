@@ -62,7 +62,7 @@ Two console scripts come with the package, whichever way you install it:
 
 | Command | Purpose |
 | --- | --- |
-| `sys-stats-server` | Flask metrics API and web UI, serves `/`, `/stats` and `/panel` |
+| `sys-stats-server` | Flask metrics API and web UI, serves `/`, `/stats`, `/panel` and `/panel/procs` |
 | `sys-stats` | Rich terminal dashboard, an HTTP client of `/stats` |
 
 `python -m sys_stats` is an alias for the CLI.
@@ -190,7 +190,7 @@ Everything is an environment variable. Nothing is required.
 | `FLASK_DEBUG` | `false` | `true` enables Flask debug mode |
 | `OLLAMA_API_URL` | unset | Enables the Ollama panel; unset means an empty model list, never an error |
 | `SYS_STATS_INSTANCE_LABEL` | unset | Free-text label in the web UI title and body |
-| `SYS_STATS_PANEL_ONLY` | unset | `1`/`true`/`yes` registers only `/panel` |
+| `SYS_STATS_PANEL_ONLY` | unset | `1`/`true`/`yes` registers only `/panel` and `/panel/procs` |
 
 ### Sampler
 
@@ -224,7 +224,9 @@ host process table, complete command lines included, with no authentication.
 Set this and `/`, `/stats` and `/favicon.png` are never registered at all, so
 a request gets Flask's own 404 rather than a guarded rejection. On a host
 whose network you do not fully trust, and where the consumer only ever needs
-`/panel`, removing the route beats guarding it. The Helm chart's default
+`/panel`, removing the route beats guarding it. `/panel/procs` stays
+registered in this mode, since it carries process names and figures but never
+a command line. The Helm chart's default
 probes hit `/`, so enabling this there means repointing them at `/panel`.
 
 **`SYS_STATS_HOSTNAME` and `SYS_STATS_INSTANCE_LABEL` are not the same thing**
@@ -288,6 +290,7 @@ is holding VRAM on.
 | `GET /` | The web dashboard |
 | `GET /stats` | Full JSON payload: CPU, RAM, GPUs, top processes, Ollama models |
 | `GET /panel` | Compact frozen-schema payload for an embedded display |
+| `GET /panel/procs` | Process lists and Ollama models, names and figures only |
 | `GET /favicon.png` | Icon |
 
 `/stats` takes an optional `?limit=` for the per-process rankings, capped by
@@ -298,6 +301,15 @@ and sensor numbers, plus an `age` in seconds telling the display how stale the
 sample is. It shares the same sampling pass as `/stats`, so enabling it costs
 no extra `nvidia-smi` call. Its schema is frozen on purpose: a wall display
 flashed once should not need reflashing when the dashboard gains a field.
+
+`/panel/procs` is where the display gets its process lists instead. It returns
+`top_cpu`, `top_memory`, `top_gpu_processes` and `ollama_processes` with the
+same nesting and the same `?limit=` handling as `/stats`, but each entry is
+rebuilt from an allowlist: `pid`, `name` and the one figure the ranking is
+about (`cpu_percent`, `memory_usage`, or `memory_used` plus `gpu_index`), and
+`name`, `model`, `size_vram` and `size` for Ollama models. No command line
+ever leaves, which is why it is still served under `SYS_STATS_PANEL_ONLY`. It
+reads the same cached sample as `/stats`, so it costs no extra process sweep.
 
 Both routes read a cached snapshot. No request ever collects anything itself.
 

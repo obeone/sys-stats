@@ -41,6 +41,13 @@ Everything hinges on one contract: the JSON payload returned by `GET /stats`.
   [templates/index.html](src/sys_stats/templates/index.html) (no build step, no bundler,
   no external JS deps) and the Rich CLI. **Changing a key in the `/stats` response
   means updating both**, plus the CLI's `build_*_panel` functions.
+- **`/panel/procs` is the command-line-free view of the process lists.** It serves
+  `top_cpu`, `top_memory`, `top_gpu_processes` and `ollama_processes` with the
+  same nesting and `?limit=` handling as `/stats`, rebuilt from the explicit
+  allowlists `_PROCS_ALLOWED_FIELDS` / `_PROCS_ALLOWED_OLLAMA_FIELDS` in
+  [server.py](src/sys_stats/server.py), and is registered even under
+  `SYS_STATS_PANEL_ONLY`. Keep it an allowlist: a field a collector gains must
+  stay out of it until someone decides it is safe for an untrusted network.
 - Units are deliberately normalised server-side: memory is converted to **bytes**
   before leaving `/stats` (GPUtil hands out MiB), `load` is a percentage, `powerDraw`
   is watts. The CLI's `human_readable_size` assumes bytes.
@@ -112,7 +119,7 @@ unprivileged hosts.
 | `SYS_STATS_PANEL_MAX_TEMPS`   | server      | Caps the `/panel` `temps` list; unset (default) means no cap |
 | `SYS_STATS_PANEL_MAX_FANS`    | server      | Caps the `/panel` `fans` list; unset (default) means no cap |
 | `SYS_STATS_PANEL_MAX_GPUS`    | server      | Caps the `/panel` `gpu` list; unset (default) means no cap |
-| `SYS_STATS_PANEL_ONLY`        | server      | `1`/`true`/`yes` registers ONLY `/panel`: `/`, `/stats` and `/favicon.png` are never registered, not just guarded; unset (default) registers every route |
+| `SYS_STATS_PANEL_ONLY`        | server      | `1`/`true`/`yes` registers ONLY `/panel` and `/panel/procs`: `/`, `/stats` and `/favicon.png` are never registered, not just guarded; unset (default) registers every route |
 | `SYS_STATS_INSTANCE_LABEL`    | server      | Optional label shown in the web UI's title and body, telling apart two co-located instances reporting on different views of the same box (e.g. a Kubernetes pod vs. the underlying hypervisor); unset (default) leaves the page exactly as before this variable existed |
 | `SYS_STATS_HOSTNAME`          | server      | Overrides `/panel`'s `host` field, otherwise `socket.gethostname()` read fresh per request; unset (default) reports the real hostname. `/panel` only, never `/stats`, and never merged with `SYS_STATS_INSTANCE_LABEL` (that one is a rewritable display label, this one is a machine identity a consumer string-compares) |
 | `SYS_STATS_DCGM_URL`          | sampler     | A dcgm-exporter `/metrics` URL; when set, `/panel`'s `gpu[]` is scraped from it instead of GPUtil/`nvidia-smi`, for hosts with no NVIDIA driver of their own (GPUs passed through to a VM). `/stats` never reads this variable and stays on the GPUtil/`nvidia-smi` path either way. Unset (default) leaves `/panel` on that same path too |
