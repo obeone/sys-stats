@@ -29,6 +29,12 @@ coloredlogs.install(level='INFO', logger=logger, fmt='%(asctime)s - %(levelname)
 def get_top_processes_by_cpu(limit: int = 5) -> list[dict[str, Any]]:
     """
     Retrieve the top processes by CPU usage.
+
+    Each entry also carries ``argv``, the raw command-line argument list
+    (``argv[0]`` included), so a caller that needs just the arguments -- e.g.
+    ``/panel/procs``'s ``args`` field -- can drop ``argv[0]`` itself instead
+    of re-parsing the already-joined ``cmdline`` string, where a path
+    containing a space in ``argv[0]`` would make that split ambiguous.
     """
     processes = []
     for p in psutil.process_iter(["pid", "name", "cpu_percent", "cmdline"]):
@@ -40,11 +46,13 @@ def get_top_processes_by_cpu(limit: int = 5) -> list[dict[str, Any]]:
             # a float would blow up the whole endpoint. Note that privilege is
             # not the missing ingredient in the container case: /proc is
             # world-readable, so the host PID namespace alone is enough.
+            argv = p.info["cmdline"] or []
             processes.append({
                 "pid": p.info["pid"],
                 "name": p.info["name"],
                 "cpu_percent": p.info["cpu_percent"] or 0.0,
-                "cmdline": " ".join(p.info["cmdline"]) if p.info["cmdline"] else "N/A"
+                "cmdline": " ".join(argv) if argv else "N/A",
+                "argv": list(argv),
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
@@ -56,6 +64,9 @@ def get_top_processes_by_cpu(limit: int = 5) -> list[dict[str, Any]]:
 def get_top_processes_by_memory(limit: int = 5) -> list[dict[str, Any]]:
     """
     Retrieve the top processes by memory usage.
+
+    Each entry also carries ``argv``, the raw command-line argument list
+    (``argv[0]`` included); see :func:`get_top_processes_by_cpu` for why.
     """
     processes = []
     for p in psutil.process_iter(["pid", "name", "memory_percent", "memory_info", "cmdline"]):
@@ -63,12 +74,14 @@ def get_top_processes_by_memory(limit: int = 5) -> list[dict[str, Any]]:
             # See get_top_processes_by_cpu: unreadable attributes come back as
             # None, including the whole memory_info namedtuple.
             memory_info = p.info["memory_info"]
+            argv = p.info["cmdline"] or []
             processes.append({
                 "pid": p.info["pid"],
                 "name": p.info["name"],
                 "memory_usage": memory_info.rss if memory_info else 0,
                 "memory_percent": p.info["memory_percent"] or 0.0,
-                "cmdline": " ".join(p.info["cmdline"]) if p.info["cmdline"] else "N/A"
+                "cmdline": " ".join(argv) if argv else "N/A",
+                "argv": list(argv),
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue

@@ -213,8 +213,15 @@ def test_procs_returns_exactly_the_allowlisted_shape(client):
     assert response.status_code == 200
     payload = response.get_json()
     assert set(payload) == {"top_cpu", "top_memory", "top_gpu_processes", "ollama_processes"}
-    assert payload["top_cpu"][0] == {"pid": 100, "name": "cpu0", "cpu_percent": 90.0}
-    assert payload["top_memory"][0] == {"pid": 200, "name": "mem0", "memory_usage": 8 * 1024**2}
+    # _fake_top_cpu/_fake_top_memory carry a joined "cmdline" but no "argv",
+    # exactly like a real entry whose cmdline collection failed: args is "".
+    assert payload["top_cpu"][0] == {"pid": 100, "name": "cpu0", "cpu_percent": 90.0, "args": ""}
+    assert payload["top_memory"][0] == {
+        "pid": 200,
+        "name": "mem0",
+        "memory_usage": 8 * 1024**2,
+        "args": "",
+    }
     assert payload["top_gpu_processes"][0] == {
         "pid": 300,
         "name": "gpu0",
@@ -254,6 +261,63 @@ def test_procs_ranks_the_same_rows_as_stats(client):
 
     for key in ("top_cpu", "top_memory", "top_gpu_processes"):
         assert [p["pid"] for p in procs[key]] == [p["pid"] for p in stats[key]]
+
+
+def test_procs_args_happy_path_drops_argv0_and_truncates(client, monkeypatch):
+    """``args`` is ``argv[1:]`` joined by spaces, ``argv[0]`` dropped, capped at 60 chars."""
+    long_arg = "x" * 80
+    monkeypatch.setattr(
+        collectors,
+        "get_top_processes_by_cpu",
+        lambda limit=5: [
+            {
+                "pid": 1,
+                "name": "qemu-kvm",
+                "cpu_percent": 42.0,
+                "cmdline": f"/usr/bin/qemu-kvm -name guest1 --extra {long_arg}",
+                "argv": ["/usr/bin/qemu-kvm", "-name", "guest1", "--extra", long_arg],
+            }
+        ],
+    )
+    sampler._sample_once(limit=sampler._get_top_processes_cap())
+
+    entry = client.get("/panel/procs").get_json()["top_cpu"][0]
+
+    assert entry["args"] == " ".join(["-name", "guest1", "--extra", long_arg])[:60]
+    assert len(entry["args"]) == 60
+    assert "qemu-kvm" not in entry["args"]
+
+
+def test_procs_args_empty_when_no_arguments(client, monkeypatch):
+    """A process with only ``argv[0]`` (no arguments) yields ``args == ""``."""
+    monkeypatch.setattr(
+        collectors,
+        "get_top_processes_by_memory",
+        lambda limit=5: [
+            {"pid": 2, "name": "sshd", "memory_usage": 1024, "cmdline": "sshd", "argv": ["sshd"]}
+        ],
+    )
+    sampler._sample_once(limit=sampler._get_top_processes_cap())
+
+    payload = client.get("/panel/procs").get_json()
+
+    assert payload["top_memory"][0]["args"] == ""
+
+
+def test_procs_args_empty_when_cmdline_unavailable(client, monkeypatch):
+    """An ``N/A`` cmdline (``AccessDenied``, a zombie, a kernel thread) yields ``args == ""``."""
+    monkeypatch.setattr(
+        collectors,
+        "get_top_processes_by_cpu",
+        lambda limit=5: [
+            {"pid": 3, "name": "kthreadd", "cpu_percent": 0.1, "cmdline": "N/A", "argv": []}
+        ],
+    )
+    sampler._sample_once(limit=sampler._get_top_processes_cap())
+
+    payload = client.get("/panel/procs").get_json()
+
+    assert payload["top_cpu"][0]["args"] == ""
 
 
 def test_procs_tolerates_a_malformed_ollama_answer(client, monkeypatch):

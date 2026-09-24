@@ -643,6 +643,47 @@ _PROCS_ALLOWED_FIELDS: dict[str, tuple[str, ...]] = {
 #: not ours; both spellings the wall panel falls back between are kept.
 _PROCS_ALLOWED_OLLAMA_FIELDS = ("name", "model", "size_vram", "size")
 
+#: Rankings that get a derived ``args`` field on top of their allowlisted
+#: fields. Deliberately just these two: ``top_gpu_processes`` and Ollama's
+#: model list are left exactly as documented, unexpanded.
+_PROCS_ARGS_RANKING_KEYS = ("top_cpu", "top_memory")
+
+#: Hard cap, in characters, on the ``args`` field ``/panel/procs`` sends. The
+#: client is an ESP32-S3 with a small heap that stores these in fixed-size
+#: buffers; a `kvm` command line can run to several kilobytes, so this is a
+#: plain slice (no ellipsis -- the client appends its own) rather than a
+#: soft formatting choice.
+_PROCS_ARGS_MAX_LEN = 60
+
+
+def _extract_args(entry: Any) -> str:
+    """Derive the wall panel's ``args`` field from one ranking entry's argv.
+
+    Parameters
+    ----------
+    entry : Any
+        One cached ``top_cpu``/``top_memory`` entry, as built by
+        :func:`sys_stats.collectors.get_top_processes_by_cpu` or
+        :func:`sys_stats.collectors.get_top_processes_by_memory`. Anything
+        that is not a dict, or whose ``argv`` is missing, not a list, or
+        holds fewer than two elements (no arguments beyond ``argv[0]``,
+        ``AccessDenied``, a zombie, or the collector's own ``"N/A"``
+        fallback for an empty ``cmdline``) yields no arguments.
+
+    Returns
+    -------
+    str
+        ``argv[1:]`` joined by single spaces, sliced to at most
+        :data:`_PROCS_ARGS_MAX_LEN` characters. ``""`` when there is
+        nothing to show.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    argv = entry.get("argv")
+    if not isinstance(argv, list) or len(argv) < 2:
+        return ""
+    return " ".join(str(part) for part in argv[1:])[:_PROCS_ARGS_MAX_LEN]
+
 
 def _pick_fields(entry: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     """Copy only the allowlisted ``fields`` out of one process or model entry.
@@ -685,7 +726,9 @@ def _build_procs_payload(stats: dict[str, Any], limit: int) -> dict[str, Any]:
         ``top_cpu``, ``top_memory``, ``top_gpu_processes`` and
         ``ollama_processes`` with the same nesting as ``/stats``, but every
         entry rebuilt from :data:`_PROCS_ALLOWED_FIELDS` and
-        :data:`_PROCS_ALLOWED_OLLAMA_FIELDS` only. Nothing else is copied.
+        :data:`_PROCS_ALLOWED_OLLAMA_FIELDS` only, plus an ``args`` string
+        added to each ``top_cpu``/``top_memory`` entry (see
+        :func:`_extract_args`). Nothing else is copied.
     """
     # Slicing first reuses /stats' exact ranking semantics (including the
     # cross-GPU VRAM reselection), so a given ?limit= means the same rows on
@@ -696,6 +739,14 @@ def _build_procs_payload(stats: dict[str, Any], limit: int) -> dict[str, Any]:
         key: [_pick_fields(entry, fields) for entry in sliced[key]]
         for key, fields in _PROCS_ALLOWED_FIELDS.items()
     }
+
+    # top_cpu/top_memory get one derived field beyond the allowlist: args,
+    # computed from the cached entry's own argv (never itself exposed) so
+    # the wall panel can tell apart processes that otherwise all render as
+    # the same name (e.g. every VM shows up as "kvm").
+    for key in _PROCS_ARGS_RANKING_KEYS:
+        for out_entry, src_entry in zip(payload[key], sliced[key], strict=True):
+            out_entry["args"] = _extract_args(src_entry)
 
     # Ollama's answer is external data: a failed or odd /api/ps reply may not
     # be a dict at all, and its model list is not guaranteed to be a list.
@@ -715,13 +766,19 @@ def _build_procs_payload(stats: dict[str, Any], limit: int) -> dict[str, Any]:
 # names and figures without ever exposing the command lines /stats carries.
 @app.route('/panel/procs', methods=['GET'])
 def get_panel_procs():
-    """Serve the process and Ollama lists, reduced to names and figures.
+    """Serve the process and Ollama lists, reduced to names, figures and args.
 
     Same keys, nesting and ``?limit=`` handling as the matching parts of
     ``/stats``, so a client decoding ``/stats`` needs only a URL change, but
-    rebuilt from an explicit allowlist: no ``cmdline``, argv, environment,
-    working directory or user ever appears. Reads the same cached snapshot
-    ``/stats`` reads, so it adds no process enumeration of its own.
+    rebuilt from an explicit allowlist: no full ``cmdline``, environment,
+    working directory or user ever appears. ``top_cpu`` and ``top_memory``
+    entries do carry ``args`` -- ``argv[1:]`` joined by spaces and truncated
+    server side to at most :data:`_PROCS_ARGS_MAX_LEN` characters, ``""``
+    when there are none or the underlying ``cmdline`` was unavailable --
+    since the wall panel needs some way to tell processes that share a name
+    apart (every VM otherwise renders as the same "kvm" row). Reads the same
+    cached snapshot ``/stats`` reads, so it adds no process enumeration of
+    its own.
 
     Returns
     -------
