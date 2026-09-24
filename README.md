@@ -48,14 +48,6 @@ On macOS, port 5000 belongs to the AirPlay Receiver. Publish on another port
 
 ---
 
-## 🖼️ Screenshots
-
-![Web dashboard](https://raw.githubusercontent.com/obeone/sys-stats/main/docs/web.png)
-
-![CLI dashboard](https://raw.githubusercontent.com/obeone/sys-stats/main/docs/cli.png)
-
----
-
 ## 📦 Installation
 
 Two console scripts come with the package, whichever way you install it:
@@ -175,6 +167,14 @@ the NVIDIA panels, and point `OLLAMA_API_URL` somewhere for the Ollama one.
 [`chart/values.yaml`](chart/values.yaml) documents all three, along with the
 commented block for IPMI, which does need a privileged pod on Kubernetes since
 there is no per-device request for a BMC.
+
+---
+
+## 🖼️ Screenshots
+
+![Web dashboard](https://raw.githubusercontent.com/obeone/sys-stats/main/docs/web.png)
+
+![CLI dashboard](https://raw.githubusercontent.com/obeone/sys-stats/main/docs/cli.png)
 
 ---
 
@@ -334,15 +334,21 @@ uv pip install -e '.[dev]'
 No test touches the real machine: `psutil`, `GPUtil`, `subprocess.run` and
 `requests.get` are all monkeypatched at the `sys_stats.collectors` boundary.
 
-The version lives in git tags and nowhere else: hatch-vcs derives it, so a build
-on `v1.6.0` is `1.6.0` and three commits later it is `1.6.1.dev3+g<sha>`. A tree
-with no tags in it, a shallow clone or an unpacked source tarball, has nothing to
-derive from and needs `SETUPTOOLS_SCM_PRETEND_VERSION=X.Y.Z` to build at all.
+The version lives in git tags and nowhere else: hatch-vcs derives it, so a
+build on `v1.6.0` is `1.6.0` and three commits later it is
+`1.6.1.dev3+g<sha>`. A tree with no tags in it, a shallow clone or an
+unpacked source tarball, has nothing to derive from and needs
+`SETUPTOOLS_SCM_PRETEND_VERSION=X.Y.Z` to build at all.
 
-Releasing is one push. `git tag v1.6.0 && git push origin v1.6.0` runs the tests,
-publishes `:1.6.0` and `:latest` to both registries, opens the GitHub release with
-its generated changelog, and commits the new image tag into `compose.yaml`, this
-README and the chart.
+Releasing is one push:
+
+```bash
+git tag v1.6.0 && git push origin v1.6.0
+```
+
+That runs the tests, publishes `:1.6.0` and `:latest` to both registries,
+opens the GitHub release with its generated changelog, and commits the new
+image tag into `compose.yaml`, this README and the chart.
 
 ---
 
@@ -375,7 +381,7 @@ flowchart TB
 
     FL -->|"/"| WEB["Web dashboard"]
     FL -->|"/stats"| CLI["sys-stats TUI"]
-    FL -->|"/panel"| ESP["ESP32-S3 wall display"]
+    FL -->|"/panel + /panel/procs"| ESP["ESP32-S3 wall display"]
 ```
 
 Every collector degrades to empty data rather than raising, so a missing GPU,
