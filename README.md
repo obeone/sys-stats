@@ -290,7 +290,7 @@ is holding VRAM on.
 | `GET /` | The web dashboard |
 | `GET /stats` | Full JSON payload: CPU, RAM, GPUs, top processes, Ollama models |
 | `GET /panel` | Compact frozen-schema payload for an embedded display |
-| `GET /panel/procs` | Process lists and Ollama models, names and figures only |
+| `GET /panel/procs` | Process lists and Ollama models, names, figures and truncated args |
 | `GET /favicon.png` | Icon |
 
 `/stats` takes an optional `?limit=` for the per-process rankings, capped by
@@ -307,9 +307,15 @@ flashed once should not need reflashing when the dashboard gains a field.
 same nesting and the same `?limit=` handling as `/stats`, but each entry is
 rebuilt from an allowlist: `pid`, `name` and the one figure the ranking is
 about (`cpu_percent`, `memory_usage`, or `memory_used` plus `gpu_index`), and
-`name`, `model`, `size_vram` and `size` for Ollama models. No command line
-ever leaves, which is why it is still served under `SYS_STATS_PANEL_ONLY`. It
-reads the same cached sample as `/stats`, so it costs no extra process sweep.
+`name`, `model`, `size_vram` and `size` for Ollama models. `top_cpu` and
+`top_memory` entries also carry `args`: the process's arguments (`argv[1:]`,
+`argv[0]` itself dropped) joined by spaces and truncated server side to at
+most 60 characters, `""` when there are none or the command line was
+unavailable, just enough for the wall display to tell apart processes that
+otherwise share the same name (every VM would render as `kvm`). No full
+command line ever leaves, which is why it is still served under
+`SYS_STATS_PANEL_ONLY`. It reads the same cached sample as `/stats`, so it
+costs no extra process sweep.
 
 Both routes read a cached snapshot. No request ever collects anything itself.
 
