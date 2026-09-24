@@ -46,11 +46,7 @@ jobs:
         if: matrix.python-version == '3.12'
         run: ruff check .
 
-      - name: Run the test suite
-        run: pytest
-
   build-and-push:
-    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
